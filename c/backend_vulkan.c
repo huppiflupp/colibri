@@ -81,6 +81,14 @@ static struct {
     VkShaderModule shader_dr; VkDescriptorSetLayout dsl_dr; VkPipelineLayout plyt_dr;
     VkPipeline pipe_dr; VkDescriptorPool dpool_dr; VkDescriptorSet dset_dr;
     Scratch dr_q, dr_k, dr_v, dr_b, dr_g, dr_s, dr_o;
+    /* whole DeltaNet block of a prefill (coli_vk_dn_block): conv, prep, gated norm
+     * pipelines, two matmul descriptor sets (projection, out_proj) and scratch */
+    VkShaderModule shader_dc, shader_dp, shader_dg;
+    VkDescriptorSetLayout dsl_dc, dsl_dp, dsl_dg; VkPipelineLayout plyt_dc, plyt_dp, plyt_dg;
+    VkPipeline pipe_dc, pipe_dp, pipe_dg; VkDescriptorPool dpool_dc, dpool_dp, dpool_dg, db_pool;
+    VkDescriptorSet dset_dc, dset_dp, dset_dg, db_mm[2];
+    Scratch db_x, db_qz, db_ba, db_par, db_cw, db_ring, db_conv, db_bg, db_nw, db_or, db_y;
+    int sgsize;
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
     VkCommandPool cpool;
@@ -141,6 +149,9 @@ struct PCN { int S, D; float eps; };
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
 struct PCAP { int S, H, KV, hd, pos_base, ldt; float scale; };   /* attn_prefill.comp */
 struct PCDR { int S, vh, vk, kdim, vdim, vstride, voff; };      /* dn_recur.comp */
+struct PCDC { int S, conv_dim, convk, pstride; };               /* dn_conv.comp */
+struct PCDP { int S, conv_dim, vk, vh, kdim; float scale; };    /* dn_prep.comp */
+struct PCDG { int S, vh, vdim, pstride, zoff; float eps; };     /* dn_gnorm.comp */
 
 static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -631,6 +642,35 @@ int coli_vk_init(const char *spv_path) {
     G.shader_att = load_spv(G.dev, att_path);
     if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
         return 0;
+    /* The prefill kernels below reduce over one 64-lane subgroup per workgroup. */
+    {
+        VkPhysicalDeviceSubgroupProperties sgp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        VkPhysicalDeviceProperties2 pp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sgp};
+        vkGetPhysicalDeviceProperties2(G.phys, &pp2);
+        G.sgsize = (int)sgp.subgroupSize;
+    }
+    /* Optional whole-DeltaNet-block kernels (COLI_VK_DN_BLOCK=0 turns them off). */
+    if (G.sgsize == 64 && !(getenv("COLI_VK_DN_BLOCK") && getenv("COLI_VK_DN_BLOCK")[0] == '0')) {
+        char pa[512];
+        derive_dir_file(spv_path, "dn_conv.spv", pa, sizeof(pa));  G.shader_dc = load_spv(G.dev, pa);
+        derive_dir_file(spv_path, "dn_prep.spv", pa, sizeof(pa));  G.shader_dp = load_spv(G.dev, pa);
+        derive_dir_file(spv_path, "dn_gnorm.spv", pa, sizeof(pa)); G.shader_dg = load_spv(G.dev, pa);
+        int ok = G.shader_dc && G.shader_dp && G.shader_dg &&
+            build_pipeline(G.dev, 4, sizeof(struct PCDC), G.shader_dc, &G.dsl_dc, &G.plyt_dc, &G.pipe_dc, &G.dpool_dc, &G.dset_dc) &&
+            build_pipeline(G.dev, 6, sizeof(struct PCDP), G.shader_dp, &G.dsl_dp, &G.plyt_dp, &G.pipe_dp, &G.dpool_dp, &G.dset_dp) &&
+            build_pipeline(G.dev, 4, sizeof(struct PCDG), G.shader_dg, &G.dsl_dg, &G.plyt_dg, &G.pipe_dg, &G.dpool_dg, &G.dset_dg);
+        if (ok) {
+            VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 8};
+            VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &ps};
+            VkDescriptorSetLayout l2[2] = {G.dsl, G.dsl};
+            VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorSetCount = 2, .pSetLayouts = l2};
+            ok = vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.db_pool) == VK_SUCCESS;
+            ai.descriptorPool = G.db_pool;
+            ok = ok && vkAllocateDescriptorSets(G.dev, &ai, G.db_mm) == VK_SUCCESS;
+        }
+        if (!ok) { G.pipe_dc = G.pipe_dp = G.pipe_dg = VK_NULL_HANDLE; }
+    }
+    if (G.sgsize != 64) fprintf(stderr, "[VK] subgroup size %d != 64: prefill attention/DeltaNet kernels off\n", G.sgsize);
     /* Optional DeltaNet prefill recurrence (COLI_VK_DN_RECUR=0 turns it off). */
     {
         const char *e = getenv("COLI_VK_DN_RECUR");
@@ -993,13 +1033,137 @@ int coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn
     return 1;
 }
 
+/* Record one matmul y = x W^T of an uploaded tensor into cb, the same shader choice
+ * as coli_vk_matmul (tiles / multi-row / one-row), on descriptor set `set`. */
+static void rec_mm(VkCommandBuffer cb, VkDescriptorSet set, ColiVkTensor *t, VkBuffer xb, VkBuffer yb, int S) {
+    VkDescriptorBufferInfo bi[4] = {
+        {.buffer = xb, .range = VK_WHOLE_SIZE}, {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = t->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = yb, .range = VK_WHOLE_SIZE}};
+    wr_desc(set, 4, bi);
+    int co = coop_use(t->fmt, S, t->I, t->O, t->gs, 0), mr = !co && mr_use(t->fmt, S, t->I, t->O);
+    uint32_t gx = 0, gy = 0;
+    VkPipeline pl = co ? coop_pick(0, S, t->O, &gx, &gy) : mr ? G.pipe_mr : G.pipe;
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &set, 0, NULL);
+    struct PC pc = {t->fmt, S, t->I, t->O, t->rowWords, t->gs};
+    vkCmdPushConstants(cb, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    if (co) vkCmdDispatch(cb, gx, gy, 1);
+    else vkCmdDispatch(cb, (uint32_t)((t->O + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
+}
+static void cc_barrier(VkCommandBuffer cb) {
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+/* A whole DeltaNet layer of a prefill block in ONE submit, nothing read back in
+ * between: qkv|z projection (proj, int8 [proj_dim x H]) -> causal conv + SiLU ->
+ * l2norm/beta/exp(g) -> gated delta rule -> gated RMSNorm -> out_proj (outp,
+ * [H x value_dim]). b|a ([S][2*vh], small f32 projections) come from the caller;
+ * par = A_log | dt_bias. ring (conv_dim x (convk-1)) and state (vh x kdim x vdim)
+ * are read and written back; y = [S][H]. 0 -> caller's path. */
+int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, const float *ba,
+                     const float *convw, const float *par, const float *normw, float *ring, float *state,
+                     int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
+                     float eps, float qscale, float *y) {
+    if (!G.ready || !G.pipe_dc || !G.pipe_dr || !proj || !outp || S < 1 || convk < 2 || convk > 17 ||
+        vh % vk || kdim % 16 || kdim > 256) return 0;
+    int value_dim = vh * vdim, pd = proj->O, ktot = vk * kdim;
+    if (proj->I != H || pd != conv_dim + value_dim || outp->I != value_dim || outp->O != H) return 0;
+    size_t f = sizeof(float);
+    size_t nx = (size_t)S * H * f, nqz = (size_t)S * pd * f, nba = (size_t)S * 2 * vh * f, npar = (size_t)2 * vh * f;
+    size_t ncw = (size_t)conv_dim * convk * f, nring = (size_t)conv_dim * (convk - 1) * f, nconv = (size_t)S * conv_dim * f;
+    size_t nqk = (size_t)S * ktot * f, nbg = (size_t)2 * S * vh * f, nst = (size_t)vh * kdim * vdim * f;
+    size_t nov = (size_t)S * value_dim * f, nnw = (size_t)vdim * f;
+    if (!scratch_reserve(&G.db_x, nx) || !scratch_reserve(&G.db_qz, nqz) || !scratch_reserve(&G.db_ba, nba) ||
+        !scratch_reserve(&G.db_par, npar) || !scratch_reserve(&G.db_cw, ncw) || !scratch_reserve(&G.db_ring, nring) ||
+        !scratch_reserve(&G.db_conv, nconv) || !scratch_reserve(&G.dr_q, nqk) || !scratch_reserve(&G.dr_k, nqk) ||
+        !scratch_reserve(&G.db_bg, nbg) || !scratch_reserve_mt(&G.dr_s, nst, G.memtype_cached) ||
+        !scratch_reserve(&G.dr_o, nov) || !scratch_reserve(&G.db_nw, nnw) || !scratch_reserve(&G.db_or, nov) ||
+        !scratch_reserve_mt(&G.db_y, nx, G.memtype_cached)) return 0;
+    memcpy(G.db_x.ptr, x, nx); memcpy(G.db_ba.ptr, ba, nba); memcpy(G.db_par.ptr, par, npar);
+    memcpy(G.db_cw.ptr, convw, ncw); memcpy(G.db_ring.ptr, ring, nring); memcpy(G.dr_s.ptr, state, nst);
+    memcpy(G.db_nw.ptr, normw, nnw);
+    VkCommandBuffer cb = G.cmd;
+    VKCHECK(vkResetCommandBuffer(cb, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(cb, &begin), "beginCmd");
+    /* 1. qkv|z = x Wp^T */
+    rec_mm(cb, G.db_mm[0], proj, G.db_x.buf, G.db_qz.buf, S);
+    cc_barrier(cb);
+    /* 2. conv + SiLU */
+    { VkDescriptorBufferInfo bi[4] = {{G.db_qz.buf, 0, VK_WHOLE_SIZE}, {G.db_cw.buf, 0, VK_WHOLE_SIZE},
+                                      {G.db_ring.buf, 0, VK_WHOLE_SIZE}, {G.db_conv.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(G.dset_dc, 4, bi);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dc);
+      vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dc, 0, 1, &G.dset_dc, 0, NULL);
+      struct PCDC pc = {S, conv_dim, convk, pd};
+      vkCmdPushConstants(cb, G.plyt_dc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+      vkCmdDispatch(cb, (uint32_t)((conv_dim + 255) / 256), (uint32_t)S, 1); }
+    cc_barrier(cb);
+    /* 3. l2norm q/k, beta, exp(g) */
+    { VkDescriptorBufferInfo bi[6] = {{G.db_conv.buf, 0, VK_WHOLE_SIZE}, {G.db_ba.buf, 0, VK_WHOLE_SIZE},
+                                      {G.db_par.buf, 0, VK_WHOLE_SIZE}, {G.dr_q.buf, 0, VK_WHOLE_SIZE},
+                                      {G.dr_k.buf, 0, VK_WHOLE_SIZE}, {G.db_bg.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(G.dset_dp, 6, bi);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dp);
+      vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dp, 0, 1, &G.dset_dp, 0, NULL);
+      struct PCDP pc = {S, conv_dim, vk, vh, kdim, qscale};
+      vkCmdPushConstants(cb, G.plyt_dp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+      vkCmdDispatch(cb, (uint32_t)S, (uint32_t)vk, 1); }
+    cc_barrier(cb);
+    /* 4. recurrence (v straight out of the conv output) */
+    { VkDeviceSize hb = (VkDeviceSize)S * vh * f;
+      VkDescriptorBufferInfo bi[7] = {{G.dr_q.buf, 0, VK_WHOLE_SIZE}, {G.dr_k.buf, 0, VK_WHOLE_SIZE},
+                                      {G.db_conv.buf, 0, VK_WHOLE_SIZE}, {G.db_bg.buf, 0, hb}, {G.db_bg.buf, hb, hb},
+                                      {G.dr_s.buf, 0, VK_WHOLE_SIZE}, {G.dr_o.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(G.dset_dr, 7, bi);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dr);
+      vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dr, 0, 1, &G.dset_dr, 0, NULL);
+      struct PCDR pc = {S, vh, vk, kdim, vdim, conv_dim, 2 * ktot};
+      vkCmdPushConstants(cb, G.plyt_dr, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+      vkCmdDispatch(cb, (uint32_t)vh, (uint32_t)((vdim + 3) / 4), 1); }
+    cc_barrier(cb);
+    /* 5. gated RMSNorm */
+    { VkDescriptorBufferInfo bi[4] = {{G.dr_o.buf, 0, VK_WHOLE_SIZE}, {G.db_qz.buf, 0, VK_WHOLE_SIZE},
+                                      {G.db_nw.buf, 0, VK_WHOLE_SIZE}, {G.db_or.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(G.dset_dg, 4, bi);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dg);
+      vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dg, 0, 1, &G.dset_dg, 0, NULL);
+      struct PCDG pc = {S, vh, vdim, pd, conv_dim, eps};
+      vkCmdPushConstants(cb, G.plyt_dg, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+      vkCmdDispatch(cb, (uint32_t)S, (uint32_t)vh, 1); }
+    cc_barrier(cb);
+    /* 6. out_proj */
+    rec_mm(cb, G.db_mm[1], outp, G.db_or.buf, G.db_y.buf, S);
+    host_read_barrier(cb);
+    VKCHECK(vkEndCommandBuffer(cb), "endCmd");
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    memcpy(y, G.db_y.ptr, nx);
+    memcpy(state, G.dr_s.ptr, nst);
+    /* new ring: the last convk-1 unconvolved qkv inputs (older ones from the old ring) */
+    { const float *qz = (const float *)G.db_qz.ptr; int km = convk - 1;
+      float *old = malloc(nring);
+      if (!old) return 0;
+      memcpy(old, ring, nring);
+      for (int cc = 0; cc < conv_dim; cc++)
+          for (int kk = 0; kk < km; kk++) {
+              int src = S - km + kk;
+              ring[cc * km + kk] = src >= 0 ? qz[(size_t)src * pd + cc] : old[cc * km + src + km];
+          }
+      free(old); }
+    G.cmd_ready = 0; G.bound_tensor = NULL;
+    return 1;
+}
+
 /* Causal attention core of a prefill block (attn_prefill.comp): q [S][H][hd] after
  * norm/RoPE, K/V the engine's per-kv-head caches, row t of kv head g at
  * (g*ldt + t)*hd, keys 0 .. pos_base+S-1 valid; ctx [S][H][hd] out. Only the valid
  * key rows travel (packed per kv head). Returns 0 when unavailable -> CPU path. */
 int coli_vk_attn_prefill(float *ctx, const float *q, const float *K, const float *V, int ldt,
                          int S, int H, int KV, int hd, int pos_base, float scale) {
-    if (!G.ready || !G.pipe_ap || S < 1 || KV < 1 || H % KV || hd < 1 || hd > 512) return 0;
+    if (!G.ready || !G.pipe_ap || G.sgsize != 64 || S < 1 || KV < 1 || H % KV || hd < 1 || hd > 512) return 0;
     int nt = pos_base + S;
     size_t qb = (size_t)S * H * hd * sizeof(float), kb = (size_t)KV * nt * hd * sizeof(float);
     if (!scratch_reserve(&G.ap_q, qb) || !scratch_reserve(&G.ap_k, kb) || !scratch_reserve(&G.ap_v, kb) ||
@@ -1929,6 +2093,17 @@ void coli_vk_shutdown(void) {
     }
     if (G.shader_co2) vkDestroyShaderModule(G.dev, G.shader_co2, NULL);
     if (G.shader_gu_co2) vkDestroyShaderModule(G.dev, G.shader_gu_co2, NULL);
+    if (G.db_pool) vkDestroyDescriptorPool(G.dev, G.db_pool, NULL);
+    { VkPipeline pl[3] = {G.pipe_dc, G.pipe_dp, G.pipe_dg}; VkPipelineLayout ly[3] = {G.plyt_dc, G.plyt_dp, G.plyt_dg};
+      VkDescriptorSetLayout dl[3] = {G.dsl_dc, G.dsl_dp, G.dsl_dg}; VkDescriptorPool dp[3] = {G.dpool_dc, G.dpool_dp, G.dpool_dg};
+      VkShaderModule sm[3] = {G.shader_dc, G.shader_dp, G.shader_dg};
+      for (int i = 0; i < 3; i++) {
+          if (pl[i]) vkDestroyPipeline(G.dev, pl[i], NULL);
+          if (ly[i]) vkDestroyPipelineLayout(G.dev, ly[i], NULL);
+          if (dl[i]) vkDestroyDescriptorSetLayout(G.dev, dl[i], NULL);
+          if (dp[i]) vkDestroyDescriptorPool(G.dev, dp[i], NULL);
+          if (sm[i]) vkDestroyShaderModule(G.dev, sm[i], NULL);
+      } }
     if (G.pipe_dr) {
         vkDestroyDescriptorPool(G.dev, G.dpool_dr, NULL);
         vkDestroyPipeline(G.dev, G.pipe_dr, NULL);
@@ -2675,6 +2850,92 @@ static int run_dn_recur_case(int S, int vh, int vk, int kdim, int vdim) {
     return rl2 > 1e-4 || rmax > 1e-3 || sl2 > 1e-4 || nf || nfs;
 }
 
+/* Whole DeltaNet block against a CPU chain that mirrors qwen36.c deltanet_phased:
+ * int8 projections (cpu_ref), conv with ring, l2norm (double), beta/g, delta rule,
+ * gated RMSNorm, out_proj; also the carried ring and state. */
+static float dnb_softplus(float z) { return z > 20.f ? z : log1pf(expf(z)); }
+static int run_dn_block_case(int S, int H, int vh, int vk, int kdim, int vdim, int convk) {
+    if (!G.pipe_dc) { printf("dn_block shaders not loaded\n"); return 1; }
+    int ktot = vk * kdim, value_dim = vh * vdim, conv_dim = 2 * ktot + value_dim, pd = conv_dim + value_dim, km = convk - 1;
+    float scale = 1.f / sqrtf((float)kdim), eps = 1e-6f;
+    uint8_t *wp = malloc((size_t)pd * H), *wo = malloc((size_t)H * value_dim);
+    float *sp = malloc((size_t)pd * 4), *so = malloc((size_t)H * 4);
+    for (size_t i = 0; i < (size_t)pd * H; i++) wp[i] = rand() & 0xff;
+    for (size_t i = 0; i < (size_t)H * value_dim; i++) wo[i] = rand() & 0xff;
+    for (int i = 0; i < pd; i++) sp[i] = 0.0005f + (rand() % 100) / 200000.0f;
+    for (int i = 0; i < H; i++) so[i] = 0.0005f + (rand() % 100) / 200000.0f;
+    ColiVkTensor *tp = NULL, *to = NULL;
+    if (!coli_vk_tensor_ensure(&tp, wp, sp, 1, H, pd, 0) || !coli_vk_tensor_ensure(&to, wo, so, 1, value_dim, H, 0)) { printf("upload failed\n"); return 1; }
+    float *x = malloc((size_t)S * H * 4), *ba = malloc((size_t)S * 2 * vh * 4), *cw = malloc((size_t)conv_dim * convk * 4);
+    float *par = malloc((size_t)2 * vh * 4), *nw = malloc((size_t)vdim * 4);
+    float *ring0 = malloc((size_t)conv_dim * km * 4), *st0 = malloc((size_t)vh * kdim * vdim * 4);
+    for (int i = 0; i < S * H; i++) x[i] = (rand() % 200 - 100) / 100.0f;
+    for (int i = 0; i < S * 2 * vh; i++) ba[i] = (rand() % 200 - 100) / 100.0f;
+    for (int i = 0; i < conv_dim * convk; i++) cw[i] = (rand() % 200 - 100) / 200.0f;
+    for (int i = 0; i < 2 * vh; i++) par[i] = (rand() % 200 - 100) / 200.0f;
+    for (int i = 0; i < vdim; i++) nw[i] = 0.5f + (rand() % 100) / 100.0f;
+    for (int i = 0; i < conv_dim * km; i++) ring0[i] = (rand() % 200 - 100) / 100.0f;
+    for (int i = 0; i < vh * kdim * vdim; i++) st0[i] = (rand() % 200 - 100) / 1000.0f;
+    float *ringg = malloc((size_t)conv_dim * km * 4), *stg = malloc((size_t)vh * kdim * vdim * 4), *yg = malloc((size_t)S * H * 4);
+    memcpy(ringg, ring0, (size_t)conv_dim * km * 4); memcpy(stg, st0, (size_t)vh * kdim * vdim * 4);
+    double t0 = now();
+    if (!coli_vk_dn_block(tp, to, x, ba, cw, par, nw, ringg, stg, S, H, conv_dim, convk, vh, vk, kdim, vdim, eps, scale, yg)) { printf("dn_block failed\n"); return 1; }
+    double ms = (now() - t0) * 1000;
+    /* CPU chain */
+    float *qz = malloc((size_t)S * pd * 4), *conv = malloc((size_t)S * conv_dim * 4), *ov = malloc((size_t)S * value_dim * 4);
+    float *orr = malloc((size_t)S * value_dim * 4), *yc = malloc((size_t)S * H * 4);
+    float *ringc = malloc((size_t)conv_dim * km * 4), *stc = malloc((size_t)vh * kdim * vdim * 4);
+    memcpy(ringc, ring0, (size_t)conv_dim * km * 4); memcpy(stc, st0, (size_t)vh * kdim * vdim * 4);
+    cpu_ref(qz, x, wp, sp, 1, S, H, pd);
+    for (int s = 0; s < S; s++) for (int cc = 0; cc < conv_dim; cc++) {
+        float acc = 0.f;
+        for (int kk = 0; kk < km; kk++) { int src = s - km + kk; acc += cw[cc * convk + kk] * (src >= 0 ? qz[(size_t)src * pd + cc] : ringc[cc * km + src + km]); }
+        acc += cw[cc * convk + km] * qz[(size_t)s * pd + cc];
+        conv[(size_t)s * conv_dim + cc] = acc / (1.f + expf(-acc));
+    }
+    for (int cc = 0; cc < conv_dim; cc++) for (int kk = 0; kk < km; kk++) { int src = S - km + kk;
+        if (src >= 0) ringc[cc * km + kk] = qz[(size_t)src * pd + cc]; else ringc[cc * km + kk] = ring0[cc * km + src + km]; }
+    int rep = vh / vk; float qh[512], kh[512], kvl[512], dl[512];
+    for (int h = 0; h < vh; h++) {
+        float *Sh = stc + (size_t)h * kdim * vdim;
+        for (int s = 0; s < S; s++) {
+            const float *cv = conv + (size_t)s * conv_dim; int j = h / rep;
+            memcpy(qh, cv + j * kdim, kdim * 4); memcpy(kh, cv + ktot + j * kdim, kdim * 4);
+            double sq = 1e-6, sk = 1e-6; for (int d = 0; d < kdim; d++) { sq += (double)qh[d] * qh[d]; sk += (double)kh[d] * kh[d]; }
+            for (int d = 0; d < kdim; d++) { qh[d] = (float)(qh[d] / sqrt(sq) * scale); kh[d] = (float)(kh[d] / sqrt(sk)); }
+            float bt = 1.f / (1.f + expf(-ba[s * 2 * vh + h]));
+            float eg = expf(-expf(par[h]) * dnb_softplus(ba[s * 2 * vh + vh + h] + par[vh + h]));
+            const float *vd = cv + 2 * ktot + h * vdim;
+            for (int t = 0; t < kdim * vdim; t++) Sh[t] *= eg;
+            for (int v = 0; v < vdim; v++) kvl[v] = 0.f;
+            for (int k = 0; k < kdim; k++) for (int v = 0; v < vdim; v++) kvl[v] += kh[k] * Sh[k * vdim + v];
+            for (int v = 0; v < vdim; v++) dl[v] = (vd[v] - kvl[v]) * bt;
+            for (int k = 0; k < kdim; k++) for (int v = 0; v < vdim; v++) Sh[k * vdim + v] += kh[k] * dl[v];
+            float *o = ov + (size_t)s * value_dim + h * vdim;
+            for (int v = 0; v < vdim; v++) o[v] = 0.f;
+            for (int k = 0; k < kdim; k++) for (int v = 0; v < vdim; v++) o[v] += qh[k] * Sh[k * vdim + v];
+        }
+    }
+    for (int s = 0; s < S; s++) for (int h = 0; h < vh; h++) {
+        const float *o = ov + (size_t)s * value_dim + h * vdim, *z = qz + (size_t)s * pd + conv_dim + h * vdim;
+        double m2 = 0; for (int d = 0; d < vdim; d++) m2 += (double)o[d] * o[d];
+        float r = 1.f / sqrtf((float)(m2 / vdim) + eps);
+        for (int d = 0; d < vdim; d++) orr[(size_t)s * value_dim + h * vdim + d] = o[d] * r * nw[d] * (z[d] / (1.f + expf(-z[d])));
+    }
+    cpu_ref(yc, orr, wo, so, 1, S, value_dim, H);
+    double yl2, ymax, sl2, smax, rl2, rmax; size_t n1, n2, n3;
+    coop_err(yg, yc, (size_t)S * H, &yl2, &ymax, &n1);
+    coop_err(stg, stc, (size_t)vh * kdim * vdim, &sl2, &smax, &n2);
+    coop_err(ringg, ringc, (size_t)conv_dim * km, &rl2, &rmax, &n3);
+    printf("DNBLOCK S=%4d H=%d vh=%d vk=%d kdim=%d vdim=%d convk=%d | y relL2 %.2e max %.2e | state %.2e | ring %.2e%s | %.2f ms\n",
+           S, H, vh, vk, kdim, vdim, convk, yl2, ymax, sl2, rl2, (n1 || n2 || n3) ? " NONFINITE" : "", ms);
+    coli_vk_tensor_free(tp); coli_vk_tensor_free(to);
+    free(wp); free(wo); free(sp); free(so); free(x); free(ba); free(cw); free(par); free(nw); free(ring0); free(st0);
+    free(ringg); free(stg); free(yg); free(qz); free(conv); free(ov); free(orr); free(yc); free(ringc); free(stc);
+    /* f16 tiles in the projections when S reaches the tile threshold: bound like the coop tests */
+    return yl2 > 5e-3 || ymax > 3e-2 || sl2 > 5e-3 || rl2 > 1e-3 || n1 || n2 || n3;
+}
+
 /* Prefill attention core against a CPU reference that mirrors qwen36.c's
  * attention(): scores, softmax (max-subtracted), weighted V sum, causal with a
  * prefix of pos_base cached keys, grouped-query heads. */
@@ -2996,6 +3257,10 @@ int main(int argc, char **argv) {
         bad |= run_coop_expert_group(4, 2048, 512, 16, 40, 5, 0.5f);   /* clamp */
         bad |= run_coop_expert_group(2, 6144, 2048, 8, 40, 3, 0.f);
     } else printf("coopmat shaders not loaded (no VK_KHR_cooperative_matrix f16 config, COLI_VK_COOP=0 or missing .spv): skipped\n");
+    if (G.pipe_dc && G.pipe_dr) {
+        bad |= run_dn_block_case(37, 256, 4, 2, 64, 64, 4);      /* small, GEMV projections */
+        bad |= run_dn_block_case(300, 2048, 32, 16, 128, 128, 4);/* Qwen3.6 shapes, tiled projections */
+    } else printf("dn_block shaders not loaded: skipped\n");
     if (G.pipe_dr) {
         bad |= run_dn_recur_case(1, 32, 16, 128, 128);           /* one token */
         bad |= run_dn_recur_case(37, 32, 16, 128, 128);          /* Qwen3.6 shape */

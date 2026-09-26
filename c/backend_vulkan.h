@@ -37,6 +37,11 @@ int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
  * fmt matches QT in glm.c: 1=int8, 2=int4. (0=f32,3=int2 fall back to CPU.)
  * First call uploads W+scales; later calls reuse the resident copy.
  * Returns 1 on success, 0 if unavailable / unsupported fmt. */
+/* A whole DeltaNet layer of a prefill block in one submit (see backend_vulkan.c). */
+int  coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, const float *ba,
+                      const float *convw, const float *par, const float *normw, float *ring, float *state,
+                      int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
+                      float eps, float qscale, float *y);
 /* DeltaNet gated delta rule over a prefill block (see backend_vulkan.c); 0 -> CPU path. */
 float *coli_vk_dn_stage(int which, size_t bytes);
 int  coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn,

@@ -1,0 +1,24 @@
+#version 450
+// DeltaNet causal depthwise conv of a prefill block + SiLU (qwen36.c deltanet_phased
+// step 2, on the GPU). Token s reads inputs s-(convk-1) .. s of its channel; the
+// ones before the block come from the carried ring (slot kk = convk-1-kk tokens
+// back). Same sum order as the CPU: ring slots oldest first, then the input.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer QZ { float qkvz[]; };   // row s at s*pstride, channel cc
+layout(std430, binding = 1) readonly buffer CW { float cw[]; };     // [conv_dim][convk]
+layout(std430, binding = 2) readonly buffer RG { float ring[]; };   // [conv_dim][convk-1]
+layout(std430, binding = 3) writeonly buffer CO { float co[]; };    // [S][conv_dim]
+layout(push_constant) uniform P { int S, conv_dim, convk, pstride; } p;
+void main() {
+    int cc = int(gl_GlobalInvocationID.x), s = int(gl_GlobalInvocationID.y);
+    if (cc >= p.conv_dim || s >= p.S) return;
+    int km = p.convk - 1;
+    float acc = 0.0;
+    for (int kk = 0; kk < km; kk++) {
+        int src = s - km + kk;
+        float v = src >= 0 ? qkvz[src * p.pstride + cc] : ring[cc * km + src + km];
+        acc += cw[cc * p.convk + kk] * v;
+    }
+    acc += cw[cc * p.convk + km] * qkvz[s * p.pstride + cc];
+    co[s * p.conv_dim + cc] = acc / (1.0 + exp(-acc));
+}

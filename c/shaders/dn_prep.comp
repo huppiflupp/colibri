@@ -1,0 +1,33 @@
+#version 450
+// DeltaNet per-token preparation of a prefill block on the GPU: l2-normalised q
+// (times scale) and k per KEY head from the conv output, and beta = sigmoid(b),
+// exp(g) with g = -exp(A_log) * softplus(a + dt_bias) per VALUE head.
+// One subgroup per (token, key head); the first key head's lanes also do beta/g.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer CO { float co[]; };     // [S][conv_dim]
+layout(std430, binding = 1) readonly buffer BA { float ba[]; };     // [S][2*vh]: b | a
+layout(std430, binding = 2) readonly buffer PR { float par[]; };    // [2*vh]: A_log | dt_bias
+layout(std430, binding = 3) writeonly buffer QN { float qn[]; };    // [S][vk][kdim]
+layout(std430, binding = 4) writeonly buffer KN { float kn[]; };    // [S][vk][kdim]
+layout(std430, binding = 5) writeonly buffer BG { float bg[]; };    // [2][S][vh]: beta | exp(g)
+layout(push_constant) uniform P { int S, conv_dim, vk, vh, kdim; float scale; } p;
+float softplus_f(float z) { return z > 20.0 ? z : log(1.0 + exp(z)); }
+void main() {
+    int s = int(gl_WorkGroupID.x), j = int(gl_WorkGroupID.y);
+    int lane = int(gl_LocalInvocationID.x);
+    int ktot = p.vk * p.kdim;
+    int qb = s * p.conv_dim + j * p.kdim, kb = qb + ktot;
+    float sq = 0.0, sk = 0.0;
+    for (int d = lane; d < p.kdim; d += 64) { float a = co[qb + d], b = co[kb + d]; sq += a * a; sk += b * b; }
+    sq = subgroupAdd(sq) + 1e-6; sk = subgroupAdd(sk) + 1e-6;
+    float nq = sqrt(sq), nk = sqrt(sk);
+    int ob = (s * p.vk + j) * p.kdim;
+    for (int d = lane; d < p.kdim; d += 64) { qn[ob + d] = co[qb + d] / nq * p.scale; kn[ob + d] = co[kb + d] / nk; }
+    if (j == 0) for (int h = lane; h < p.vh; h += 64) {
+        float b = ba[s * 2 * p.vh + h], a = ba[s * 2 * p.vh + p.vh + h];
+        bg[s * p.vh + h] = 1.0 / (1.0 + exp(-b));
+        float g = -exp(par[h]) * softplus_f(a + par[p.vh + h]);
+        bg[p.S * p.vh + s * p.vh + h] = exp(g);
+    }
+}
