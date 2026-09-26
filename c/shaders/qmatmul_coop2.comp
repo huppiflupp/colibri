@@ -1,6 +1,6 @@
 #version 450
 // Tiled int8/int4 matmul on the cooperative-matrix units, second generation:
-// 256 invocations (4 x wave64 or 8 x wave32) per workgroup, a block of 128
+// 256 invocations (4 x wave64; the host enables it only for subgroup size 64) per workgroup, a block of 128
 // output rows x 16*TT token rows. Compared with qmatmul_coop.comp (64 x 32 on
 // one wave) every dequantised weight serves up to 4x more token rows and every
 // wave issues more matrix multiply-adds per dequantisation step.
@@ -40,10 +40,10 @@ layout(push_constant) uniform P { int fmt, S, I, O, rowWords, gs; } p;
 
 #define BO 128u                        // output rows per workgroup (8 tiles)
 #define TM (16u * TT)                  // token rows per workgroup
-shared float16_t sx[TM * 64u];         // x slice [token][k]
-shared float16_t sg[BO * 64u];         // gate (or the only) weights [out][k]
+shared uvec4 sx[TM * 8u];              // x slice, A tiles row-major, 8 f16 per uvec4
+shared uvec4 sg[BO * 8u];              // weights, B tiles COLUMN-major (= W[n][k], k contiguous)
 #ifdef GATE_UP
-shared float16_t su[BO * 64u];
+shared uvec4 su[BO * 8u];
 #endif
 shared float spatch[8u * 256u];        // per-subgroup 16x16 patch for partial token tiles
 
@@ -52,67 +52,12 @@ shared float spatch[8u * 256u];        // per-subgroup 16x16 patch for partial t
 // array are what made the first version slow (RADV, cf. Kernel-Lab E020/E030).
 //   x:  A tile (token tile t, k tile kt), element (row r, col k)  -> r*16 + k
 //   W:  B tile (out tile q, k tile kt), B(k, n) = W[n][k], row-major -> k*16 + n
-#ifdef BCOL   // B tile stored column-major (W[n][k] contiguous in k), loaded ColumnMajor
 uint wix(uint n, uint k) { return ((n >> 4u) * 4u + (k >> 4u)) * 256u + (n & 15u) * 16u + (k & 15u); }
-#define BLAYOUT gl_CooperativeMatrixLayoutColumnMajor
-#else
-uint wix(uint n, uint k) { return ((n >> 4u) * 4u + (k >> 4u)) * 256u + (k & 15u) * 16u + (n & 15u); }
-#define BLAYOUT gl_CooperativeMatrixLayoutRowMajor
-#endif
 uint xix(uint r, uint k) { return ((r >> 4u) * 4u + (k >> 4u)) * 256u + (r & 15u) * 16u + (k & 15u); }
 
-// Lanes 2n and 2n+1 dequantise weight row o0+n: inputs k0 + 32*hf .. +31.
-void dequant_half(uint o0, uint k0, uint tid, bool up) {
-    uint n = tid >> 1u, hf = tid & 1u, o = o0 + n;
-    uint kb = k0 + 32u * hf;
-    int ng = (p.I + p.gs - 1) / max(p.gs, 1);
-    if (p.fmt == 1) {                  // int8: 8 words of 4 bytes, per-row scale
-        uint rb = o * uint(p.rowWords) + kb / 4u;
-#ifdef GATE_UP
-        float sc = up ? uscale[o] : gscale[o];
-#else
-        float sc = gscale[o];
+#ifndef DBUF
+#error v2 needs -DDBUF
 #endif
-        [[unroll]] for (uint j = 0u; j < 8u; j++) {
-#ifdef GATE_UP
-            uint wd = up ? wu[rb + j] : wg[rb + j];
-#else
-            uint wd = wg[rb + j];
-#endif
-            [[unroll]] for (uint k = 0u; k < 4u; k++) {
-                int b = int((wd >> (8u * k)) & 0xffu); if (b >= 128) b -= 256;
-                float16_t v = float16_t(float(b) * sc);
-#ifdef GATE_UP
-                if (up) su[wix(n, 32u * hf + 4u * j + k)] = v; else
-#endif
-                sg[wix(n, 32u * hf + 4u * j + k)] = v;
-            }
-        }
-        return;
-    }
-    uint rb = o * uint(p.rowWords) + kb / 8u;   // int4: 4 words of 8 nibbles
-    [[unroll]] for (uint j = 0u; j < 4u; j++) {
-#ifdef GATE_UP
-        uint wd = up ? wu[rb + j] : wg[rb + j];
-#else
-        uint wd = wg[rb + j];
-#endif
-        uint si = p.fmt == 4 ? o * uint(ng) + (kb + 8u * j) / uint(p.gs) : o;
-#ifdef GATE_UP
-        float sc = up ? uscale[si] : gscale[si];
-#else
-        float sc = gscale[si];
-#endif
-        [[unroll]] for (uint k = 0u; k < 8u; k++) {
-            float16_t v = float16_t(float(int((wd >> (4u * k)) & 0xfu) - 8) * sc);
-#ifdef GATE_UP
-            if (up) su[wix(n, 32u * hf + 8u * j + k)] = v; else
-#endif
-            sg[wix(n, 32u * hf + 8u * j + k)] = v;
-        }
-    }
-}
-
 #ifdef DBUF
 // Register double buffering: the raw words, scales and x values of the NEXT 64-input
 // step are fetched into registers while the matrix units work on the current step
@@ -127,9 +72,10 @@ float rsu[4];
 float rx[XPL];
 void fetch_raw(uint s0, uint o0, uint k0, uint tid) {
     uint K = uint(p.I), S = uint(p.S);
-    [[unroll]] for (uint i = 0u; i < XPL; i++) {
-        uint j = tid + i * 256u, r = j / 64u, kk = j % 64u;
-        rx[i] = s0 + r < S ? x[(s0 + r) * K + k0 + kk] : 0.0;
+    {
+        uint r = tid / (64u / XPL), kk = (tid % (64u / XPL)) * XPL;
+        bool ok = s0 + r < S;
+        [[unroll]] for (uint i = 0u; i < XPL; i++) rx[i] = ok ? x[(s0 + r) * K + k0 + kk + i] : 0.0;
     }
     uint n = tid >> 1u, hf = tid & 1u, o = o0 + n, kb = k0 + 32u * hf;
     int ng = (p.I + p.gs - 1) / max(p.gs, 1);
@@ -152,26 +98,43 @@ void fetch_raw(uint s0, uint o0, uint k0, uint tid) {
         }
     }
 }
+uint pk(float a, float b) { return packFloat2x16(f16vec2(float16_t(a), float16_t(b))); }
+uint i8(uint w, uint k) { return uint(int(w << (24u - 8u * k)) >> 24); }
 void store_raw(uint tid) {
-    [[unroll]] for (uint i = 0u; i < XPL; i++) {
-        uint j = tid + i * 256u;
-        sx[xix(j / 64u, j % 64u)] = float16_t(rx[i]);
+    {
+        uint r = tid / (64u / XPL), kk = (tid % (64u / XPL)) * XPL;
+        [[unroll]] for (uint c = 0u; c < XPL / 8u; c++) {
+            uint k = kk + 8u * c;
+            uint base = ((r >> 4u) * 4u + (k >> 4u)) * 32u + (r & 15u) * 2u + ((k & 15u) >> 3u);
+            sx[base] = uvec4(pk(rx[8u*c], rx[8u*c+1u]), pk(rx[8u*c+2u], rx[8u*c+3u]), pk(rx[8u*c+4u], rx[8u*c+5u]), pk(rx[8u*c+6u], rx[8u*c+7u]));
+        }
     }
     uint n = tid >> 1u, hf = tid & 1u;
+    // lane's 32 values = k tiles 2hf, 2hf+1; 2 uvec4 per tile row
+    uint wb = ((n >> 4u) * 4u + 2u * hf) * 32u + (n & 15u) * 2u;
     if (p.fmt == 1) {
-        [[unroll]] for (uint j = 0u; j < 8u; j++) [[unroll]] for (uint k = 0u; k < 4u; k++) {
-            int b = int((rwg[j] >> (8u * k)) & 0xffu); if (b >= 128) b -= 256;
-            sg[wix(n, 32u * hf + 4u * j + k)] = float16_t(float(b) * rsg[0]);
+        [[unroll]] for (uint j = 0u; j < 8u; j += 2u) {   // 2 words = 8 values = one uvec4
+            float a = rsg[0];
+            uvec4 v = uvec4(pk(float(int(i8(rwg[j],0u)))*a, float(int(i8(rwg[j],1u)))*a), pk(float(int(i8(rwg[j],2u)))*a, float(int(i8(rwg[j],3u)))*a),
+                            pk(float(int(i8(rwg[j+1u],0u)))*a, float(int(i8(rwg[j+1u],1u)))*a), pk(float(int(i8(rwg[j+1u],2u)))*a, float(int(i8(rwg[j+1u],3u)))*a));
+            uint e = wb + (j >> 2u) * 32u + ((j >> 1u) & 1u);
+            sg[e] = v;
 #ifdef GATE_UP
-            int c = int((rwu[j] >> (8u * k)) & 0xffu); if (c >= 128) c -= 256;
-            su[wix(n, 32u * hf + 4u * j + k)] = float16_t(float(c) * rsu[0]);
+            float b = rsu[0];
+            su[e] = uvec4(pk(float(int(i8(rwu[j],0u)))*b, float(int(i8(rwu[j],1u)))*b), pk(float(int(i8(rwu[j],2u)))*b, float(int(i8(rwu[j],3u)))*b),
+                          pk(float(int(i8(rwu[j+1u],0u)))*b, float(int(i8(rwu[j+1u],1u)))*b), pk(float(int(i8(rwu[j+1u],2u)))*b, float(int(i8(rwu[j+1u],3u)))*b));
 #endif
         }
     } else {
-        [[unroll]] for (uint j = 0u; j < 4u; j++) [[unroll]] for (uint k = 0u; k < 8u; k++) {
-            sg[wix(n, 32u * hf + 8u * j + k)] = float16_t(float(int((rwg[j] >> (4u * k)) & 0xfu) - 8) * rsg[j]);
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {        // 1 word = 8 nibbles = one uvec4
+            float a = rsg[j]; uint w = rwg[j];
+            uvec4 v; [[unroll]] for (uint c = 0u; c < 4u; c++) v[c] = pk(float(int((w >> (8u*c)) & 0xfu) - 8) * a, float(int((w >> (8u*c+4u)) & 0xfu) - 8) * a);
+            uint e = wb + (j >> 1u) * 32u + (j & 1u);
+            sg[e] = v;
 #ifdef GATE_UP
-            su[wix(n, 32u * hf + 8u * j + k)] = float16_t(float(int((rwu[j] >> (4u * k)) & 0xfu) - 8) * rsu[j]);
+            float b = rsu[j]; uint u = rwu[j];
+            [[unroll]] for (uint c = 0u; c < 4u; c++) v[c] = pk(float(int((u >> (8u*c)) & 0xfu) - 8) * b, float(int((u >> (8u*c+4u)) & 0xfu) - 8) * b);
+            su[e] = v;
 #endif
         }
     }
@@ -229,17 +192,15 @@ void main() {
 #endif
         [[unroll]] for (uint kt = 0u; kt < 4u; kt++) {
             [[unroll]] for (uint t = 0u; t < TT; t++)
-                coopMatLoad(A[t], sx, (t * 4u + kt) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(A[t], sx, (t * 4u + kt) * 32u, 2u, gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint qi = 0u; qi < MAXQ; qi++) {
-                if (qi >= nq) break;                       // subgroup-uniform
-                uint q = sgi + qi * nsg;
-                if (q >= 8u) break;
-                coopMatLoad(B, sg, (q * 4u + kt) * 256u, 16u, BLAYOUT);
+                uint q = sgi + qi * 4u;                    // wave64 assumed (requiredSubgroupSize = 64)
+                coopMatLoad(B, sg, (q * 4u + kt) * 32u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
 #ifndef EXP_NOMMA
                 [[unroll]] for (uint t = 0u; t < TT; t++) G[qi * TT + t] = coopMatMulAdd(A[t], B, G[qi * TT + t]);
 #endif
 #ifdef GATE_UP
-                coopMatLoad(B, su, (q * 4u + kt) * 256u, 16u, BLAYOUT);
+                coopMatLoad(B, su, (q * 4u + kt) * 32u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
                 [[unroll]] for (uint t = 0u; t < TT; t++) U[qi * TT + t] = coopMatMulAdd(A[t], B, U[qi * TT + t]);
 #endif
             }
