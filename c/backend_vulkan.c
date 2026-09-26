@@ -420,7 +420,7 @@ static int mr_use(int fmt, int S, int I, int O) {
 /* Pipeline and grid of a tiled dispatch (coop_use said yes): the second-generation
  * tiles when the output dimension fits their 128-row blocks, else the first. */
 static VkPipeline coop_pick(int gate_up, int S, int O, uint32_t *gx, uint32_t *gy) {
-    if (G.coop2 && O % 128 == 0) {
+    if (G.coop2 && G.sgsize == 64 && O % 128 == 0) {   /* gen 2 hard-codes 4 x wave64 */
         int v = S >= G.coop2_split;
         int tm = 16 * G.coop2_tt[v];
         *gx = (uint32_t)((S + tm - 1) / tm); *gy = (uint32_t)(O / 128);
@@ -706,11 +706,16 @@ int coli_vk_init(const char *spv_path) {
                 G.coop = 1;
         }
         /* second generation, on top: COLI_VK_COOP2=0 off, COLI_VK_COOP2_TT=<small>,<large>
-         * (default 2,4), COLI_VK_COOP2_SPLIT=<rows> (default 64) */
+         * (default 2,8), COLI_VK_COOP2_SPLIT=<rows> (default 64) */
         const char *e2 = getenv("COLI_VK_COOP2"), *t2 = getenv("COLI_VK_COOP2_TT"), *sp = getenv("COLI_VK_COOP2_SPLIT");
-        G.coop2 = 0; G.coop2_tt[0] = 2; G.coop2_tt[1] = 4; G.coop2_split = sp ? atoi(sp) : 64;
+        G.coop2 = 0; G.coop2_tt[0] = 2; G.coop2_tt[1] = 8; G.coop2_split = sp ? atoi(sp) : 64;
         if (t2) sscanf(t2, "%d,%d", &G.coop2_tt[0], &G.coop2_tt[1]);
-        for (int v = 0; v < 2; v++) if (G.coop2_tt[v] < 1 || G.coop2_tt[v] > 8) G.coop2_tt[v] = v ? 4 : 2;
+        /* gen 2 needs TT >= 2 (its x staging reads two token tiles per lane group;
+         * TT=1 computed garbage in the harness) */
+        for (int v = 0; v < 2; v++) if (G.coop2_tt[v] < 2 || G.coop2_tt[v] > 8) {
+            fprintf(stderr, "[VK] COLI_VK_COOP2_TT: %d not supported (2..8), using %d\n", G.coop2_tt[v], v ? 8 : 2);
+            G.coop2_tt[v] = v ? 8 : 2;
+        }
         if (G.coop && !(e2 && *e2 == '0') && dp.limits.maxComputeSharedMemorySize >= 57344) {   /* TT=8 gate_up: 56 KiB */
             char p1[512], p2[512];
             derive_sibling(spv_path, "_coop2.spv", p1, sizeof(p1));
