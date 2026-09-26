@@ -107,6 +107,71 @@ void dequant_half(uint o0, uint k0, uint tid, bool up) {
     }
 }
 
+#ifdef DBUF
+// Register double buffering: the raw words, scales and x values of the NEXT 64-input
+// step are fetched into registers while the matrix units work on the current step
+// out of shared memory; they are dequantised into shared memory after a barrier.
+#define XPL (TM * 64u / 256u)          // x values per lane per step
+uint rwg[8];
+float rsg[4];
+#ifdef GATE_UP
+uint rwu[8];
+float rsu[4];
+#endif
+float rx[XPL];
+void fetch_raw(uint s0, uint o0, uint k0, uint tid) {
+    uint K = uint(p.I), S = uint(p.S);
+    [[unroll]] for (uint i = 0u; i < XPL; i++) {
+        uint j = tid + i * 256u, r = j / 64u, kk = j % 64u;
+        rx[i] = s0 + r < S ? x[(s0 + r) * K + k0 + kk] : 0.0;
+    }
+    uint n = tid >> 1u, hf = tid & 1u, o = o0 + n, kb = k0 + 32u * hf;
+    int ng = (p.I + p.gs - 1) / max(p.gs, 1);
+    if (p.fmt == 1) {
+        uint rb = o * uint(p.rowWords) + kb / 4u;
+        [[unroll]] for (uint j = 0u; j < 8u; j++) rwg[j] = wg[rb + j];
+        rsg[0] = gscale[o];
+#ifdef GATE_UP
+        [[unroll]] for (uint j = 0u; j < 8u; j++) rwu[j] = wu[rb + j];
+        rsu[0] = uscale[o];
+#endif
+    } else {
+        uint rb = o * uint(p.rowWords) + kb / 8u;
+        [[unroll]] for (uint j = 0u; j < 4u; j++) {
+            uint si = p.fmt == 4 ? o * uint(ng) + (kb + 8u * j) / uint(p.gs) : o;
+            rwg[j] = wg[rb + j]; rsg[j] = gscale[si];
+#ifdef GATE_UP
+            rwu[j] = wu[rb + j]; rsu[j] = uscale[si];
+#endif
+        }
+    }
+}
+void store_raw(uint tid) {
+    [[unroll]] for (uint i = 0u; i < XPL; i++) {
+        uint j = tid + i * 256u;
+        sx[xix(j / 64u, j % 64u)] = float16_t(rx[i]);
+    }
+    uint n = tid >> 1u, hf = tid & 1u;
+    if (p.fmt == 1) {
+        [[unroll]] for (uint j = 0u; j < 8u; j++) [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            int b = int((rwg[j] >> (8u * k)) & 0xffu); if (b >= 128) b -= 256;
+            sg[wix(n, 32u * hf + 4u * j + k)] = float16_t(float(b) * rsg[0]);
+#ifdef GATE_UP
+            int c = int((rwu[j] >> (8u * k)) & 0xffu); if (c >= 128) c -= 256;
+            su[wix(n, 32u * hf + 4u * j + k)] = float16_t(float(c) * rsu[0]);
+#endif
+        }
+    } else {
+        [[unroll]] for (uint j = 0u; j < 4u; j++) [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            sg[wix(n, 32u * hf + 8u * j + k)] = float16_t(float(int((rwg[j] >> (4u * k)) & 0xfu) - 8) * rsg[j]);
+#ifdef GATE_UP
+            su[wix(n, 32u * hf + 8u * j + k)] = float16_t(float(int((rwu[j] >> (4u * k)) & 0xfu) - 8) * rsu[j]);
+#endif
+        }
+    }
+}
+#endif
+
 // Each subgroup owns output tiles q = sgi, sgi + nsg, ... (8 per workgroup) for
 // all TT token tiles: MAXQ tiles per subgroup at most (8 with one wave64 group of 4).
 #define MAXQ 2u
@@ -132,7 +197,16 @@ void main() {
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A[TT];
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
 
+#ifdef DBUF
+    fetch_raw(s0, o0, 0u, tid);
+    store_raw(tid);
+    barrier();
+#endif
     for (uint k0 = 0u; k0 < K; k0 += 64u) {
+#ifdef DBUF
+        bool nxt = k0 + 64u < K;                       // workgroup-uniform
+        if (nxt) fetch_raw(s0, o0, k0 + 64u, tid);     // in flight during the multiply below
+#else
 #ifndef EXP_NOX
         for (uint j = tid; j < TM * 64u; j += 256u) {
             uint r = j / 64u, kk = j % 64u;
@@ -146,6 +220,7 @@ void main() {
 #endif
 #endif
         barrier();
+#endif
         [[unroll]] for (uint kt = 0u; kt < 4u; kt++) {
             [[unroll]] for (uint t = 0u; t < TT; t++)
                 coopMatLoad(A[t], sx, (t * 4u + kt) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
@@ -164,6 +239,9 @@ void main() {
             }
         }
         barrier();
+#ifdef DBUF
+        if (nxt) { store_raw(tid); barrier(); }
+#endif
     }
 
     uint lane = gl_SubgroupInvocationID, sgsz = gl_SubgroupSize;
