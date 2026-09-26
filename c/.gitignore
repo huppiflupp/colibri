@@ -58,3 +58,5 @@ shaders/rmsnorm.spv
 tests/xdna_exec_fixtures/
 tests/xdna_fail_fixtures/
 tests/xdna_physical_probe
+shaders/qmatmul_coop.spv
+shaders/qmatmul_gate_up_coop.spv
