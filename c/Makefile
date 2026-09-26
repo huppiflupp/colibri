@@ -683,7 +683,7 @@ ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o
-VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -817,6 +817,10 @@ colibri$(EXE): colibri.c sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_arg
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
 backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
+# The fused gate+up variant of the tiled shader is the same source with -DGATE_UP.
+shaders/qmatmul_gate_up_coop.spv: shaders/qmatmul_coop.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@

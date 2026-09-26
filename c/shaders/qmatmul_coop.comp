@@ -1,0 +1,139 @@
+#version 450
+// Tiled int4 matmul on the cooperative-matrix units (VK_KHR_cooperative_matrix,
+// 16x16x16 f16 x f16 -> f32), for S >= a row threshold, next to the GEMV shaders:
+//   y[s,o] = sum_i x[s,i] * dequant(W[o,i])                      (default)
+//   hid[s,o] = silu(gate[s,o]) * up[s,o]                          (-DGATE_UP)
+// One workgroup = 64 output rows x TM = 16*TT token rows. The input dimension
+// is walked in steps of 64: each lane dequantises one weight row's 64 values
+// (int4 nibble - 8, times its scale) to f16 in shared memory, the x slice is
+// converted to f16 beside it, and the subgroups multiply 16x16 tiles out of
+// shared memory. Results go through shared memory so padded token rows are
+// never stored. Inputs are rounded to f16 on the way in: NOT bit-identical to
+// the GEMV shaders; the harness bounds it against the CPU reference.
+// fmt: 2 = int4 with one scale per row, 4 = grouped int4 (gs % 8 == 0).
+// Host gates: I % 64 == 0, O % 64 == 0.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint TT = 2;          // 16-row token tiles per workgroup
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+#ifdef GATE_UP
+layout(std430, binding = 1) readonly buffer WG { uint  wg[]; };
+layout(std430, binding = 2) readonly buffer SG { float gscale[]; };
+layout(std430, binding = 3) readonly buffer WU { uint  wu[]; };
+layout(std430, binding = 4) readonly buffer SU { float uscale[]; };
+layout(std430, binding = 5) writeonly buffer H { float y[]; };
+layout(push_constant) uniform P { int fmt, S, I, O, rowWords, gs; float limit; } p;
+#else
+layout(std430, binding = 1) readonly buffer W  { uint  wg[]; };
+layout(std430, binding = 2) readonly buffer Sc { float gscale[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform P { int fmt, S, I, O, rowWords, gs; } p;
+#endif
+
+#define TM (16u * TT)
+shared float16_t sx[TM * 64u];          // x slice [token][k]
+shared float16_t sg[64u * 64u];         // gate (or the only) weights [out][k]
+#ifdef GATE_UP
+shared float16_t su[64u * 64u];         // up weights [out][k]
+#endif
+shared float so[TM * 64u];              // result staging [token][out]
+
+void dequant_row(uint o, uint k0, uint n, bool up) {
+    // one lane: weight row o, inputs k0..k0+63 -> shared row n (8 words of 8 nibbles)
+    uint rb = o * uint(p.rowWords) + k0 / 8u;
+    int ng = (p.I + p.gs - 1) / max(p.gs, 1);
+    [[unroll]] for (uint j = 0u; j < 8u; j++) {
+#ifdef GATE_UP
+        uint wd = up ? wu[rb + j] : wg[rb + j];
+        uint si = p.fmt == 4 ? o * uint(ng) + (k0 + 8u * j) / uint(p.gs) : o;
+        float sc = up ? uscale[si] : gscale[si];
+#else
+        uint wd = wg[rb + j];
+        float sc = p.fmt == 4 ? gscale[o * uint(ng) + (k0 + 8u * j) / uint(p.gs)] : gscale[o];
+#endif
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            float v = float(int((wd >> (4u * k)) & 0xfu) - 8) * sc;
+#ifdef GATE_UP
+            if (up) su[n * 64u + 8u * j + k] = float16_t(v); else
+#endif
+            sg[n * 64u + 8u * j + k] = float16_t(v);
+        }
+    }
+}
+
+void main() {
+    uint o0 = gl_WorkGroupID.x * 64u;
+    uint s0 = gl_WorkGroupID.y * TM;
+    uint tid = gl_LocalInvocationID.x;
+    uint nsg = gl_NumSubgroups, sgi = gl_SubgroupID;   // 1 x wave64 or 2 x wave32
+    uint K = uint(p.I), S = uint(p.S);
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> G[TT * 4u];
+#ifdef GATE_UP
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> U[TT * 4u];
+#endif
+    [[unroll]] for (uint t = 0u; t < TT * 4u; t++) {
+        G[t] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+#ifdef GATE_UP
+        U[t] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+#endif
+    }
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A[TT];
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+
+    for (uint k0 = 0u; k0 < K; k0 += 64u) {
+        for (uint j = tid; j < TM * 64u; j += 64u) {
+            uint r = j / 64u, kk = j % 64u;
+            sx[j] = s0 + r < S ? float16_t(x[(s0 + r) * K + k0 + kk]) : float16_t(0.0);
+        }
+        dequant_row(o0 + tid, k0, tid, false);
+#ifdef GATE_UP
+        dequant_row(o0 + tid, k0, tid, true);
+#endif
+        barrier();
+        [[unroll]] for (uint kt = 0u; kt < 4u; kt++) {
+            [[unroll]] for (uint t = 0u; t < TT; t++)
+                coopMatLoad(A[t], sx, t * 16u * 64u + kt * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint q = 0u; q < 4u; q++) {
+                if (q % nsg != sgi) continue;               // subgroup-uniform
+                // B(k, n) = W[n][k]: output n's weights are contiguous in k -> column-major
+                coopMatLoad(B, sg, q * 16u * 64u + kt * 16u, 64u, gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint t = 0u; t < TT; t++) G[t * 4u + q] = coopMatMulAdd(A[t], B, G[t * 4u + q]);
+#ifdef GATE_UP
+                coopMatLoad(B, su, q * 16u * 64u + kt * 16u, 64u, gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint t = 0u; t < TT; t++) U[t * 4u + q] = coopMatMulAdd(A[t], B, U[t * 4u + q]);
+#endif
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        if (q % nsg != sgi) continue;
+        [[unroll]] for (uint t = 0u; t < TT; t++) {
+#ifdef GATE_UP
+            // gate and up tiles share one element mapping, so the SwiGLU is elementwise
+            for (int e = 0; e < G[t * 4u + q].length(); e++) {
+                float gt = G[t * 4u + q][e], ut = U[t * 4u + q][e];
+                if (p.limit > 0.0) {
+                    if (gt > p.limit) gt = p.limit;
+                    if (ut > p.limit) ut = p.limit;
+                    if (ut < -p.limit) ut = -p.limit;
+                }
+                G[t * 4u + q][e] = (gt / (1.0 + exp(-gt))) * ut;
+            }
+#endif
+            coopMatStore(G[t * 4u + q], so, t * 16u * 64u + q * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+    barrier();
+    for (uint j = tid; j < TM * 64u; j += 64u) {
+        uint r = j / 64u, n = j % 64u;
+        if (s0 + r < S) y[(s0 + r) * uint(p.O) + o0 + n] = so[j];
+    }
+}

@@ -93,6 +93,10 @@ static struct {
      * rows, each weight word read once for all of them. Same layouts as pipe / pipe_gu,
      * so the existing descriptor sets bind to either. Optional: absent -> one-row path. */
     VkShaderModule shader_mr, shader_gu_mr; VkPipeline pipe_mr, pipe_gu_mr; int mr;
+    /* Tiled cooperative-matrix variants (qmatmul_coop / qmatmul_gate_up_coop), same
+     * layouts again. coop = usable; coop_min = fewest token rows that take them. */
+    VkShaderModule shader_co, shader_gu_co; VkPipeline pipe_co, pipe_gu_co; int coop, coop_min;
+    int has_coop_dev;    /* device created with cooperativeMatrix + shaderFloat16 + vulkanMemoryModel */
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
@@ -365,6 +369,15 @@ static int mr_use(int fmt, int S, int I, int O) {
     if (g_mr_any) return 1;
     return S >= 8 && I <= 8192 && (size_t)I * (size_t)O >= ((size_t)4 << 20);
 }
+/* Tiled cooperative-matrix shader for this dispatch? int4 formats, both dims a
+ * multiple of its 64-wide tiles, at least coop_min token rows. Takes precedence
+ * over the multi-row shader. 32 token rows x 64 outputs per workgroup. */
+static int g_coop_any;
+static int coop_use(int fmt, int S, int I, int O, int gs) {
+    if (!G.coop || !(fmt == 2 || fmt == 4) || I % 64 || O % 64) return 0;
+    if (fmt == 4 && (gs < 8 || gs % 8)) return 0;
+    return S >= (g_coop_any ? 1 : G.coop_min);
+}
 
 /* "…/qmatmul.spv" -> "…/qmatmul<suffix>" (sibling of the main shader). */
 static void derive_sibling(const char *spv, const char *suffix, char *out, size_t n) {
@@ -428,7 +441,7 @@ int coli_vk_init(const char *spv_path) {
     /* Pressure-proofing extensions (both optional, detected at runtime):
      * memory_priority ranks allocations for the kernel's eviction order,
      * memory_budget exposes how much VRAM a new allocation can still take. */
-    const char *dext[3]; uint32_t ndext = 0;
+    const char *dext[4]; uint32_t ndext = 0;
     {
         uint32_t ne = 0;
         vkEnumerateDeviceExtensionProperties(G.phys, NULL, &ne, NULL);
@@ -443,12 +456,55 @@ int coli_vk_init(const char *spv_path) {
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G.has_budget = 1;
 #endif
                 if (!strcmp(ep[i].extensionName, "VK_KHR_portability_subset")) G.has_portability = 1;
+#ifdef VK_KHR_cooperative_matrix
+                if (!strcmp(ep[i].extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) G.has_coop_dev = 1;
+#endif
             }
             free(ep);
         }
     }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
+#ifdef VK_KHR_cooperative_matrix
+    /* Optional tiled matmul on the matrix units: needs the extension, its feature,
+     * f16 arithmetic and the Vulkan memory model, plus a 16x16x16 f16 x f16 -> f32
+     * subgroup configuration. Missing any of them -> the GEMV shaders only. */
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    VkPhysicalDeviceVulkan12Features v12 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    if (G.has_coop_dev) {
+        v12.pNext = &cmf;
+        VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &v12};
+        vkGetPhysicalDeviceFeatures2(G.phys, &f2);
+        int cfg = 0;
+        PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR gp = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+            vkGetInstanceProcAddr(G.inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+        uint32_t nc = 0;
+        if (gp && gp(G.phys, &nc, NULL) == VK_SUCCESS && nc) {
+            VkCooperativeMatrixPropertiesKHR *cp = calloc(nc, sizeof(*cp));
+            if (cp) {
+                for (uint32_t i = 0; i < nc; i++) cp[i].sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                if (gp(G.phys, &nc, cp) == VK_SUCCESS)
+                    for (uint32_t i = 0; i < nc; i++)
+                        if (cp[i].MSize == 16 && cp[i].NSize == 16 && cp[i].KSize == 16 &&
+                            cp[i].AType == VK_COMPONENT_TYPE_FLOAT16_KHR && cp[i].BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                            cp[i].CType == VK_COMPONENT_TYPE_FLOAT32_KHR && cp[i].ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                            cp[i].scope == VK_SCOPE_SUBGROUP_KHR) cfg = 1;
+                free(cp);
+            }
+        }
+        G.has_coop_dev = cfg && cmf.cooperativeMatrix && v12.shaderFloat16 && v12.vulkanMemoryModel;
+        if (G.has_coop_dev) {
+            memset(&v12, 0, sizeof v12); v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+            v12.shaderFloat16 = VK_TRUE; v12.vulkanMemoryModel = VK_TRUE;
+            memset(&cmf, 0, sizeof cmf); cmf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+            cmf.cooperativeMatrix = VK_TRUE;
+            v12.pNext = &cmf; cmf.pNext = (void *)di.pNext; di.pNext = &v12;
+            dext[ndext++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+        }
+    }
+#endif
 #ifdef VK_EXT_memory_priority
     VkPhysicalDeviceMemoryPriorityFeaturesEXT prif = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
@@ -561,6 +617,27 @@ int coli_vk_init(const char *spv_path) {
         }
     }
 
+    /* Optional tiled cooperative-matrix pipelines. COLI_VK_COOP=0 turns them off,
+     * COLI_VK_COOP_MIN=<rows> sets the fewest token rows that take them (default 16). */
+    {
+        const char *e = getenv("COLI_VK_COOP"), *mn = getenv("COLI_VK_COOP_MIN");
+        G.coop = 0; G.coop_min = mn ? atoi(mn) : 16;
+        if (G.coop_min < 2) G.coop_min = 2;
+        VkPhysicalDeviceProperties dp; vkGetPhysicalDeviceProperties(G.phys, &dp);
+        if (G.has_coop_dev && !(e && *e == '0') && G.shader_gu &&
+            dp.limits.maxComputeSharedMemorySize >= 32768) {   /* 32-row tiles: ~28 KiB shared */
+            char p1[512], p2[512];
+            derive_sibling(spv_path, "_coop.spv", p1, sizeof(p1));
+            derive_sibling(spv_path, "_gate_up_coop.spv", p2, sizeof(p2));
+            G.shader_co = load_spv(G.dev, p1);
+            G.shader_gu_co = G.shader_co ? load_spv(G.dev, p2) : VK_NULL_HANDLE;
+            if (G.shader_co && G.shader_gu_co &&
+                build_pipeline_mr(G.dev, G.plyt, G.shader_co, 2, &G.pipe_co) &&
+                build_pipeline_mr(G.dev, G.plyt_gu, G.shader_gu_co, 2, &G.pipe_gu_co))
+                G.coop = 1;
+        }
+    }
+
     /* Optional MLA absorb attention pipeline (same directory as the main shader). */
     /* Optional rmsnorm pipeline: enables the pair->norm->q_b single-submit chain
      * (coli_vk_attn_qprep); absent -> callers keep the 3-submit path. */
@@ -606,9 +683,9 @@ int coli_vk_init(const char *spv_path) {
 
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
-    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s, weights %s\n", p.deviceName, G.qfam, G.memtype,
+    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s%s, weights %s\n", p.deviceName, G.qfam, G.memtype,
             G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "",
-            G.staged ? "staged" : "mapped");
+            G.coop ? ", coopmat tiles" : "", G.staged ? "staged" : "mapped");
     return 1;
 }
 
@@ -935,15 +1012,16 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-        int mr = mr_use(fmt, S, I, O);
-        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mr ? G.pipe_mr : G.pipe);
+        int co = coop_use(fmt, S, I, O, t->gs), mr = !co && mr_use(fmt, S, I, O);
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, co ? G.pipe_co : mr ? G.pipe_mr : G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
         struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
         vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
          * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width.
          * The multi-row shader covers MR token rows per workgroup in y. */
-        vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
+        if (co) vkCmdDispatch(G.cmd, (uint32_t)(O / 64), (uint32_t)((S + 31) / 32), 1);
+        else vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
         VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
         G.cmd_ready = 1; G.bound_S = S; G.bound_I = I; G.bound_O = O;
     }
@@ -1001,12 +1079,13 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-    int mr = mr_use(fmt, S, D, I);
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mr ? G.pipe_gu_mr : G.pipe_gu);
+    int co = coop_use(fmt, S, D, I, tg->gs), mr = !co && mr_use(fmt, S, D, I);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, co ? G.pipe_gu_co : mr ? G.pipe_gu_mr : G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
     struct PCGU pc = pcgu(fmt, S, D, I, tg->rowWords, tg->gs);   // PC.I = input D, PC.O = moe_inter I
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
+    if (co) vkCmdDispatch(G.cmd, (uint32_t)(I / 64), (uint32_t)((S + 31) / 32), 1);
+    else vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
@@ -1098,25 +1177,27 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
      * one-row shader; order within a phase is free (the dispatches are independent). */
     VkPipeline bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
-        int mr = mr_use(fmt, rows[c], D, I);
-        VkPipeline want = mr ? G.pipe_gu_mr : G.pipe_gu;
+        int co = coop_use(fmt, rows[c], D, I, gates[c]->gs), mr = !co && mr_use(fmt, rows[c], D, I);
+        VkPipeline want = co ? G.pipe_gu_co : mr ? G.pipe_gu_mr : G.pipe_gu;
         if (want != bound) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); bound = want; }
         struct PCGU pc = pcgu(fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs);
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
+        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)(I / 64), (uint32_t)((rows[c] + 31) / 32), 1);
+        else vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
     vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     /* phase 2: down projection hidden -> y */
     bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
-        int mr = mr_use(dfmt, rows[c], I, D);
-        VkPipeline want = mr ? G.pipe_mr : G.pipe;
+        int co = coop_use(dfmt, rows[c], I, D, downs[c]->gs), mr = !co && mr_use(dfmt, rows[c], I, D);
+        VkPipeline want = co ? G.pipe_co : mr ? G.pipe_mr : G.pipe;
         if (want != bound) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); bound = want; }
         struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
+        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)(D / 64), (uint32_t)((rows[c] + 31) / 32), 1);
+        else vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
     VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
     if (G.eg_prof) G.eg_t3 = vk_now();
@@ -1907,6 +1988,10 @@ void coli_vk_shutdown(void) {
     vkDestroyPipelineLayout(G.dev, G.plyt, NULL);
     vkDestroyDescriptorSetLayout(G.dev, G.dsl, NULL);
     vkDestroyShaderModule(G.dev, G.shader, NULL);
+    if (G.pipe_co) vkDestroyPipeline(G.dev, G.pipe_co, NULL);
+    if (G.pipe_gu_co) vkDestroyPipeline(G.dev, G.pipe_gu_co, NULL);
+    if (G.shader_co) vkDestroyShaderModule(G.dev, G.shader_co, NULL);
+    if (G.shader_gu_co) vkDestroyShaderModule(G.dev, G.shader_gu_co, NULL);
     if (G.pipe_mr) vkDestroyPipeline(G.dev, G.pipe_mr, NULL);
     if (G.pipe_gu_mr) vkDestroyPipeline(G.dev, G.pipe_gu_mr, NULL);
     if (G.shader_mr) vkDestroyShaderModule(G.dev, G.shader_mr, NULL);
@@ -2497,6 +2582,114 @@ static int run_mr_cache(int fmt, int I, int O) {
     coli_vk_tensor_free(t); free(x); free(sc); free(yg); free(yc); free(w);
     return bad;
 }
+/* Tiled cooperative-matrix shaders: inputs are rounded to f16, so they are held
+ * to the CPU reference by error norms instead of bit identity -- relative L2
+ * error of the whole output, and the largest single error against the largest
+ * magnitude -- plus finiteness. Also times them against the GEMV path. */
+static void coop_err(const float *y, const float *ref, size_t n, double *rl2, double *rmax, size_t *nonfin) {
+    double se = 0, sr = 0, me = 0, mr = 0; *nonfin = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!isfinite(y[i])) { (*nonfin)++; continue; }
+        double e = (double)y[i] - ref[i];
+        se += e * e; sr += (double)ref[i] * ref[i];
+        if (fabs(e) > me) me = fabs(e);
+        if (fabs(ref[i]) > mr) mr = fabs(ref[i]);
+    }
+    *rl2 = sr > 0 ? sqrt(se / sr) : 0; *rmax = mr > 0 ? me / mr : 0;
+}
+static int run_coop_case(int fmt, int S, int I, int O, int iters) {
+    if (!G.coop) { printf("coopmat shaders not loaded\n"); return 1; }
+    size_t rb = ref_rowbytes(fmt, I), nsc = ref_scales(fmt, I, O), ny = (size_t)S * O;
+    float *x = malloc((size_t)S * I * 4), *sc = malloc(nsc * 4), *yc0 = malloc(ny * 4);
+    uint8_t *w = malloc(rb * O);
+    float *yco = malloc(ny * 4), *y1 = malloc(ny * 4), *yc = malloc(ny * 4);
+    for (int i = 0; i < S * I; i++) x[i] = (float)((rand() % 200 - 100) / 100.0);
+    for (size_t i = 0; i < rb * O; i++) w[i] = rand() & 0xff;
+    for (size_t o = 0; o < nsc; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
+    ColiVkTensor *t = NULL;
+    int cmin = G.coop_min; G.coop_min = 1;
+    if (!coli_vk_matmul(&t, yco, x, w, sc, fmt, S, I, O, g_ref_gs)) { printf("matmul failed\n"); return 1; }
+    double t0 = now();
+    for (int k = 0; k < iters; k++) coli_vk_matmul(&t, yco, x, w, sc, fmt, S, I, O, g_ref_gs);
+    double ms_co = (now() - t0) * 1000 / iters;
+    int co = G.coop; G.coop = 0; G.cmd_ready = 0;
+    coli_vk_matmul(&t, y1, x, w, sc, fmt, S, I, O, g_ref_gs);
+    t0 = now();
+    for (int k = 0; k < iters; k++) coli_vk_matmul(&t, y1, x, w, sc, fmt, S, I, O, g_ref_gs);
+    double ms_1 = (now() - t0) * 1000 / iters;
+    G.coop = co; G.coop_min = cmin; G.cmd_ready = 0;
+    cpu_ref(yc, x, w, sc, fmt, S, I, O);
+    double rl2, rmax, rl2g, rmaxg; size_t nf, nfg;
+    coop_err(yco, yc, ny, &rl2, &rmax, &nf);
+    coop_err(y1, yc, ny, &rl2g, &rmaxg, &nfg);
+    printf("COOP fmt=%d S=%3d I=%5d O=%5d | relL2 %.2e max %.2e (GEMV %.2e / %.2e)%s | %.3f ms (GEMV %.3f, %.2fx)\n",
+           fmt, S, I, O, rl2, rmax, rl2g, rmaxg, nf ? " NONFINITE" : "", ms_co, ms_1, ms_1 / ms_co);
+    coli_vk_tensor_free(t);
+    free(x); free(sc); free(yc0); free(w); free(yco); free(y1); free(yc);
+    return rl2 > 2e-3 || rmax > 1e-2 || nf;
+}
+/* Expert group through the tiled shaders (rows per expert cycle 1..maxrows; the
+ * experts below coop_min rows take the GEMV path inside the same group). */
+static int run_coop_expert_group(int fmt, int D, int I, int K, int maxrows, int iters, float limit) {
+    if (!G.coop) { printf("coopmat shaders not loaded\n"); return 1; }
+    if (K > 64) K = 64;
+    size_t gu_rb = ref_rowbytes(fmt, D), gu_sc = ref_scales(fmt, D, I);
+    size_t d_rb  = ref_rowbytes(fmt, I), d_sc  = ref_scales(fmt, I, D);
+    ColiVkTensor *tg[64] = {0}, *tu[64] = {0}, *td[64] = {0};
+    uint8_t *hgw[64], *huw[64], *hdw[64]; float *hgs[64], *hus[64], *hds[64];
+    int rows[64], total = 0;
+    for (int c = 0; c < K; c++) { rows[c] = 1 + (c * 7) % maxrows; total += rows[c]; }
+    float *x = malloc((size_t)total*D*4), *yco = malloc((size_t)total*D*4);
+    float *y1 = malloc((size_t)total*D*4), *yc = malloc((size_t)total*D*4), *hid = malloc((size_t)I*4);
+    for (int i = 0; i < total*D; i++) x[i] = (rand()%200-100)/100.0f;
+    for (int c = 0; c < K; c++) {
+        hgw[c] = malloc(gu_rb*I); huw[c] = malloc(gu_rb*I); hdw[c] = malloc(d_rb*D);
+        for (size_t i = 0; i < gu_rb*I; i++) { hgw[c][i] = rand()&0xff; huw[c][i] = rand()&0xff; }
+        for (size_t i = 0; i < d_rb*D; i++) hdw[c][i] = rand()&0xff;
+        hgs[c] = malloc(gu_sc*4); hus[c] = malloc(gu_sc*4); hds[c] = malloc(d_sc*4);
+        for (size_t o = 0; o < gu_sc; o++) { hgs[c][o] = 0.01f+(rand()%100)/10000.0f; hus[c][o] = 0.01f+(rand()%100)/10000.0f; }
+        for (size_t o = 0; o < d_sc; o++) hds[c][o] = 0.01f+(rand()%100)/10000.0f;
+        coli_vk_tensor_ensure(&tg[c], hgw[c], hgs[c], fmt, D, I, g_ref_gs);
+        coli_vk_tensor_ensure(&tu[c], huw[c], hus[c], fmt, D, I, g_ref_gs);
+        coli_vk_tensor_ensure(&td[c], hdw[c], hds[c], fmt, I, D, g_ref_gs);
+    }
+    coli_vk_set_swiglu_limit(limit);
+    if (!coli_vk_expert_group(tg, tu, td, rows, K, yco, x)) { printf("expert_group failed\n"); return 1; }
+    double t0 = now();
+    for (int k = 0; k < iters; k++) coli_vk_expert_group(tg, tu, td, rows, K, yco, x);
+    double ms_co = (now() - t0) * 1000 / iters;
+    int co = G.coop; G.coop = 0;
+    coli_vk_expert_group(tg, tu, td, rows, K, y1, x);
+    t0 = now();
+    for (int k = 0; k < iters; k++) coli_vk_expert_group(tg, tu, td, rows, K, y1, x);
+    double ms_1 = (now() - t0) * 1000 / iters;
+    G.coop = co;
+    coli_vk_set_swiglu_limit(0.f);
+    for (int c = 0, off = 0; c < K; off += rows[c], c++)
+        for (int r = 0; r < rows[c]; r++) {
+            const float *xr = x + (size_t)(off + r)*D;
+            for (int o = 0; o < I; o++) {
+                float gt = (float)ref_dot(xr, hgw[c]+(size_t)o*gu_rb, hgs[c], o, fmt, D);
+                float ut = (float)ref_dot(xr, huw[c]+(size_t)o*gu_rb, hus[c], o, fmt, D);
+                if (limit > 0.f) { if (gt > limit) gt = limit; if (ut > limit) ut = limit; if (ut < -limit) ut = -limit; }
+                hid[o] = (gt/(1.0f+expf(-gt)))*ut;
+            }
+            for (int d = 0; d < D; d++)
+                yc[(size_t)(off + r)*D + d] = (float)ref_dot(hid, hdw[c]+(size_t)d*d_rb, hds[c], d, fmt, I);
+        }
+    double rl2, rmax, rl2g, rmaxg; size_t nf, nfg;
+    coop_err(yco, yc, (size_t)total*D, &rl2, &rmax, &nf);
+    coop_err(y1, yc, (size_t)total*D, &rl2g, &rmaxg, &nfg);
+    printf("COOP expert_group fmt=%d D=%d I=%d %2d experts, %4d rows (1..%d, coop from %d) limit=%.1f | relL2 %.2e max %.2e (GEMV %.2e / %.2e)%s | %.3f ms (GEMV %.3f, %.2fx)\n",
+           fmt, D, I, K, total, maxrows, G.coop_min, limit, rl2, rmax, rl2g, rmaxg, nf ? " NONFINITE" : "", ms_co, ms_1, ms_1 / ms_co);
+    free(x); free(yco); free(y1); free(yc); free(hid);
+    for (int c = 0; c < K; c++) {
+        coli_vk_tensor_free(tg[c]); coli_vk_tensor_free(tu[c]); coli_vk_tensor_free(td[c]);
+        free(hgw[c]); free(huw[c]); free(hdw[c]); free(hgs[c]); free(hus[c]); free(hds[c]);
+    }
+    return rl2 > 3e-3 || rmax > 2e-2 || nf;
+}
+
 /* Expert group with several routed rows per expert (prefill / MTP verify): rows[c]
  * cycles 1..maxrows, so one group mixes one-row and multi-row dispatches. */
 static int run_mr_expert_group(int fmt, int D, int I, int K, int maxrows, int iters) {
@@ -2574,6 +2767,7 @@ int main(int argc, char **argv) {
     srand(1234);
     int bad = 0;
     if (getenv("VK_MR_SWEEP")) {   /* tuning aid: multi-row vs one-row across shapes only */
+        G.coop = 0;
         g_mr_any = 1;
         int sh[][2] = {{2048,512},{512,2048},{2048,1536},{1536,2048},{4096,1024},{6144,1536},{6144,2048},{2048,6144},{16384,6144}};
         int ss[] = {2, 4, 8, 16, 32};
@@ -2723,6 +2917,8 @@ int main(int argc, char **argv) {
     }
     /* Multi-row shaders: formats 1/2/4, tails (S not a multiple of MR), the staged
      * (MR*I <= 8192) and unstaged paths, Qwen3.6 and GLM expert shapes. */
+    int coop_saved = G.coop;
+    G.coop = 0;          /* the multi-row block tests the multi-row shaders, not the tiles */
     if (G.mr) {
         g_ref_gs = 64;
         g_mr_any = 1;   /* exercise the multi-row shaders on every shape, not just the tuned ones */
@@ -2748,6 +2944,24 @@ int main(int argc, char **argv) {
         bad |= run_mr_cache(2, 6144, 1536);
         g_mr_any = 0;
     } else printf("multi-row shaders not loaded (COLI_VK_MR<=1 or missing .spv): skipped\n");
+    G.coop = coop_saved;
+    /* Tiled cooperative-matrix shaders: int4 per-row and gs64, Qwen3.6 and GLM
+     * shapes, token counts around the 32-row tile (tails), the fused gate+up with
+     * and without the SwiGLU clamp, and whole expert groups. */
+    if (G.coop) {
+        g_ref_gs = 64;
+        int ss[6] = {1, 16, 31, 32, 33, 100};
+        for (int k = 0; k < 6; k++) {
+            bad |= run_coop_case(4, ss[k], 2048, 512, 10);   /* Qwen3.6 gate/up */
+            bad |= run_coop_case(4, ss[k], 512, 2048, 10);   /* Qwen3.6 down */
+            bad |= run_coop_case(2, ss[k], 6144, 1536, 5);   /* GLM gate/up, per-row int4 */
+        }
+        bad |= run_coop_case(4, 64, 6144, 2048, 5);
+        bad |= run_coop_expert_group(4, 2048, 512, 32, 40, 10, 0.f);
+        bad |= run_coop_expert_group(4, 2048, 512, 64, 100, 5, 0.f);
+        bad |= run_coop_expert_group(4, 2048, 512, 16, 40, 5, 0.5f);   /* clamp */
+        bad |= run_coop_expert_group(2, 6144, 2048, 8, 40, 3, 0.f);
+    } else printf("coopmat shaders not loaded (no VK_KHR_cooperative_matrix f16 config, COLI_VK_COOP=0 or missing .spv): skipped\n");
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();
     return bad;
