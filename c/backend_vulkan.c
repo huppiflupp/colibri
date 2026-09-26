@@ -673,11 +673,11 @@ int coli_vk_init(const char *spv_path) {
                 G.coop = 1;
         }
         /* second generation, on top: COLI_VK_COOP2=0 off, COLI_VK_COOP2_TT=<small>,<large>
-         * (default 2,8), COLI_VK_COOP2_SPLIT=<rows> (default 64) */
+         * (default 2,4), COLI_VK_COOP2_SPLIT=<rows> (default 64) */
         const char *e2 = getenv("COLI_VK_COOP2"), *t2 = getenv("COLI_VK_COOP2_TT"), *sp = getenv("COLI_VK_COOP2_SPLIT");
-        G.coop2 = 0; G.coop2_tt[0] = 2; G.coop2_tt[1] = 8; G.coop2_split = sp ? atoi(sp) : 64;
+        G.coop2 = 0; G.coop2_tt[0] = 2; G.coop2_tt[1] = 4; G.coop2_split = sp ? atoi(sp) : 64;
         if (t2) sscanf(t2, "%d,%d", &G.coop2_tt[0], &G.coop2_tt[1]);
-        for (int v = 0; v < 2; v++) if (G.coop2_tt[v] < 1 || G.coop2_tt[v] > 8) G.coop2_tt[v] = v ? 8 : 2;
+        for (int v = 0; v < 2; v++) if (G.coop2_tt[v] < 1 || G.coop2_tt[v] > 8) G.coop2_tt[v] = v ? 4 : 2;
         if (G.coop && !(e2 && *e2 == '0') && dp.limits.maxComputeSharedMemorySize >= 57344) {   /* TT=8 gate_up: 56 KiB */
             char p1[512], p2[512];
             derive_sibling(spv_path, "_coop2.spv", p1, sizeof(p1));
@@ -2840,6 +2840,15 @@ int main(int argc, char **argv) {
     printf("weights: %s\n", coli_vk_staged() ? "staged device-local" : "mapped host-visible");
     srand(1234);
     int bad = 0;
+    if (getenv("VK_COOP_BENCH")) {   /* tuning aid: the tiled shaders on two prefill shapes only */
+        g_ref_gs = 64;
+        bad |= run_coop_case(1, 1024, 2048, 8192, 10);   /* DeltaNet qkv, whole prompt */
+        bad |= run_coop_case(4, 32, 2048, 512, 20);      /* one Qwen3.6 expert gate/up-shaped matmul */
+        bad |= run_coop_expert_group(4, 2048, 512, 64, 60, 10, 0.f);
+        printf(bad ? "FAIL\n" : "PASS\n");
+        coli_vk_shutdown();
+        return bad;
+    }
     if (getenv("VK_MR_SWEEP")) {   /* tuning aid: multi-row vs one-row across shapes only */
         G.coop = 0;
         g_mr_any = 1;
