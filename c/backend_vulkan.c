@@ -65,6 +65,12 @@ static struct {
     /* Tiled cooperative-matrix variants (qmatmul_coop / qmatmul_gate_up_coop), same
      * layouts again. coop = usable; coop_min = fewest token rows that take them. */
     VkShaderModule shader_co, shader_gu_co; VkPipeline pipe_co, pipe_gu_co; int coop, coop_min, coop_tt;
+    /* Second-generation tiles (qmatmul_coop2 / qmatmul_gate_up_coop2): 128 outputs x
+     * 16*TT tokens, 256 invocations. [0] = small token blocks (experts), [1] = large
+     * (trunk). coop2 = usable; coop2_tt[] the TT of each; coop2_split = fewest rows
+     * that take [1]. */
+    VkShaderModule shader_co2, shader_gu_co2; VkPipeline pipe_co2[2], pipe_gu_co2[2];
+    int coop2, coop2_tt[2], coop2_split;
     int has_coop_dev;    /* device created with cooperativeMatrix + shaderFloat16 + vulkanMemoryModel */
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
@@ -316,6 +322,19 @@ static int mr_use(int fmt, int S, int I, int O) {
     if (g_mr_any) return 1;
     return S >= 8 && I <= 8192 && (size_t)I * (size_t)O >= ((size_t)4 << 20);
 }
+/* Pipeline and grid of a tiled dispatch (coop_use said yes): the second-generation
+ * tiles when the output dimension fits their 128-row blocks, else the first. */
+static VkPipeline coop_pick(int gate_up, int S, int O, uint32_t *gx, uint32_t *gy) {
+    if (G.coop2 && O % 128 == 0) {
+        int v = S >= G.coop2_split;
+        int tm = 16 * G.coop2_tt[v];
+        *gx = (uint32_t)((S + tm - 1) / tm); *gy = (uint32_t)(O / 128);
+        return gate_up ? G.pipe_gu_co2[v] : G.pipe_co2[v];
+    }
+    int tm = 16 * G.coop_tt;
+    *gx = (uint32_t)((S + tm - 1) / tm); *gy = (uint32_t)(O / 64);
+    return gate_up ? G.pipe_gu_co : G.pipe_co;
+}
 /* Tiled cooperative-matrix shader for this dispatch? int8/int4 formats, both dims a
  * multiple of its 64-wide tiles, enough token rows. Takes precedence over the
  * multi-row shader. One workgroup = 64 outputs x 16*coop_tt token rows, so a
@@ -559,6 +578,24 @@ int coli_vk_init(const char *spv_path) {
                 build_pipeline_mr(G.dev, G.plyt_gu, G.shader_gu_co, G.coop_tt, &G.pipe_gu_co))
                 G.coop = 1;
         }
+        /* second generation, on top: COLI_VK_COOP2=0 off, COLI_VK_COOP2_TT=<small>,<large>
+         * (default 2,8), COLI_VK_COOP2_SPLIT=<rows> (default 64) */
+        const char *e2 = getenv("COLI_VK_COOP2"), *t2 = getenv("COLI_VK_COOP2_TT"), *sp = getenv("COLI_VK_COOP2_SPLIT");
+        G.coop2 = 0; G.coop2_tt[0] = 2; G.coop2_tt[1] = 8; G.coop2_split = sp ? atoi(sp) : 64;
+        if (t2) sscanf(t2, "%d,%d", &G.coop2_tt[0], &G.coop2_tt[1]);
+        for (int v = 0; v < 2; v++) if (G.coop2_tt[v] < 1 || G.coop2_tt[v] > 8) G.coop2_tt[v] = v ? 8 : 2;
+        if (G.coop && !(e2 && *e2 == '0') && dp.limits.maxComputeSharedMemorySize >= 57344) {   /* TT=8 gate_up: 56 KiB */
+            char p1[512], p2[512];
+            derive_sibling(spv_path, "_coop2.spv", p1, sizeof(p1));
+            derive_sibling(spv_path, "_gate_up_coop2.spv", p2, sizeof(p2));
+            G.shader_co2 = load_spv(G.dev, p1);
+            G.shader_gu_co2 = G.shader_co2 ? load_spv(G.dev, p2) : VK_NULL_HANDLE;
+            int ok = G.shader_co2 && G.shader_gu_co2;
+            for (int v = 0; ok && v < 2; v++)
+                ok = build_pipeline_mr(G.dev, G.plyt, G.shader_co2, G.coop2_tt[v], &G.pipe_co2[v]) &&
+                     build_pipeline_mr(G.dev, G.plyt_gu, G.shader_gu_co2, G.coop2_tt[v], &G.pipe_gu_co2[v]);
+            G.coop2 = ok;
+        }
     }
 
     /* Optional MLA absorb attention pipeline (same directory as the main shader). */
@@ -600,7 +637,7 @@ int coli_vk_init(const char *spv_path) {
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
     fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s%s\n", p.deviceName, G.qfam, G.memtype,
             G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "",
-            G.coop ? ", coopmat tiles" : "");
+            G.coop2 ? ", coopmat tiles (gen 2)" : G.coop ? ", coopmat tiles" : "");
     return 1;
 }
 
@@ -778,14 +815,16 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
         int co = coop_use(fmt, S, I, O, t->gs, 0), mr = !co && mr_use(fmt, S, I, O);
-        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, co ? G.pipe_co : mr ? G.pipe_mr : G.pipe);
+        uint32_t cgx = 0, cgy = 0;
+        VkPipeline cpl = co ? coop_pick(0, S, O, &cgx, &cgy) : VK_NULL_HANDLE;
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, co ? cpl : mr ? G.pipe_mr : G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
         struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
         vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
          * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width.
          * The multi-row shader covers MR token rows per workgroup in y. */
-        if (co) vkCmdDispatch(G.cmd, (uint32_t)((S + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), (uint32_t)(O / 64), 1);
+        if (co) vkCmdDispatch(G.cmd, cgx, cgy, 1);
         else vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
         host_read_barrier(G.cmd);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -846,11 +885,13 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
     int co = coop_use(fmt, S, D, I, tg->gs, 0), mr = !co && mr_use(fmt, S, D, I);
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, co ? G.pipe_gu_co : mr ? G.pipe_gu_mr : G.pipe_gu);
+    uint32_t cgx = 0, cgy = 0;
+    VkPipeline cpl = co ? coop_pick(1, S, I, &cgx, &cgy) : VK_NULL_HANDLE;
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, co ? cpl : mr ? G.pipe_gu_mr : G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
     struct PCGU pc = pcgu(fmt, S, D, I, tg->rowWords, tg->gs);   // PC.I = input D, PC.O = moe_inter I
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    if (co) vkCmdDispatch(G.cmd, (uint32_t)((S + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), (uint32_t)(I / 64), 1);
+    if (co) vkCmdDispatch(G.cmd, cgx, cgy, 1);
     else vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
     host_read_barrier(G.cmd);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -945,12 +986,13 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VkPipeline bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
         int co = coop_use(fmt, rows[c], D, I, gates[c]->gs, 1), mr = !co && mr_use(fmt, rows[c], D, I);
-        VkPipeline want = co ? G.pipe_gu_co : mr ? G.pipe_gu_mr : G.pipe_gu;
+        uint32_t cgx = 0, cgy = 0;
+        VkPipeline want = co ? coop_pick(1, rows[c], I, &cgx, &cgy) : mr ? G.pipe_gu_mr : G.pipe_gu;
         if (want != bound) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); bound = want; }
         struct PCGU pc = pcgu(fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs);
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)((rows[c] + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), (uint32_t)(I / 64), 1);
+        if (co) vkCmdDispatch(G.eg_cmd, cgx, cgy, 1);
         else vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
     vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
@@ -958,12 +1000,13 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
         int co = coop_use(dfmt, rows[c], I, D, downs[c]->gs, 1), mr = !co && mr_use(dfmt, rows[c], I, D);
-        VkPipeline want = co ? G.pipe_co : mr ? G.pipe_mr : G.pipe;
+        uint32_t cgx = 0, cgy = 0;
+        VkPipeline want = co ? coop_pick(0, rows[c], D, &cgx, &cgy) : mr ? G.pipe_mr : G.pipe;
         if (want != bound) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); bound = want; }
         struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)((rows[c] + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), (uint32_t)(D / 64), 1);
+        if (co) vkCmdDispatch(G.eg_cmd, cgx, cgy, 1);
         else vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
     host_read_barrier(G.eg_cmd);
@@ -1755,6 +1798,12 @@ void coli_vk_shutdown(void) {
     vkDestroyPipelineLayout(G.dev, G.plyt, NULL);
     vkDestroyDescriptorSetLayout(G.dev, G.dsl, NULL);
     vkDestroyShaderModule(G.dev, G.shader, NULL);
+    for (int v = 0; v < 2; v++) {
+        if (G.pipe_co2[v]) vkDestroyPipeline(G.dev, G.pipe_co2[v], NULL);
+        if (G.pipe_gu_co2[v]) vkDestroyPipeline(G.dev, G.pipe_gu_co2[v], NULL);
+    }
+    if (G.shader_co2) vkDestroyShaderModule(G.dev, G.shader_co2, NULL);
+    if (G.shader_gu_co2) vkDestroyShaderModule(G.dev, G.shader_gu_co2, NULL);
     if (G.pipe_co) vkDestroyPipeline(G.dev, G.pipe_co, NULL);
     if (G.pipe_gu_co) vkDestroyPipeline(G.dev, G.pipe_gu_co, NULL);
     if (G.shader_co) vkDestroyShaderModule(G.dev, G.shader_co, NULL);
