@@ -1,0 +1,49 @@
+#version 450
+// Causal multi-head attention core for a prefill block (Qwen3.6 gated attention,
+// after q/k norm and RoPE; the output gate and o_proj stay with the caller):
+//   ctx[s,h,:] = sum_{t <= pos_base+s} softmax_t(q[s,h,:] . K[kvh,t,:] * scale) V[kvh,t,:]
+// with kvh = h / (H / KV) (grouped-query attention). One workgroup = one subgroup
+// of 64 lanes per (query token, head); each lane owns hd/64 dims. Keys are walked
+// in order with an online softmax (running max and sum, f32), so no score row is
+// materialised. K/V rows of every kv head are contiguous: K[(kvh*ldt + t)*hd + d].
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Q  { float q[]; };    // [S][H][hd]
+layout(std430, binding = 1) readonly buffer KB { float kc[]; };   // [KV][ldt][hd]
+layout(std430, binding = 2) readonly buffer VB { float vc[]; };   // [KV][ldt][hd]
+layout(std430, binding = 3) writeonly buffer O { float ctx[]; };  // [S][H][hd]
+
+layout(push_constant) uniform P { int S, H, KV, hd, pos_base, ldt; float scale; } p;
+
+#define MAXD 8          // hd / 64 <= 8 (hd <= 512)
+
+void main() {
+    int s = int(gl_WorkGroupID.x), h = int(gl_WorkGroupID.y);
+    int lane = int(gl_SubgroupInvocationID), nl = int(gl_SubgroupSize);
+    int per = (p.hd + nl - 1) / nl;                 // dims per lane
+    int kvh = h / (p.H / p.KV);
+    int qpos = p.pos_base + s;
+    float qv[MAXD], acc[MAXD];
+    int qb = (s * p.H + h) * p.hd;
+    for (int j = 0; j < MAXD; j++) {
+        int d = lane + j * nl;
+        qv[j] = (j < per && d < p.hd) ? q[qb + d] : 0.0;
+        acc[j] = 0.0;
+    }
+    float m = -1.0 / 0.0, l = 0.0;
+    int kb0 = kvh * p.ldt * p.hd;
+    for (int t = 0; t <= qpos; t++) {
+        int kb = kb0 + t * p.hd;
+        float part = 0.0;
+        for (int j = 0; j < per; j++) { int d = lane + j * nl; if (d < p.hd) part += qv[j] * kc[kb + d]; }
+        float sc = subgroupAdd(part) * p.scale;
+        float mn = max(m, sc);
+        float corr = exp(m - mn), w = exp(sc - mn);
+        l = l * corr + w;
+        for (int j = 0; j < per; j++) { int d = lane + j * nl; acc[j] = acc[j] * corr + (d < p.hd ? w * vc[kb + d] : 0.0); }
+        m = mn;
+    }
+    float inv = 1.0 / l;
+    for (int j = 0; j < per; j++) { int d = lane + j * nl; if (d < p.hd) ctx[qb + d] = acc[j] * inv; }
+}

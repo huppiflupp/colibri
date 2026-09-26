@@ -62,3 +62,4 @@ shaders/qmatmul_coop.spv
 shaders/qmatmul_gate_up_coop.spv
 shaders/qmatmul_coop2.spv
 shaders/qmatmul_gate_up_coop2.spv
+shaders/attn_prefill.spv

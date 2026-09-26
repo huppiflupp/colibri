@@ -73,6 +73,10 @@ static struct {
     int coop2, coop2_tt[2], coop2_split;
     int has_coop_dev;    /* device created with cooperativeMatrix + shaderFloat16 + vulkanMemoryModel */
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
+    /* causal prefill attention core (attn_prefill.comp): q, K, V, ctx */
+    VkShaderModule shader_ap; VkDescriptorSetLayout dsl_ap; VkPipelineLayout plyt_ap;
+    VkPipeline pipe_ap; VkDescriptorPool dpool_ap; VkDescriptorSet dset_ap;
+    Scratch ap_q, ap_k, ap_v, ap_o;
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
     VkCommandPool cpool;
@@ -131,6 +135,7 @@ static struct PCGU pcgu(int fmt, int S, int I, int O, int rowWords, int gs) {
 struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
+struct PCAP { int S, H, KV, hd, pos_base, ldt; float scale; };   /* attn_prefill.comp */
 
 static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -621,6 +626,15 @@ int coli_vk_init(const char *spv_path) {
     G.shader_att = load_spv(G.dev, att_path);
     if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
         return 0;
+    /* Optional causal prefill attention core (COLI_VK_ATTN_PREFILL=0 turns it off). */
+    {
+        const char *e = getenv("COLI_VK_ATTN_PREFILL");
+        char ap_path[512]; derive_dir_file(spv_path, "attn_prefill.spv", ap_path, sizeof(ap_path));
+        if (!(e && *e == '0')) G.shader_ap = load_spv(G.dev, ap_path);
+        if (G.shader_ap && !build_pipeline(G.dev, 4, sizeof(struct PCAP), G.shader_ap, &G.dsl_ap, &G.plyt_ap, &G.pipe_ap, &G.dpool_ap, &G.dset_ap)) {
+            vkDestroyShaderModule(G.dev, G.shader_ap, NULL); G.shader_ap = VK_NULL_HANDLE; G.pipe_ap = VK_NULL_HANDLE;
+        }
+    }
 
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G.qfam};
@@ -904,6 +918,46 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(hidden, G.h.ptr, hb);
+    G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
+    return 1;
+}
+
+static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi);
+/* Causal attention core of a prefill block (attn_prefill.comp): q [S][H][hd] after
+ * norm/RoPE, K/V the engine's per-kv-head caches, row t of kv head g at
+ * (g*ldt + t)*hd, keys 0 .. pos_base+S-1 valid; ctx [S][H][hd] out. Only the valid
+ * key rows travel (packed per kv head). Returns 0 when unavailable -> CPU path. */
+int coli_vk_attn_prefill(float *ctx, const float *q, const float *K, const float *V, int ldt,
+                         int S, int H, int KV, int hd, int pos_base, float scale) {
+    if (!G.ready || !G.pipe_ap || S < 1 || KV < 1 || H % KV || hd < 1 || hd > 512) return 0;
+    int nt = pos_base + S;
+    size_t qb = (size_t)S * H * hd * sizeof(float), kb = (size_t)KV * nt * hd * sizeof(float);
+    if (!scratch_reserve(&G.ap_q, qb) || !scratch_reserve(&G.ap_k, kb) || !scratch_reserve(&G.ap_v, kb) ||
+        !scratch_reserve_mt(&G.ap_o, qb, G.memtype_cached)) return 0;
+    memcpy(G.ap_q.ptr, q, qb);
+    for (int g = 0; g < KV; g++) {
+        memcpy((char *)G.ap_k.ptr + (size_t)g * nt * hd * sizeof(float), K + (size_t)g * ldt * hd, (size_t)nt * hd * sizeof(float));
+        memcpy((char *)G.ap_v.ptr + (size_t)g * nt * hd * sizeof(float), V + (size_t)g * ldt * hd, (size_t)nt * hd * sizeof(float));
+    }
+    VkDescriptorBufferInfo bi[4] = {
+        {.buffer = G.ap_q.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.ap_k.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.ap_v.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.ap_o.buf, .range = VK_WHOLE_SIZE}};
+    wr_desc(G.dset_ap, 4, bi);
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_ap);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_ap, 0, 1, &G.dset_ap, 0, NULL);
+    struct PCAP pc = {S, H, KV, hd, pos_base, nt, scale};
+    vkCmdPushConstants(G.cmd, G.plyt_ap, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)S, (uint32_t)H, 1);
+    host_read_barrier(G.cmd);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    memcpy(ctx, G.ap_o.ptr, qb);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
     return 1;
 }
@@ -1804,6 +1858,13 @@ void coli_vk_shutdown(void) {
     }
     if (G.shader_co2) vkDestroyShaderModule(G.dev, G.shader_co2, NULL);
     if (G.shader_gu_co2) vkDestroyShaderModule(G.dev, G.shader_gu_co2, NULL);
+    if (G.pipe_ap) {
+        vkDestroyDescriptorPool(G.dev, G.dpool_ap, NULL);
+        vkDestroyPipeline(G.dev, G.pipe_ap, NULL);
+        vkDestroyPipelineLayout(G.dev, G.plyt_ap, NULL);
+        vkDestroyDescriptorSetLayout(G.dev, G.dsl_ap, NULL);
+        vkDestroyShaderModule(G.dev, G.shader_ap, NULL);
+    }
     if (G.pipe_co) vkDestroyPipeline(G.dev, G.pipe_co, NULL);
     if (G.pipe_gu_co) vkDestroyPipeline(G.dev, G.pipe_gu_co, NULL);
     if (G.shader_co) vkDestroyShaderModule(G.dev, G.shader_co, NULL);
@@ -2492,6 +2553,46 @@ static int run_coop_expert_group(int fmt, int D, int I, int K, int maxrows, int 
     return rl2 > 3e-3 || rmax > 2e-2 || nf;
 }
 
+/* Prefill attention core against a CPU reference that mirrors qwen36.c's
+ * attention(): scores, softmax (max-subtracted), weighted V sum, causal with a
+ * prefix of pos_base cached keys, grouped-query heads. */
+static int run_attn_prefill_case(int S, int H, int KV, int hd, int pos_base, int ldt) {
+    if (!G.pipe_ap) { printf("attn_prefill shader not loaded\n"); return 1; }
+    int nt = pos_base + S;
+    float *q = malloc((size_t)S * H * hd * 4), *K = malloc((size_t)KV * ldt * hd * 4), *V = malloc((size_t)KV * ldt * hd * 4);
+    float *cg = malloc((size_t)S * H * hd * 4), *cc = malloc((size_t)S * H * hd * 4);
+    double *sc = malloc((size_t)nt * sizeof(double));
+    for (int i = 0; i < S * H * hd; i++) q[i] = (rand() % 200 - 100) / 100.0f;
+    for (size_t i = 0; i < (size_t)KV * ldt * hd; i++) { K[i] = (rand() % 200 - 100) / 100.0f; V[i] = (rand() % 200 - 100) / 100.0f; }
+    float scale = 1.f / sqrtf((float)hd);
+    double t0 = now();
+    int ok = coli_vk_attn_prefill(cg, q, K, V, ldt, S, H, KV, hd, pos_base, scale);
+    double ms = (now() - t0) * 1000;
+    if (!ok) { printf("attn_prefill failed\n"); return 1; }
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++) {
+        int g = h / (H / KV), qpos = pos_base + s;
+        const float *qv = q + ((size_t)s * H + h) * hd;
+        double mx = -1e300;
+        for (int t = 0; t <= qpos; t++) {
+            const float *kr = K + ((size_t)g * ldt + t) * hd;
+            double a = 0; for (int d = 0; d < hd; d++) a += (double)qv[d] * kr[d];
+            sc[t] = a * scale; if (sc[t] > mx) mx = sc[t];
+        }
+        double z = 0; for (int t = 0; t <= qpos; t++) { sc[t] = exp(sc[t] - mx); z += sc[t]; }
+        float *o = cc + ((size_t)s * H + h) * hd;
+        for (int d = 0; d < hd; d++) {
+            double a = 0; for (int t = 0; t <= qpos; t++) a += sc[t] / z * V[((size_t)g * ldt + t) * hd + d];
+            o[d] = (float)a;
+        }
+    }
+    double rl2, rmax; size_t nf;
+    coop_err(cg, cc, (size_t)S * H * hd, &rl2, &rmax, &nf);
+    printf("ATTN prefill S=%4d H=%d KV=%d hd=%d pos_base=%d | relL2 %.2e max %.2e%s | %.2f ms (incl. upload)\n",
+           S, H, KV, hd, pos_base, rl2, rmax, nf ? " NONFINITE" : "", ms);
+    free(q); free(K); free(V); free(cg); free(cc); free(sc);
+    return rl2 > 1e-5 || rmax > 1e-4 || nf;
+}
+
 /* Expert group with several routed rows per expert (prefill / MTP verify): rows[c]
  * cycles 1..maxrows, so one group mixes one-row and multi-row dispatches. */
 static int run_mr_expert_group(int fmt, int D, int I, int K, int maxrows, int iters) {
@@ -2773,6 +2874,13 @@ int main(int argc, char **argv) {
         bad |= run_coop_expert_group(4, 2048, 512, 16, 40, 5, 0.5f);   /* clamp */
         bad |= run_coop_expert_group(2, 6144, 2048, 8, 40, 3, 0.f);
     } else printf("coopmat shaders not loaded (no VK_KHR_cooperative_matrix f16 config, COLI_VK_COOP=0 or missing .spv): skipped\n");
+    if (G.pipe_ap) {
+        bad |= run_attn_prefill_case(1, 16, 2, 256, 0, 64);      /* one token */
+        bad |= run_attn_prefill_case(37, 16, 2, 256, 0, 64);     /* Qwen3.6 shape, odd S */
+        bad |= run_attn_prefill_case(20, 16, 2, 256, 30, 64);    /* cached prefix (pos_base > 0) */
+        bad |= run_attn_prefill_case(33, 8, 8, 128, 5, 40);      /* no GQA, other head dim */
+        bad |= run_attn_prefill_case(1011, 16, 2, 256, 0, 1100); /* the 1011-token prompt */
+    } else printf("attn_prefill shader not loaded: skipped\n");
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();
     return bad;
