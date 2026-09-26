@@ -1270,6 +1270,91 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
     return ok;
 }
 
+/* Prefill batch (S > 1): every resident (token, expert) pair of one layer goes
+ * to the GPU grouped BY EXPERT -- one expert carries all of its routed tokens as
+ * rows, so a layer costs a handful of group submits instead of one per token.
+ * res[(s*K+k)*D] receives the raw expert output of each pair the GPU computed
+ * and done[s*K+k] marks it; the caller adds val*res in the per-token order of
+ * the qt_issue/qt_take path (CPU misses, shared expert, then GPU in k order),
+ * so the sum per token is the same as token by token. Synchronous; single
+ * device; Vulkan only for now (the CUDA group staging is sized for
+ * QT_MAX_ROWS rows). Returns 0 when the batch path is unavailable -- then
+ * nothing was computed and the caller uses the per-token path. */
+#define QT_BATCH_GROUP 64   /* experts per group submit (coli_vk_expert_group limit) */
+int qt_batch_ok(void){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    const char *e=getenv("QT_PREFILL_BATCH");
+    return G.on && G.ndev==1 && !(e && *e=='0');
+#else
+    return 0;
+#endif
+}
+int qt_issue_batch(int layer,const int *eids,int S,int K,const float *x,float *res,uint8_t *done){
+    if(!qt_batch_ok()) return 0;
+    int E=G.ne, D=G.D;
+    size_t pairs=(size_t)S*K;
+    int *cnt=calloc((size_t)E,sizeof(int)), *first=malloc((size_t)E*sizeof(int));
+    int *order=malloc(pairs*sizeof(int));          /* pair ids grouped by expert */
+    int *ex=malloc((size_t)E*sizeof(int)), nex=0;  /* distinct resident experts, first-seen order */
+    if(!cnt||!first||!order||!ex){ free(cnt); free(first); free(order); free(ex); return 0; }
+    memset(done,0,pairs);
+
+    pthread_mutex_lock(&G.mx);
+    if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
+    if(G.th_stop){ pthread_mutex_unlock(&G.mx); free(cnt); free(first); free(order); free(ex); return 0; }
+    if(layer==0) for(int s=0;s<S;s++) qt_lfru_tick_locked();   /* one tick per token, as qt_issue */
+    G.issue_open=1;
+    for(size_t pi=0;pi<pairs;pi++){
+        int e=eids[pi];
+        if(e<0||e>=E){ continue; }
+        if(qs(layer,e)->resident){ if(!cnt[e]++) ex[nex++]=e; G.hits[0]++; }
+        else G.miss++;
+    }
+    /* counting sort of the resident pairs by expert, expert order = first seen */
+    for(int j=0,o=0;j<nex;j++){ first[ex[j]]=o; o+=cnt[ex[j]]; }
+    int *fill=calloc((size_t)E,sizeof(int)); if(!fill){ G.issue_open=0; pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx); free(cnt); free(first); free(order); free(ex); return 0; }
+    for(size_t pi=0;pi<pairs;pi++){
+        int e=eids[pi];
+        if(e>=0&&e<E&&cnt[e]&&qs(layer,e)->resident) order[first[e]+fill[e]++]=(int)pi;
+    }
+    QtTensor *tg[QT_BATCH_GROUP],*tu[QT_BATCH_GROUP],*td[QT_BATCH_GROUP];
+    QtTensor **pg=malloc((size_t)(nex?nex:1)*3*sizeof(QtTensor*));
+    int ok=pg!=NULL;
+    size_t total=0; for(int j=0;j<nex;j++) total+=(size_t)cnt[ex[j]];
+    float *xb=total?malloc(total*(size_t)D*sizeof(float)):NULL, *yb=total?malloc(total*(size_t)D*sizeof(float)):NULL;
+    if(total&&(!xb||!yb)) ok=0;
+    /* the group runs while the tier lock is released, as qt_issue does; issue_open
+     * keeps the uploader from swapping a resident expert out underneath it */
+    if(ok) for(int j=0;j<nex;j++){ QSlot *q=qs(layer,ex[j]); pg[3*j]=q->tg; pg[3*j+1]=q->tu; pg[3*j+2]=q->td; }
+    pthread_mutex_unlock(&G.mx);
+
+    for(int j0=0;ok&&j0<nex;j0+=QT_BATCH_GROUP){
+        int c=nex-j0<QT_BATCH_GROUP?nex-j0:QT_BATCH_GROUP, rows[QT_BATCH_GROUP];
+        size_t r0=(size_t)first[ex[j0]], nr=0;
+        for(int j=0;j<c;j++){
+            tg[j]=pg[3*(j0+j)]; tu[j]=pg[3*(j0+j)+1]; td[j]=pg[3*(j0+j)+2]; rows[j]=cnt[ex[j0+j]];
+            for(int r=0;r<rows[j];r++){
+                int pi=order[r0+nr+(size_t)r];
+                memcpy(xb+(r0+nr+(size_t)r)*D, x+(size_t)(pi/K)*D, (size_t)D*sizeof(float));
+            }
+            nr+=(size_t)rows[j];
+        }
+        if(!be_issue(tg,tu,td,rows,c,xb+r0*D) || !be_take(G.dev[0],yb+r0*D)){ ok=0; break; }
+    }
+    if(ok) for(size_t r=0;r<total;r++){
+        int pi=order[r];
+        memcpy(res+(size_t)pi*D, yb+r*D, (size_t)D*sizeof(float));
+        done[pi]=1;
+    }
+    pthread_mutex_lock(&G.mx);
+    G.issue_open=0;
+    pthread_cond_broadcast(&G.cv_take);
+    pthread_mutex_unlock(&G.mx);
+    free(cnt); free(first); free(order); free(ex); free(fill); free(xb); free(yb); free(pg);
+    if(!ok){ memset(done,0,pairs); fprintf(stderr,"[qtier] prefill batch failed at layer %d\n",layer); }
+    return ok;
+}
+
 void qt_stats(void){
     if(!G.on) return;
     uint64_t hits=0; size_t res=0;

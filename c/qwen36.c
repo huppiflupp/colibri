@@ -2378,6 +2378,39 @@ static void route_footer(FILE *f, const Model *m) {
                 m->route.kl_n ? m->route.kl_sum/(double)m->route.kl_n : 0.0);
 }
 
+/* Shared expert of one token on the tier path (overlaps the in-flight GPU groups). */
+static void qt_shared_token(Cfg *c, Layer *l, const float *xs, float *os,
+                            float *sh, float *shu, float *shd, int S) {
+    int D = c->hidden;
+    double _ts2 = tm_now();
+    int Ish = c->shared_inter;
+    if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, &l->sh_g, 1, D, Ish);
+    if (!qtd(l->qth_shu, shu, xs, D, Ish)) matmul_d(shu, xs, &l->sh_u, 1, D, Ish);
+    for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
+    if (!qtd(l->qth_shd, shd, sh, Ish, D)) matmul_d(shd, sh, &l->sh_d, 1, Ish, D);
+    float sgate = 1.f;
+    if (l->sh_gate) {
+        float sg = 0.f; const float *wg = l->sh_gate;
+        for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
+        sgate = 1.f / (1.f + expf(-sg));
+    }
+    for (int d = 0; d < D; d++) os[d] += sgate * shd[d];
+    tm_add(S, 3, tm_now()-_ts2);
+}
+
+/* One routed expert of one token on the CPU (tier miss): os += w * expert(xs). */
+static void qt_cpu_expert(Model *m, int layer, int eid, float w, const float *xs, float *os,
+                          float *g, float *u, float *hh) {
+    int D = m->c.hidden, I = m->c.inter;
+    Slot *e; expert_get(m, layer, eid, &e);
+    slot_ensure_int8(m, e);
+    matmul_qe(g, xs, e->g, e->gs, D, I);
+    matmul_qe(u, xs, e->u, e->us, D, I);
+    for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+    matmul_qd(hh, g, e->d, e->ds, I, D);
+    for (int d = 0; d < D; d++) os[d] += w * hh[d];
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
@@ -2394,6 +2427,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int use_xf = !use_qt && xf_mode(m);
     int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *xval = use_xf ? falloc((int64_t)S * K) : NULL;
+    /* Tier prefill batch: collect the routing of all S tokens first, then send
+     * each resident expert ONE group row block with all of its tokens
+     * (qt_issue_batch) instead of one submit per token. */
+    int use_qtb = use_qt && S > 1 && qt_batch_ok();
+    int *bidx = use_qtb ? malloc(sizeof(int) * (size_t)S * K) : NULL;
+    float *bval = use_qtb ? falloc((int64_t)S * K) : NULL;
     for (int s = 0; s < S; s++) {
         float *pr = logits + (int64_t)s*E;
         if (m->momentum_logits && m->pilot_smooth > 0.f) {
@@ -2468,39 +2507,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                  * same pointer choice tier_warmstart makes, one place. */
                 tier_offer_slot(layer, idx[kk], e);
             }
+            if (use_qtb) {
+                for (int kk = 0; kk < K; kk++) { bidx[s*K+kk] = idx[kk]; bval[s*K+kk] = val[kk]; }
+                continue;
+            }
             double _q0 = tm_now();
             uint32_t qmask = qt_issue(layer, idx, K, xs);
             double _q1 = tm_now();
             for (int kk = 0; kk < K; kk++) {
                 if (qmask & (1u<<kk)) continue;
-                Slot *e; expert_get(m, layer, idx[kk], &e);
-                slot_ensure_int8(m, e);
-                matmul_qe(g, xs, e->g, e->gs, D, I);
-                matmul_qe(u, xs, e->u, e->us, D, I);
-                for (int i = 0; i < I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
-                matmul_qd(hh, g, e->d, e->ds, I, D);
-                float w = val[kk]; float *os = out + (int64_t)s*D;
-                for (int d = 0; d < D; d++) os[d] += w * hh[d];
+                qt_cpu_expert(m, layer, idx[kk], val[kk], xs, out + (int64_t)s*D, g, u, hh);
             }
             /* Compute the shared expert NOW so it overlaps with the GPU
              * groups; the common block below is skipped. */
-            {
-                double _ts2 = tm_now();
-                int Ish = c->shared_inter;
-                if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, &l->sh_g, 1, D, Ish);
-                if (!qtd(l->qth_shu, shu, xs, D, Ish)) matmul_d(shu, xs, &l->sh_u, 1, D, Ish);
-                for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
-                if (!qtd(l->qth_shd, shd, sh, Ish, D)) matmul_d(shd, sh, &l->sh_d, 1, Ish, D);
-                float sgate = 1.f;
-                if (l->sh_gate) {
-                    float sg = 0.f; const float *wg = l->sh_gate;
-                    for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
-                    sgate = 1.f / (1.f + expf(-sg));
-                }
-                float *os = out + (int64_t)s*D;
-                for (int d = 0; d < D; d++) os[d] += sgate * shd[d];
-                tm_add(S, 3, tm_now()-_ts2);
-            }
+            qt_shared_token(c, l, xs, out + (int64_t)s*D, sh, shu, shd, S);
             double _q2 = tm_now();
             if(!qt_take(qmask, val, K, out + (int64_t)s*D)){
                 fprintf(stderr,"qwen36: %s expert collection failed at layer %d; stopping inference\n",qt_backend_name(),layer);
@@ -2523,6 +2543,26 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 for (int d = 0; d < D; d++) os[d] += w * hh[d];
             }
         }
+    }
+    if (use_qtb) {
+        /* Same per-token order as the qt_issue/qt_take path: CPU misses, shared
+         * expert, then the GPU results in k order -- so each token's sum is
+         * formed exactly as it is token by token. A failed batch computes every
+         * pair on the CPU. */
+        float *res = falloc((int64_t)S * K * D);
+        uint8_t *done = malloc((size_t)S * K);
+        if (!qt_issue_batch(layer, bidx, S, K, x, res, done)) memset(done, 0, (size_t)S * K);
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s*D; float *os = out + (int64_t)s*D;
+            for (int kk = 0; kk < K; kk++)
+                if (!done[s*K+kk]) qt_cpu_expert(m, layer, bidx[s*K+kk], bval[s*K+kk], xs, os, g, u, hh);
+            qt_shared_token(c, l, xs, os, sh, shu, shd, S);
+            for (int kk = 0; kk < K; kk++) if (done[s*K+kk]) {
+                float w = bval[s*K+kk]; const float *row = res + ((int64_t)s*K + kk) * D;
+                for (int d = 0; d < D; d++) os[d] += w * row[d];
+            }
+        }
+        free(res); free(done); free(bidx); free(bval);
     }
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
