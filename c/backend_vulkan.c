@@ -3025,6 +3025,8 @@ static int run_expert_prefill_tests(void) {
     bad |= run_expert_prefill(256,128,65,17,0.f); /* GEMV/MR without tiles */
     G.coop = co; g_mr_any = any;
     return bad;
+}
+
 /* Prefill attention core against a CPU reference that mirrors qwen36.c's
  * attention(): scores, softmax (max-subtracted), weighted V sum, causal with a
  * prefix of pos_base cached keys, grouped-query heads. */
