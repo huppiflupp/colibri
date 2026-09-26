@@ -928,7 +928,7 @@ int qt_trunk_min_s(void){
     if(v < 0){
         const char *e = getenv("QT_TRUNK_MIN_S");
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
-        v = e ? atoi(e) : 16;
+        v = e ? atoi(e) : 256;  /* measured crossover on gfx1151: CPU int8 wins below ~256 rows */
 #else
         v = e ? atoi(e) : 1;
 #endif

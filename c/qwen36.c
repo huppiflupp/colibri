@@ -2682,7 +2682,8 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
     float *qkv = falloc((int64_t)S * conv_dim), *z = falloc((int64_t)S * value_dim);
     float *b = falloc((int64_t)S * vh), *a = falloc((int64_t)S * vh);
     if (qt_dnproj_ready(layer)) {
-        int B = dnproj_batch_rows(S, H, proj_dim);
+        /* whole-prompt blocks (up to 2048 rows): the GPU only wins on large ones */
+        int B = S < 2048 ? S : 2048;
         float *qkvz = falloc((int64_t)B * proj_dim);
         for (int s0 = 0; s0 < S; s0 += B) {
             int rows = S - s0 < B ? S - s0 : B;
@@ -3078,7 +3079,9 @@ static int trunk_probe_gpu_wins(Model *m){
     /* Measure the case the trunk will actually serve on this backend: one row
      * where every call may go to the GPU, a prefill block where only blocks of
      * qt_trunk_min_s() rows or more do (decode then stays on the CPU anyway). */
-    int S = qt_trunk_min_s() > 1 ? 4 * qt_trunk_min_s() : 1;
+    const char *pr = getenv("COLI_TRUNK_PROBE_ROWS");
+    int S = qt_trunk_min_s() > 1 ? (pr ? atoi(pr) : 512) : 1;   /* a prefill-sized block */
+    if (S < 1) S = 1;
     float *x = malloc((size_t)S * I * sizeof(float)), *y = malloc((size_t)S * O * sizeof(float));
     if (!x || !y) { free(x); free(y); return 1; }
     for (int i = 0; i < S * I; i++) x[i] = sinf(0.37f * (float)i);
