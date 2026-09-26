@@ -37,6 +37,11 @@ int  coli_vk_mem_budget(double *used_gb, double *budget_gb);
  * fmt matches QT in glm.c: 1=int8, 2=int4. (0=f32,3=int2 fall back to CPU.)
  * First call uploads W+scales; later calls reuse the resident copy.
  * Returns 1 on success, 0 if unavailable / unsupported fmt. */
+/* DeltaNet gated delta rule over a prefill block (see backend_vulkan.c); 0 -> CPU path. */
+float *coli_vk_dn_stage(int which, size_t bytes);
+int  coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn,
+                      const float *vsrc, int vstride, int voff, const float *beta, const float *gexp,
+                      int S, int vh, int vk, int kdim, int vdim);
 /* Causal attention core of a prefill block (see backend_vulkan.c); 0 -> CPU path. */
 int  coli_vk_attn_prefill(float *ctx, const float *q, const float *K, const float *V, int ldt,
                           int S, int H, int KV, int hd, int pos_base, float scale);

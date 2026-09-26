@@ -1,0 +1,64 @@
+#version 450
+// Gated delta rule of a prefill block for Qwen3.6 DeltaNet layers, in ONE dispatch
+// over all tokens (layout of the per-head state as in qwen36.c: S[h][kk][vv]):
+//   S *= exp(g_t);  kv = k_t^T S;  delta = (v_t - kv) * beta_t;  S += k_t delta^T;
+//   out_t = q_t^T S
+// Every value column vv of S evolves independently, so a column is one unit of
+// work: its kdim entries live in registers of LPC lanes (kdim / LPC each), the
+// k.S and q.S column sums are clustered subgroup adds, and the token loop runs
+// inside the kernel. q and k arrive l2-normalised (q already scaled) per KEY
+// head; value head h reads key head h / rep (repeat_interleave, NOT h % vk).
+// Workgroup = 64 invocations = 4 columns; grid x = value heads, y = vdim / 4.
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 64) in;
+#define LPC 16u                        // lanes per value column
+#define MAXR 16u                       // kdim / LPC <= 16 (kdim <= 256)
+
+layout(std430, binding = 0) readonly buffer QN { float qn[]; };     // [S][vk][kdim]
+layout(std430, binding = 1) readonly buffer KN { float kn[]; };     // [S][vk][kdim]
+layout(std430, binding = 2) readonly buffer VS { float vsrc[]; };   // row t at t*vstride + voff + h*vdim
+layout(std430, binding = 3) readonly buffer BT { float beta[]; };   // [S][vh]
+layout(std430, binding = 4) readonly buffer GE { float gexp[]; };   // [S][vh]  exp(g)
+layout(std430, binding = 5) buffer ST { float st[]; };              // [vh][kdim][vdim], in and out
+layout(std430, binding = 6) writeonly buffer OV { float outv[]; };  // [S][vh][vdim]
+
+layout(push_constant) uniform P { int S, vh, vk, kdim, vdim, vstride, voff; } p;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    // 64 invocations = 4 columns of 16 lanes; clusters of 16 consecutive
+    // invocations stay inside one subgroup for wave32 and wave64 alike
+    uint li = gl_LocalInvocationID.x % LPC;
+    uint col = gl_WorkGroupID.y * 4u + gl_LocalInvocationID.x / LPC;
+    uint kd = uint(p.kdim), vd = uint(p.vdim);
+    uint R = kd / LPC;
+    bool live = col < vd;
+    uint rep = uint(p.vh / p.vk), hk = h / rep;
+    uint sb = h * kd * vd;
+    float s[MAXR];
+    [[unroll]] for (uint r = 0u; r < MAXR; r++)
+        s[r] = (r < R && live) ? st[sb + (r * LPC + li) * vd + col] : 0.0;
+    for (uint t = 0u; t < uint(p.S); t++) {
+        uint qk = (t * uint(p.vk) + hk) * kd;
+        float ge = gexp[t * uint(p.vh) + h], bt = beta[t * uint(p.vh) + h];
+        float part = 0.0;
+        [[unroll]] for (uint r = 0u; r < MAXR; r++) if (r < R) {
+            s[r] *= ge;
+            part += kn[qk + r * LPC + li] * s[r];
+        }
+        float kv = subgroupClusteredAdd(part, LPC);
+        float vv = live ? vsrc[t * uint(p.vstride) + uint(p.voff) + h * vd + col] : 0.0;
+        float dl = (vv - kv) * bt;
+        float op = 0.0;
+        [[unroll]] for (uint r = 0u; r < MAXR; r++) if (r < R) {
+            s[r] += kn[qk + r * LPC + li] * dl;
+            op += qn[qk + r * LPC + li] * s[r];
+        }
+        float o = subgroupClusteredAdd(op, LPC);
+        if (li == 0u && live) outv[(t * uint(p.vh) + h) * vd + col] = o;
+    }
+    [[unroll]] for (uint r = 0u; r < MAXR; r++)
+        if (r < R && live) st[sb + (r * LPC + li) * vd + col] = s[r];
+}
