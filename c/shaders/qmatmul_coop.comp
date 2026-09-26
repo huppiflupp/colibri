@@ -10,7 +10,8 @@
 // shared memory. Results go through shared memory so padded token rows are
 // never stored. Inputs are rounded to f16 on the way in: NOT bit-identical to
 // the GEMV shaders; the harness bounds it against the CPU reference.
-// fmt: 2 = int4 with one scale per row, 4 = grouped int4 (gs % 8 == 0).
+// fmt: 1 = int8 with one scale per row (the dense-i8 trunk), 2 = int4 with one
+// scale per row, 4 = grouped int4 (gs % 8 == 0).
 // Host gates: I % 64 == 0, O % 64 == 0.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
@@ -44,7 +45,31 @@ shared float16_t su[64u * 64u];         // up weights [out][k]
 shared float so[TM * 64u];              // result staging [token][out]
 
 void dequant_row(uint o, uint k0, uint n, bool up) {
-    // one lane: weight row o, inputs k0..k0+63 -> shared row n (8 words of 8 nibbles)
+    if (p.fmt == 1) {   // int8: 16 words of 4 bytes, one scale per row
+        uint rb = o * uint(p.rowWords) + k0 / 4u;
+#ifdef GATE_UP
+        float sc = up ? uscale[o] : gscale[o];
+#else
+        float sc = gscale[o];
+#endif
+        [[unroll]] for (uint j = 0u; j < 16u; j++) {
+#ifdef GATE_UP
+            uint wd = up ? wu[rb + j] : wg[rb + j];
+#else
+            uint wd = wg[rb + j];
+#endif
+            [[unroll]] for (uint k = 0u; k < 4u; k++) {
+                int b = int((wd >> (8u * k)) & 0xffu); if (b >= 128) b -= 256;
+                float v = float(b) * sc;
+#ifdef GATE_UP
+                if (up) su[n * 64u + 4u * j + k] = float16_t(v); else
+#endif
+                sg[n * 64u + 4u * j + k] = float16_t(v);
+            }
+        }
+        return;
+    }
+    // int4: weight row o, inputs k0..k0+63 -> shared row n (8 words of 8 nibbles)
     uint rb = o * uint(p.rowWords) + k0 / 8u;
     int ng = (p.I + p.gs - 1) / max(p.gs, 1);
     [[unroll]] for (uint j = 0u; j < 8u; j++) {

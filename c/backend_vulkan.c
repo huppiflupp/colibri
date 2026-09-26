@@ -307,7 +307,7 @@ static int mr_use(int fmt, int S, int I, int O) {
     if (g_mr_any) return 1;
     return S >= 8 && I <= 8192 && (size_t)I * (size_t)O >= ((size_t)4 << 20);
 }
-/* Tiled cooperative-matrix shader for this dispatch? int4 formats, both dims a
+/* Tiled cooperative-matrix shader for this dispatch? int8/int4 formats, both dims a
  * multiple of its 64-wide tiles, enough token rows. Takes precedence over the
  * multi-row shader. One workgroup = 64 outputs x 16*coop_tt token rows, so a
  * lone matmul launches only O/64 workgroups: measured on gfx1151 it loses to the
@@ -315,7 +315,7 @@ static int mr_use(int fmt, int S, int I, int O) {
  * one submit) it wins from 8 rows on. `grouped` picks the threshold. */
 static int g_coop_any;
 static int coop_use(int fmt, int S, int I, int O, int gs, int grouped) {
-    if (!G.coop || !(fmt == 2 || fmt == 4) || I % 64 || O % 64) return 0;
+    if (!G.coop || !(fmt == 1 || fmt == 2 || fmt == 4) || I % 64 || O % 64) return 0;
     if (fmt == 4 && (gs < 8 || gs % 8)) return 0;
     if (g_coop_any) return 1;
     return S >= (grouped ? G.coop_min : (G.coop_min > 64 ? G.coop_min : 64));
@@ -2690,6 +2690,9 @@ int main(int argc, char **argv) {
             bad |= run_coop_case(2, ss[k], 6144, 1536, 5);   /* GLM gate/up, per-row int4 */
         }
         bad |= run_coop_case(4, 64, 6144, 2048, 5);
+        bad |= run_coop_case(1, 100, 2048, 8192, 3);           /* dense-i8 trunk: DeltaNet qkv (Qwen3.6) */
+        bad |= run_coop_case(1, 33, 4096, 2048, 5);            /* DeltaNet out_proj, tail */
+        bad |= run_coop_case(1, 256, 2048, 4096, 3);
         bad |= run_coop_expert_group(4, 2048, 512, 32, 40, 10, 0.f);
         bad |= run_coop_expert_group(4, 2048, 512, 64, 100, 5, 0.f);
         bad |= run_coop_expert_group(4, 2048, 512, 16, 40, 5, 0.5f);   /* clamp */
