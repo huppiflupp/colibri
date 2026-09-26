@@ -95,7 +95,7 @@ static struct {
     VkShaderModule shader_mr, shader_gu_mr; VkPipeline pipe_mr, pipe_gu_mr; int mr;
     /* Tiled cooperative-matrix variants (qmatmul_coop / qmatmul_gate_up_coop), same
      * layouts again. coop = usable; coop_min = fewest token rows that take them. */
-    VkShaderModule shader_co, shader_gu_co; VkPipeline pipe_co, pipe_gu_co; int coop, coop_min;
+    VkShaderModule shader_co, shader_gu_co; VkPipeline pipe_co, pipe_gu_co; int coop, coop_min, coop_tt;
     int has_coop_dev;    /* device created with cooperativeMatrix + shaderFloat16 + vulkanMemoryModel */
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
@@ -620,20 +620,23 @@ int coli_vk_init(const char *spv_path) {
     /* Optional tiled cooperative-matrix pipelines. COLI_VK_COOP=0 turns them off,
      * COLI_VK_COOP_MIN=<rows> sets the fewest token rows that take them (default 16). */
     {
-        const char *e = getenv("COLI_VK_COOP"), *mn = getenv("COLI_VK_COOP_MIN");
+        const char *e = getenv("COLI_VK_COOP"), *mn = getenv("COLI_VK_COOP_MIN"), *tt = getenv("COLI_VK_COOP_TT");
         G.coop = 0; G.coop_min = mn ? atoi(mn) : 16;
         if (G.coop_min < 2) G.coop_min = 2;
+        /* 16-row token tiles per workgroup (1, 2 or 4; COLI_VK_COOP_TT) */
+        G.coop_tt = tt ? atoi(tt) : 2;
+        if (G.coop_tt != 1 && G.coop_tt != 4) G.coop_tt = 2;
         VkPhysicalDeviceProperties dp; vkGetPhysicalDeviceProperties(G.phys, &dp);
         if (G.has_coop_dev && !(e && *e == '0') && G.shader_gu &&
-            dp.limits.maxComputeSharedMemorySize >= 32768) {   /* 32-row tiles: ~28 KiB shared */
+            dp.limits.maxComputeSharedMemorySize >= 49152) {   /* 64-row tiles: ~44 KiB shared */
             char p1[512], p2[512];
             derive_sibling(spv_path, "_coop.spv", p1, sizeof(p1));
             derive_sibling(spv_path, "_gate_up_coop.spv", p2, sizeof(p2));
             G.shader_co = load_spv(G.dev, p1);
             G.shader_gu_co = G.shader_co ? load_spv(G.dev, p2) : VK_NULL_HANDLE;
             if (G.shader_co && G.shader_gu_co &&
-                build_pipeline_mr(G.dev, G.plyt, G.shader_co, 2, &G.pipe_co) &&
-                build_pipeline_mr(G.dev, G.plyt_gu, G.shader_gu_co, 2, &G.pipe_gu_co))
+                build_pipeline_mr(G.dev, G.plyt, G.shader_co, G.coop_tt, &G.pipe_co) &&
+                build_pipeline_mr(G.dev, G.plyt_gu, G.shader_gu_co, G.coop_tt, &G.pipe_gu_co))
                 G.coop = 1;
         }
     }
@@ -1020,7 +1023,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
          * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width.
          * The multi-row shader covers MR token rows per workgroup in y. */
-        if (co) vkCmdDispatch(G.cmd, (uint32_t)(O / 64), (uint32_t)((S + 31) / 32), 1);
+        if (co) vkCmdDispatch(G.cmd, (uint32_t)(O / 64), (uint32_t)((S + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), 1);
         else vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
         VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
         G.cmd_ready = 1; G.bound_S = S; G.bound_I = I; G.bound_O = O;
@@ -1084,7 +1087,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
     struct PCGU pc = pcgu(fmt, S, D, I, tg->rowWords, tg->gs);   // PC.I = input D, PC.O = moe_inter I
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    if (co) vkCmdDispatch(G.cmd, (uint32_t)(I / 64), (uint32_t)((S + 31) / 32), 1);
+    if (co) vkCmdDispatch(G.cmd, (uint32_t)(I / 64), (uint32_t)((S + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), 1);
     else vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
 
@@ -1183,7 +1186,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         struct PCGU pc = pcgu(fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs);
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)(I / 64), (uint32_t)((rows[c] + 31) / 32), 1);
+        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)(I / 64), (uint32_t)((rows[c] + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), 1);
         else vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
     vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
@@ -1196,7 +1199,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)(D / 64), (uint32_t)((rows[c] + 31) / 32), 1);
+        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)(D / 64), (uint32_t)((rows[c] + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), 1);
         else vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
     VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
