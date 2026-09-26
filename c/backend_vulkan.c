@@ -785,7 +785,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
          * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width.
          * The multi-row shader covers MR token rows per workgroup in y. */
-        if (co) vkCmdDispatch(G.cmd, (uint32_t)(O / 64), (uint32_t)((S + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), 1);
+        if (co) vkCmdDispatch(G.cmd, (uint32_t)((S + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), (uint32_t)(O / 64), 1);
         else vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
         host_read_barrier(G.cmd);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -850,7 +850,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
     struct PCGU pc = pcgu(fmt, S, D, I, tg->rowWords, tg->gs);   // PC.I = input D, PC.O = moe_inter I
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    if (co) vkCmdDispatch(G.cmd, (uint32_t)(I / 64), (uint32_t)((S + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), 1);
+    if (co) vkCmdDispatch(G.cmd, (uint32_t)((S + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), (uint32_t)(I / 64), 1);
     else vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
     host_read_barrier(G.cmd);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -950,7 +950,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         struct PCGU pc = pcgu(fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs);
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)(I / 64), (uint32_t)((rows[c] + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), 1);
+        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)((rows[c] + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), (uint32_t)(I / 64), 1);
         else vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
     vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
@@ -963,7 +963,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)(D / 64), (uint32_t)((rows[c] + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), 1);
+        if (co) vkCmdDispatch(G.eg_cmd, (uint32_t)((rows[c] + 16 * G.coop_tt - 1) / (16 * G.coop_tt)), (uint32_t)(D / 64), 1);
         else vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
     host_read_barrier(G.eg_cmd);

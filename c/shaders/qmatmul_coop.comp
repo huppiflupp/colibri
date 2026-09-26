@@ -92,8 +92,14 @@ void dequant_row(uint o, uint k0, uint n, bool up) {
 }
 
 void main() {
-    uint o0 = gl_WorkGroupID.x * 64u;
-    uint s0 = gl_WorkGroupID.y * TM;
+    // Grid: x = token tiles, y = 64-output blocks. Workgroups are launched x
+    // first, so the ones in flight together share one output block -- its
+    // weights come from the cache for every token tile instead of being read
+    // from memory once per tile ("A-major" order, Kernel-Lab E020). (A variant
+    // where consecutive lanes read consecutive words of one weight row measured
+    // 15-30 % slower on gfx1151 and was dropped.)
+    uint s0 = gl_WorkGroupID.x * TM;
+    uint o0 = gl_WorkGroupID.y * 64u;
     uint tid = gl_LocalInvocationID.x;
     uint nsg = gl_NumSubgroups, sgi = gl_SubgroupID;   // 1 x wave64 or 2 x wave32
     uint K = uint(p.I), S = uint(p.S);
