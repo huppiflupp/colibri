@@ -2757,6 +2757,41 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
      * repeat_interleave), then the gated delta rule on the carried state */
     float *outv = falloc((int64_t)S * value_dim);
     float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
+    /* GPU: normalised q/k per key head, compact v, beta and exp(g) written in
+     * place into the backend's staging buffers, then one dispatch over the block
+     * (f32; not bit-identical to the loop below). QWEN_DN_GPU=0 keeps the CPU. */
+    int dn_gpu = 0;
+    if (S >= 16 && kdim <= 512 && vdim <= 512 && qt_ready() &&
+        !(getenv("QWEN_DN_GPU") && getenv("QWEN_DN_GPU")[0] == '0')) {
+        size_t nqk = (size_t)S * vk * kdim * sizeof(float);
+        float *gq = qt_dn_stage(0, nqk), *gk = qt_dn_stage(1, nqk);
+        float *gv = qt_dn_stage(2, (size_t)S * value_dim * sizeof(float));
+        float *gb = qt_dn_stage(3, (size_t)S * vh * sizeof(float)), *gg = qt_dn_stage(4, (size_t)S * vh * sizeof(float));
+        if (gq && gk && gv && gb && gg) {
+            #pragma omp parallel for schedule(static)
+            for (int s = 0; s < S; s++) {
+                const float *cv = conv + (int64_t)s * conv_dim;
+                for (int j = 0; j < vk; j++) {
+                    const float *qi = cv + (int64_t)j * kdim, *ki = cv + key_dim_tot + (int64_t)j * kdim;
+                    float *qo = gq + ((int64_t)s * vk + j) * kdim, *ko = gk + ((int64_t)s * vk + j) * kdim;
+                    double sq = 1e-6; for (int d = 0; d < kdim; d++) sq += (double)qi[d] * qi[d];
+                    double nq = sqrt(sq);
+                    for (int d = 0; d < kdim; d++) qo[d] = (float)((double)qi[d] / nq * scale);
+                    double sk = 1e-6; for (int d = 0; d < kdim; d++) sk += (double)ki[d] * ki[d];
+                    double nk = sqrt(sk);
+                    for (int d = 0; d < kdim; d++) ko[d] = (float)((double)ki[d] / nk);
+                }
+                memcpy(gv + (int64_t)s * value_dim, cv + 2 * key_dim_tot, (size_t)value_dim * sizeof(float));
+                for (int h = 0; h < vh; h++) {
+                    gb[s * vh + h] = 1.f / (1.f + expf(-b[(int64_t)s * vh + h]));
+                    float gt = -expf(l->dn_alog[h]) * softplus_f(a[(int64_t)s * vh + h] + l->dn_dtbias[h]);
+                    gg[s * vh + h] = expf(gt);
+                }
+            }
+            dn_gpu = qt_dn_recur(outv, rec, gq, gk, gv, gb, gg, S, vh, vk, kdim, vdim);
+        }
+    }
+    if (!dn_gpu)
     #pragma omp parallel for schedule(static)
     for (int h = 0; h < vh; h++) {
         float qh[512], kh[512], kvl[512], dl[512];   /* kdim, vdim <= 512 */

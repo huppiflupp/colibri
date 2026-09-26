@@ -938,6 +938,25 @@ int qt_attn_prefill(float *ctx, const float *q, const float *K, const float *V, 
     return 0;
 #endif
 }
+/* DeltaNet prefill recurrence on the GPU (Vulkan only): staging buffers the engine
+ * fills in place (which 0..4 = qn, kn, v, beta, exp(g)), then one call. */
+float *qt_dn_stage(int which, size_t bytes){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_available() ? coli_vk_dn_stage(which, bytes) : NULL;
+#else
+    (void)which; (void)bytes; return NULL;
+#endif
+}
+int qt_dn_recur(float *outv, float *state, const float *qn, const float *kn, const float *v,
+                const float *beta, const float *gexp, int S, int vh, int vk, int kdim, int vdim){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_available() &&
+           coli_vk_dn_recur(outv, state, qn, kn, v, vh * vdim, 0, beta, gexp, S, vh, vk, kdim, vdim);
+#else
+    (void)outv;(void)state;(void)qn;(void)kn;(void)v;(void)beta;(void)gexp;(void)S;(void)vh;(void)vk;(void)kdim;(void)vdim;
+    return 0;
+#endif
+}
 int qt_trunk_min_s(void){
     static int v = -1;
     if(v < 0){

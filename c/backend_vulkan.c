@@ -111,6 +111,10 @@ static struct {
     VkShaderModule shader_ap; VkDescriptorSetLayout dsl_ap; VkPipelineLayout plyt_ap;
     VkPipeline pipe_ap; VkDescriptorPool dpool_ap; VkDescriptorSet dset_ap;
     Scratch ap_q, ap_k, ap_v, ap_o;
+    /* DeltaNet prefill recurrence (dn_recur.comp): qn, kn, v source, beta, exp(g), state, out */
+    VkShaderModule shader_dr; VkDescriptorSetLayout dsl_dr; VkPipelineLayout plyt_dr;
+    VkPipeline pipe_dr; VkDescriptorPool dpool_dr; VkDescriptorSet dset_dr;
+    Scratch dr_q, dr_k, dr_v, dr_b, dr_g, dr_s, dr_o;
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
     VkCommandPool cpool;
@@ -180,6 +184,7 @@ struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
 struct PCAP { int S, H, KV, hd, pos_base, ldt; float scale; };   /* attn_prefill.comp */
+struct PCDR { int S, vh, vk, kdim, vdim, vstride, voff; };      /* dn_recur.comp */
 
 static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -738,6 +743,15 @@ int coli_vk_init(const char *spv_path) {
     G.shader_att = load_spv(G.dev, att_path);
     if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
         return 0;
+    /* Optional DeltaNet prefill recurrence (COLI_VK_DN_RECUR=0 turns it off). */
+    {
+        const char *e = getenv("COLI_VK_DN_RECUR");
+        char dr_path[512]; derive_dir_file(spv_path, "dn_recur.spv", dr_path, sizeof(dr_path));
+        if (!(e && *e == '0')) G.shader_dr = load_spv(G.dev, dr_path);
+        if (G.shader_dr && !build_pipeline(G.dev, 7, sizeof(struct PCDR), G.shader_dr, &G.dsl_dr, &G.plyt_dr, &G.pipe_dr, &G.dpool_dr, &G.dset_dr)) {
+            vkDestroyShaderModule(G.dev, G.shader_dr, NULL); G.shader_dr = VK_NULL_HANDLE; G.pipe_dr = VK_NULL_HANDLE;
+        }
+    }
     /* Optional causal prefill attention core (COLI_VK_ATTN_PREFILL=0 turns it off). */
     {
         const char *e = getenv("COLI_VK_ATTN_PREFILL");
@@ -1195,6 +1209,62 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
 }
 
 static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi);
+/* DeltaNet gated delta rule over a prefill block (dn_recur.comp). qn/kn: [S][vk][kdim]
+ * l2-normalised (q scaled), v row t at vsrc[t*vstride + voff + h*vdim], beta/gexp:
+ * [S][vh] (gexp = exp(g)), state: [vh][kdim][vdim] read and written back in place,
+ * outv: [S][vh][vdim]. Returns 0 when unavailable -> the caller's CPU recurrence. */
+/* Host-visible staging for coli_vk_dn_recur: which 0..4 = qn, kn, v, beta, gexp.
+ * A caller that fills these in place saves the upload copy (the call skips the
+ * memcpy for any input that already is the staged pointer). NULL on failure. */
+float *coli_vk_dn_stage(int which, size_t bytes) {
+    Scratch *sc[5] = {&G.dr_q, &G.dr_k, &G.dr_v, &G.dr_b, &G.dr_g};
+    if (!G.ready || which < 0 || which > 4 || !scratch_reserve(sc[which], bytes)) return NULL;
+    return (float *)sc[which]->ptr;
+}
+int coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn,
+                     const float *vsrc, int vstride, int voff, const float *beta, const float *gexp,
+                     int S, int vh, int vk, int kdim, int vdim) {
+    if (!G.ready || !G.pipe_dr || S < 1 || vk < 1 || vh % vk || kdim % 16 || kdim > 256 || vdim < 1) return 0;
+    size_t qb = (size_t)S * vk * kdim * 4, vb = ((size_t)(S - 1) * vstride + voff + (size_t)vh * vdim) * 4;
+    size_t bb = (size_t)S * vh * 4, sb = (size_t)vh * kdim * vdim * 4, ob = (size_t)S * vh * vdim * 4;
+    if (!scratch_reserve(&G.dr_q, qb) || !scratch_reserve(&G.dr_k, qb) || !scratch_reserve(&G.dr_v, vb) ||
+        !scratch_reserve(&G.dr_b, bb) || !scratch_reserve(&G.dr_g, bb) ||
+        !scratch_reserve_mt(&G.dr_s, sb, G.memtype_cached) || !scratch_reserve_mt(&G.dr_o, ob, G.memtype_cached)) return 0;
+    double dp0 = vk_now();
+    if (qn != G.dr_q.ptr) memcpy(G.dr_q.ptr, qn, qb);
+    if (kn != G.dr_k.ptr) memcpy(G.dr_k.ptr, kn, qb);
+    if (vsrc != G.dr_v.ptr) memcpy(G.dr_v.ptr, vsrc, vb);
+    if (beta != G.dr_b.ptr) memcpy(G.dr_b.ptr, beta, bb);
+    if (gexp != G.dr_g.ptr) memcpy(G.dr_g.ptr, gexp, bb);
+    memcpy(G.dr_s.ptr, state, sb);
+    double dp1 = vk_now();
+    VkDescriptorBufferInfo bi[7] = {
+        {.buffer = G.dr_q.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.dr_k.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.dr_v.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.dr_b.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.dr_g.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.dr_s.buf, .range = VK_WHOLE_SIZE},
+        {.buffer = G.dr_o.buf, .range = VK_WHOLE_SIZE}};
+    wr_desc(G.dset_dr, 7, bi);
+    VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dr);
+    vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dr, 0, 1, &G.dset_dr, 0, NULL);
+    struct PCDR pc = {S, vh, vk, kdim, vdim, vstride, voff};
+    vkCmdPushConstants(G.cmd, G.plyt_dr, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd, (uint32_t)vh, (uint32_t)((vdim + 3) / 4), 1);
+    host_read_barrier(G.cmd);
+    VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    double dp2 = vk_now();
+    memcpy(outv, G.dr_o.ptr, ob); memcpy(state, G.dr_s.ptr, sb);
+    if (getenv("VK_PROF")) fprintf(stderr, "[VK_PROF] dn_recur upload %.2f | gpu %.2f | readback %.2f ms\n", dp1 - dp0, dp2 - dp1, vk_now() - dp2);
+    G.cmd_ready = 0; G.bound_tensor = NULL;
+    return 1;
+}
+
 /* Causal attention core of a prefill block (attn_prefill.comp): q [S][H][hd] after
  * norm/RoPE, K/V the engine's per-kv-head caches, row t of kv head g at
  * (g*ldt + t)*hd, keys 0 .. pos_base+S-1 valid; ctx [S][H][hd] out. Only the valid
@@ -1235,7 +1305,8 @@ int coli_vk_attn_prefill(float *ctx, const float *q, const float *K, const float
 }
 
 static void wr_desc_dev(VkDevice dev, VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi) {
-    VkWriteDescriptorSet w[6];
+    VkWriteDescriptorSet w[8];   /* up to 8 bindings (dn_recur uses 7) */
+    if (n > 8) n = 8;
     for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = (uint32_t)i,
         .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
@@ -2221,6 +2292,13 @@ void coli_vk_shutdown(void) {
     }
     if (G.shader_co2) vkDestroyShaderModule(G.dev, G.shader_co2, NULL);
     if (G.shader_gu_co2) vkDestroyShaderModule(G.dev, G.shader_gu_co2, NULL);
+    if (G.pipe_dr) {
+        vkDestroyDescriptorPool(G.dev, G.dpool_dr, NULL);
+        vkDestroyPipeline(G.dev, G.pipe_dr, NULL);
+        vkDestroyPipelineLayout(G.dev, G.plyt_dr, NULL);
+        vkDestroyDescriptorSetLayout(G.dev, G.dsl_dr, NULL);
+        vkDestroyShaderModule(G.dev, G.shader_dr, NULL);
+    }
     if (G.pipe_ap) {
         vkDestroyDescriptorPool(G.dev, G.dpool_ap, NULL);
         vkDestroyPipeline(G.dev, G.pipe_ap, NULL);
@@ -3025,6 +3103,48 @@ static int run_expert_prefill_tests(void) {
     bad |= run_expert_prefill(256,128,65,17,0.f); /* GEMV/MR without tiles */
     G.coop = co; g_mr_any = any;
     return bad;
+/* DeltaNet recurrence against the CPU loop of qwen36.c (deltanet_phased, step 3):
+ * same state layout, key head h/rep, decay then k.S, delta, update, q.S. */
+static int run_dn_recur_case(int S, int vh, int vk, int kdim, int vdim) {
+    if (!G.pipe_dr) { printf("dn_recur shader not loaded\n"); return 1; }
+    int vstride = 2 * vk * kdim + vh * vdim + 7, voff = 2 * vk * kdim;   /* conv row: q | k | v (+pad) */
+    size_t nq = (size_t)S * vk * kdim, ns = (size_t)vh * kdim * vdim, no = (size_t)S * vh * vdim;
+    float *qn = malloc(nq * 4), *kn = malloc(nq * 4), *vs = malloc((size_t)S * vstride * 4);
+    float *bt = malloc((size_t)S * vh * 4), *ge = malloc((size_t)S * vh * 4);
+    float *s0 = malloc(ns * 4), *sg = malloc(ns * 4), *sc = malloc(ns * 4), *og = malloc(no * 4), *oc = malloc(no * 4);
+    for (size_t i = 0; i < nq; i++) { qn[i] = (rand() % 200 - 100) / 1000.0f; kn[i] = (rand() % 200 - 100) / 1000.0f; }
+    for (size_t i = 0; i < (size_t)S * vstride; i++) vs[i] = (rand() % 200 - 100) / 100.0f;
+    for (int i = 0; i < S * vh; i++) { bt[i] = (rand() % 100) / 100.0f; ge[i] = 0.9f + (rand() % 100) / 1000.0f; }
+    for (size_t i = 0; i < ns; i++) s0[i] = (rand() % 200 - 100) / 1000.0f;
+    memcpy(sg, s0, ns * 4); memcpy(sc, s0, ns * 4);
+    double t0 = now();
+    if (!coli_vk_dn_recur(og, sg, qn, kn, vs, vstride, voff, bt, ge, S, vh, vk, kdim, vdim)) { printf("dn_recur failed\n"); return 1; }
+    double ms = (now() - t0) * 1000;
+    int rep = vh / vk;
+    float kvl[512], dl[512];
+    for (int h = 0; h < vh; h++) {
+        float *Sh = sc + (size_t)h * kdim * vdim;
+        for (int s = 0; s < S; s++) {
+            const float *kh = kn + ((size_t)s * vk + h / rep) * kdim, *qh = qn + ((size_t)s * vk + h / rep) * kdim;
+            const float *vd = vs + (size_t)s * vstride + voff + (size_t)h * vdim;
+            float egh = ge[s * vh + h], b = bt[s * vh + h];
+            for (int t = 0; t < kdim * vdim; t++) Sh[t] *= egh;
+            for (int v = 0; v < vdim; v++) kvl[v] = 0.f;
+            for (int k = 0; k < kdim; k++) for (int v = 0; v < vdim; v++) kvl[v] += kh[k] * Sh[k * vdim + v];
+            for (int v = 0; v < vdim; v++) dl[v] = (vd[v] - kvl[v]) * b;
+            for (int k = 0; k < kdim; k++) for (int v = 0; v < vdim; v++) Sh[k * vdim + v] += kh[k] * dl[v];
+            float *ov = oc + ((size_t)s * vh + h) * vdim;
+            for (int v = 0; v < vdim; v++) ov[v] = 0.f;
+            for (int k = 0; k < kdim; k++) for (int v = 0; v < vdim; v++) ov[v] += qh[k] * Sh[k * vdim + v];
+        }
+    }
+    double rl2, rmax, sl2, smax; size_t nf, nfs;
+    coop_err(og, oc, no, &rl2, &rmax, &nf);
+    coop_err(sg, sc, ns, &sl2, &smax, &nfs);
+    printf("DNREC S=%4d vh=%d vk=%d kdim=%d vdim=%d | out relL2 %.2e max %.2e | state relL2 %.2e%s | %.2f ms (incl. upload)\n",
+           S, vh, vk, kdim, vdim, rl2, rmax, sl2, (nf || nfs) ? " NONFINITE" : "", ms);
+    free(qn); free(kn); free(vs); free(bt); free(ge); free(s0); free(sg); free(sc); free(og); free(oc);
+    return rl2 > 1e-4 || rmax > 1e-3 || sl2 > 1e-4 || nf || nfs;
 }
 
 /* Prefill attention core against a CPU reference that mirrors qwen36.c's
@@ -3357,6 +3477,12 @@ int main(int argc, char **argv) {
         bad |= run_coop_expert_group(2, 6144, 2048, 8, 40, 3, 0.f);
     } else printf("coopmat shaders not loaded (no VK_KHR_cooperative_matrix f16 config, COLI_VK_COOP=0 or missing .spv): skipped\n");
     bad |= run_expert_prefill_tests();
+    if (G.pipe_dr) {
+        bad |= run_dn_recur_case(1, 32, 16, 128, 128);           /* one token */
+        bad |= run_dn_recur_case(37, 32, 16, 128, 128);          /* Qwen3.6 shape */
+        bad |= run_dn_recur_case(20, 8, 2, 64, 30);              /* rep 4, odd vdim */
+        bad |= run_dn_recur_case(1011, 32, 16, 128, 128);        /* the 1011-token prompt */
+    } else printf("dn_recur shader not loaded: skipped\n");
     if (G.pipe_ap) {
         bad |= run_attn_prefill_case(1, 16, 2, 256, 0, 64);      /* one token */
         bad |= run_attn_prefill_case(37, 16, 2, 256, 0, 64);     /* Qwen3.6 shape, odd S */

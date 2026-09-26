@@ -66,3 +66,4 @@ shaders/qmatmul_gate_up_coop2.spv
 shaders/expert_gather.spv
 shaders/expert_reduce.spv
 shaders/attn_prefill.spv
+shaders/dn_recur.spv
