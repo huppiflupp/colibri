@@ -2690,6 +2690,28 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
     int proj_dim = conv_dim + value_dim;
     extern double g_dn_pf[4];
     double _d0 = tm_now();
+    /* The whole layer on the GPU in one submit when its projections are placed
+     * there: nothing but the layer output, the state and the ring comes back.
+     * QWEN_DN_BLOCK=0 keeps the phases below. (f16 tiles in the projections, as
+     * the placed trunk uses anyway; the rest f32.) */
+    if (l->qth_dnout && qt_dnproj_ready(layer) && S >= qt_trunk_min_s() &&
+        !(getenv("QWEN_DN_BLOCK") && getenv("QWEN_DN_BLOCK")[0] == '0')) {
+        float *bb = falloc((int64_t)S * vh), *aa = falloc((int64_t)S * vh);
+        float *ba = falloc((int64_t)S * 2 * vh), *par = falloc(2 * vh);
+        matmul(bb, x, l->dn_b, S, H, vh);
+        matmul(aa, x, l->dn_a, S, H, vh);
+        for (int s = 0; s < S; s++) {
+            memcpy(ba + (int64_t)s * 2 * vh, bb + (int64_t)s * vh, (size_t)vh * sizeof(float));
+            memcpy(ba + (int64_t)s * 2 * vh + vh, aa + (int64_t)s * vh, (size_t)vh * sizeof(float));
+        }
+        memcpy(par, l->dn_alog, (size_t)vh * sizeof(float));
+        memcpy(par + vh, l->dn_dtbias, (size_t)vh * sizeof(float));
+        int ok = qt_dn_block(layer, l->qth_dnout - 1, x, ba, l->dn_conv, par, l->dn_norm,
+                             m->DN_conv[layer], m->DN_rec[layer], S, H, conv_dim, convk,
+                             vh, vk, kdim, vdim, c->eps, scale, out);
+        free(bb); free(aa); free(ba); free(par);
+        if (ok) { if (tm_on()) g_dn_pf[0] += tm_now() - _d0; return; }
+    }
     /* 1. projections of every token */
     float *qkv = falloc((int64_t)S * conv_dim), *z = falloc((int64_t)S * value_dim);
     float *b = falloc((int64_t)S * vh), *a = falloc((int64_t)S * vh);

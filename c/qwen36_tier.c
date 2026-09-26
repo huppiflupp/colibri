@@ -957,6 +957,23 @@ int qt_dn_recur(float *outv, float *state, const float *qn, const float *kn, con
     return 0;
 #endif
 }
+/* A whole DeltaNet layer of a prefill block on the GPU (Vulkan only): the fused
+ * qkv|z projection of `layer` and the dense out_proj handle `hout` must both be
+ * GPU-placed. 0 -> the engine's own path. */
+int qt_dn_block(int layer, int hout, const float *x, const float *ba, const float *convw,
+                const float *par, const float *normw, float *ring, float *state,
+                int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
+                float eps, float qscale, float *y){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    if(!qt_dnproj_ready(layer) || hout < 0 || hout >= G_dense_n || !G_dense[hout].on) return 0;
+    return coli_vk_dn_block(G_dnp[layer].t, G_dense[hout].t, x, ba, convw, par, normw, ring, state,
+                            S, H, conv_dim, convk, vh, vk, kdim, vdim, eps, qscale, y);
+#else
+    (void)layer;(void)hout;(void)x;(void)ba;(void)convw;(void)par;(void)normw;(void)ring;(void)state;
+    (void)S;(void)H;(void)conv_dim;(void)convk;(void)vh;(void)vk;(void)kdim;(void)vdim;(void)eps;(void)qscale;(void)y;
+    return 0;
+#endif
+}
 int qt_trunk_min_s(void){
     static int v = -1;
     if(v < 0){

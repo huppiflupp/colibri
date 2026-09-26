@@ -1,0 +1,25 @@
+#version 450
+// DeltaNet gated RMSNorm of a prefill block on the GPU (HF Qwen3_5MoeRMSNormGated):
+//   out = (o * r) * w * silu(z),  r = 1 / sqrt(mean(o^2) + eps)
+// One subgroup per (token, value head).
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer OV { float ov[]; };     // [S][vh][vdim]
+layout(std430, binding = 1) readonly buffer QZ { float qkvz[]; };   // z of row s at s*pstride + zoff + h*vdim
+layout(std430, binding = 2) readonly buffer NW { float nw[]; };     // [vdim]
+layout(std430, binding = 3) writeonly buffer OR { float orr[]; };   // [S][vh*vdim]
+layout(push_constant) uniform P { int S, vh, vdim, pstride, zoff; float eps; } p;
+void main() {
+    int s = int(gl_WorkGroupID.x), h = int(gl_WorkGroupID.y);
+    int lane = int(gl_LocalInvocationID.x);
+    int ob = (s * p.vh + h) * p.vdim;
+    float ms = 0.0;
+    for (int d = lane; d < p.vdim; d += 64) { float o = ov[ob + d]; ms += o * o; }
+    ms = subgroupAdd(ms);
+    float r = 1.0 / sqrt(ms / float(p.vdim) + p.eps);
+    int zb = s * p.pstride + p.zoff + h * p.vdim;
+    for (int d = lane; d < p.vdim; d += 64) {
+        float z = qkvz[zb + d];
+        orr[ob + d] = ov[ob + d] * r * nw[d] * (z / (1.0 + exp(-z)));
+    }
+}
