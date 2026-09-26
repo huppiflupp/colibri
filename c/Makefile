@@ -818,9 +818,14 @@ colibri$(EXE): colibri.c sse41_kernels.h exact_dot.h oracle.h pin_pool.h cli_arg
 backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
 # The fused gate+up variant of the tiled shader is the same source with -DGATE_UP.
+# Generation 2 is built with register double buffering (-DDBUF): measured 3-25 %
+# faster on gfx1151 than fetching each step after the barrier.
+shaders/qmatmul_coop2.spv: shaders/qmatmul_coop2.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DDBUF $< -o $@
 shaders/qmatmul_gate_up_coop2.spv: shaders/qmatmul_coop2.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
-	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+	$(GLSLC) --target-env=vulkan1.2 -DDBUF -DGATE_UP $< -o $@
 shaders/qmatmul_gate_up_coop.spv: shaders/qmatmul_coop.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
