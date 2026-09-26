@@ -74,17 +74,16 @@ static int  be_issue(QtTensor *const *g,QtTensor *const *u,QtTensor *const *d,co
 static const float *be_take(int dev,float *ybuf){ (void)dev; return coli_vk_expert_group_take(ybuf) ? ybuf : NULL; }
 static void be_stats(int dev,size_t *tc,size_t *tb){ (void)dev; coli_vk_mem_info(tb,tc); }
 static void be_shutdown(void){ coli_vk_shutdown(); }
-/* Not on Vulkan yet -- each refusal lands on the existing CPU path:
- *  - fmt 8 (fp8 streaming, Qwen3.8) needs the e4m3 decode table in the kernels;
- *  - the resident trunk (COLI_PLACE / COLI_LMHEAD_GPU) needs a matmul on an
- *    already-uploaded tensor. Both exist in backend_cuda only. */
+/* Not on Vulkan yet -- the refusal lands on the existing CPU path:
+ *  - fmt 8 (fp8 streaming, Qwen3.8) needs the e4m3 decode table in the kernels. */
 static int  be_fp8_set_lut(const float *lut){ (void)lut; return 0; }
+/* Resident trunk: one int8 per-row tensor (fmt 1), driven through coli_vk_matmul
+ * on the already-uploaded tensor (weights NULL: the cached tensor is used). With
+ * S >= the backend's tile threshold that is the cooperative-matrix path. */
 static int  be_trunk_upload(QtTensor **t,const int8_t *q,const float *sc,int I,int O,int dev){
-    (void)t;(void)q;(void)sc;(void)I;(void)O;(void)dev;
-    static int said=0; if(!said){ said=1; fprintf(stderr,"[qtier] trunk placement is CUDA-only; lm_head/projections stay on CPU\n"); }
-    return 0; }
+    (void)dev; return coli_vk_tensor_ensure(t,(const uint8_t *)q,sc,1,I,O,0); }
 static int  be_trunk_matmul(QtTensor **t,float *y,const float *x,int S,int I,int O,int dev){
-    (void)t;(void)y;(void)x;(void)S;(void)I;(void)O;(void)dev; return 0; }
+    (void)dev; return coli_vk_matmul(t,y,x,NULL,NULL,1,S,I,O,0); }
 #endif
 #include "tier.h"
 
@@ -919,8 +918,27 @@ int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){
     G_dense_n++;
     return h;
 }
+/* Fewest rows a trunk call takes to the GPU. On Vulkan a lone S=1 GEMV costs a
+ * submit and a fence round trip per matrix, which on an APU loses to the CPU,
+ * while a prefill block runs on the matrix units: so decode stays on the CPU
+ * and prefill goes to the GPU. Declining is not a failure -- the caller's CPU
+ * path runs and the tensor stays placed. QT_TRUNK_MIN_S overrides. */
+int qt_trunk_min_s(void){
+    static int v = -1;
+    if(v < 0){
+        const char *e = getenv("QT_TRUNK_MIN_S");
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+        v = e ? atoi(e) : 16;
+#else
+        v = e ? atoi(e) : 1;
+#endif
+        if(v < 1) v = 1;
+    }
+    return v;
+}
 int qt_dense_matmul_batch(int h, float *y, const float *x, int S, int I, int O){
     if(h < 0 || h >= G_dense_n || !G_dense[h].on || S <= 0) return 0;
+    if(S < qt_trunk_min_s()) return 0;
     if(be_trunk_matmul(&G_dense[h].t, y, x, S, I, O, G_dense[h].dev)) return 1;
     fprintf(stderr,"[dense] handle %d GPU matmul failed; CPU from here on\n", h);
     G_dense[h].on = 0;
@@ -936,6 +954,7 @@ int qt_dnproj_ready(int layer){
 }
 int qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, int O){
     if(!qt_dnproj_ready(layer) || S <= 0) return 0;
+    if(S < qt_trunk_min_s()) return 0;
     if(be_trunk_matmul(&G_dnp[layer].t,y,x,S,I,O,G_dnp[layer].dev))
         return 1;
     fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
@@ -949,6 +968,7 @@ int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
 
 int qt_lmhead_matmul(float *y, const float *x, int I, int O){
     if(!G_lmh.on) return 0;
+    if(qt_trunk_min_s() > 1) return 0;   /* one row: stays on the CPU where lone GEMVs lose */
     /* cached-tensor path: upload params are ignored once *t exists */
     if(be_trunk_matmul(&G_lmh.t,y,x,1,I,O,G_lmh.dev)) return 1;
     fprintf(stderr,"[lmh] GPU matmul failed; falling back to CPU from here on\n");

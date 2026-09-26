@@ -2552,17 +2552,42 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         float *res = falloc((int64_t)S * K * D);
         uint8_t *done = malloc((size_t)S * K);
         if (!qt_issue_batch(layer, bidx, S, K, x, res, done)) memset(done, 0, (size_t)S * K);
+        /* Shared expert of all S tokens in three batched matmuls when it is GPU-
+         * placed (a prefill block); the sum per token keeps its old place below. */
+        int Ish = c->shared_inter;
+        float *shb = NULL, *sgb = NULL;
+        if (l->qth_shg && l->qth_shu && l->qth_shd && S >= qt_trunk_min_s()) {
+            float *hg = falloc((int64_t)S * Ish), *hu = falloc((int64_t)S * Ish);
+            shb = falloc((int64_t)S * D); sgb = falloc(S);
+            double _ts2 = tm_now();
+            if (!qtd_batch(l->qth_shg, hg, x, S, D, Ish)) matmul_d(hg, x, &l->sh_g, S, D, Ish);
+            if (!qtd_batch(l->qth_shu, hu, x, S, D, Ish)) matmul_d(hu, x, &l->sh_u, S, D, Ish);
+            for (int64_t i = 0; i < (int64_t)S * Ish; i++) { float sv = hg[i]; hg[i] = (sv / (1.f + expf(-sv))) * hu[i]; }
+            if (!qtd_batch(l->qth_shd, shb, hg, S, Ish, D)) matmul_d(shb, hg, &l->sh_d, S, Ish, D);
+            for (int s = 0; s < S; s++) {
+                float sgate = 1.f;
+                if (l->sh_gate) {
+                    float sg = 0.f; const float *wg = l->sh_gate, *xs = x + (int64_t)s*D;
+                    for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
+                    sgate = 1.f / (1.f + expf(-sg));
+                }
+                sgb[s] = sgate;
+            }
+            tm_add(S, 3, tm_now()-_ts2);
+            free(hg); free(hu);
+        }
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s*D; float *os = out + (int64_t)s*D;
             for (int kk = 0; kk < K; kk++)
                 if (!done[s*K+kk]) qt_cpu_expert(m, layer, bidx[s*K+kk], bval[s*K+kk], xs, os, g, u, hh);
-            qt_shared_token(c, l, xs, os, sh, shu, shd, S);
+            if (shb) { const float *sr = shb + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += sgb[s] * sr[d]; }
+            else qt_shared_token(c, l, xs, os, sh, shu, shd, S);
             for (int kk = 0; kk < K; kk++) if (done[s*K+kk]) {
                 float w = bval[s*K+kk]; const float *row = res + ((int64_t)s*K + kk) * D;
                 for (int d = 0; d < D; d++) os[d] += w * row[d];
             }
         }
-        free(res); free(done); free(bidx); free(bval);
+        free(res); free(done); free(bidx); free(bval); free(shb); free(sgb);
     }
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
@@ -2623,6 +2648,11 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
 
     float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
     float *ring = m->DN_conv[layer];    /* [conv_dim*(convk-1)] */
+    /* out_proj has no recurrent dependency either: on a GPU-placed layer, a
+     * prefill block collects every token's gated-norm row and projects them
+     * in ONE batched call after the loop instead of one GEMV per token. */
+    int dnout_batch = l->qth_dnout && S >= qt_trunk_min_s() && S > 1;
+    float *outr_all = dnout_batch ? falloc((int64_t)S * value_dim) : NULL;
 
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s * H;
@@ -2734,7 +2764,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                 outr[(int64_t)h * vdim + d] = val * zr[d] / (1.f + expf(-zr[d]));
             }
         }
-        if (!qtd(l->qth_dnout, out + (int64_t)s * H, outr, value_dim, H))
+        if (dnout_batch) memcpy(outr_all + (int64_t)s * value_dim, outr, (size_t)value_dim * sizeof(float));
+        else if (!qtd(l->qth_dnout, out + (int64_t)s * H, outr, value_dim, H))
             matmul_d(out + (int64_t)s * H, outr, &l->dn_out, 1, value_dim, H);
         if (tm_on() && S==1){ g_dn_sub[3]+=tm_now()-_d0; }
         if (layer == 0 && s == 0 && getenv("DN_DBG")) {
@@ -2753,6 +2784,11 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                 fclose(dbg);
             }
         }
+    }
+    if (dnout_batch) {
+        if (!qtd_batch(l->qth_dnout, out, outr_all, S, value_dim, H))
+            matmul_d(out, outr_all, &l->dn_out, S, value_dim, H);
+        free(outr_all);
     }
     free(qkvz);   /* qkv and z are regions of this one allocation */
     free(b); free(a); free(beta); free(gg);
@@ -2847,26 +2883,32 @@ static int trunk_probe_gpu_wins(Model *m){
     int I = w->I, O = w->O;
     int h = qt_dense_init(w->q, w->sc, I, O, dev);
     if (h < 0) return 1;                             /* cannot measure: the placer's word stands */
-    float *x = malloc((size_t)I * sizeof(float)), *y = malloc((size_t)O * sizeof(float));
+    /* Measure the case the trunk will actually serve on this backend: one row
+     * where every call may go to the GPU, a prefill block where only blocks of
+     * qt_trunk_min_s() rows or more do (decode then stays on the CPU anyway). */
+    int S = qt_trunk_min_s() > 1 ? 4 * qt_trunk_min_s() : 1;
+    float *x = malloc((size_t)S * I * sizeof(float)), *y = malloc((size_t)S * O * sizeof(float));
     if (!x || !y) { free(x); free(y); return 1; }
-    for (int i = 0; i < I; i++) x[i] = sinf(0.37f * (float)i);
+    for (int i = 0; i < S * I; i++) x[i] = sinf(0.37f * (float)i);
     double gpu = 1e30, cpu = 1e30;
     for (int r = 0; r < 3; r++) {
-        for (int k = 0; k < 3; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
+        for (int k = 0; k < 3; k++) if (!qt_dense_matmul_batch(h, y, x, S, I, O)) { free(x); free(y); return 1; }
         double t0 = now_s();
-        for (int k = 0; k < 10; k++) if (!qt_dense_matmul(h, y, x, I, O)) { free(x); free(y); return 1; }
+        for (int k = 0; k < 10; k++) if (!qt_dense_matmul_batch(h, y, x, S, I, O)) { free(x); free(y); return 1; }
         double tg = (now_s() - t0) / 10;
-        for (int k = 0; k < 3; k++) matmul_q(y, x, w->q, w->sc, I, O);
+        if (S == 1) for (int k = 0; k < 3; k++) matmul_q(y, x, w->q, w->sc, I, O);
+        else for (int k = 0; k < 3; k++) matmul_d(y, x, w, S, I, O);
         t0 = now_s();
-        for (int k = 0; k < 10; k++) matmul_q(y, x, w->q, w->sc, I, O);
+        if (S == 1) for (int k = 0; k < 10; k++) matmul_q(y, x, w->q, w->sc, I, O);
+        else for (int k = 0; k < 10; k++) matmul_d(y, x, w, S, I, O);
         double tc = (now_s() - t0) / 10;
         if (tg < gpu) gpu = tg;
         if (tc < cpu) cpu = tc;
     }
     free(x); free(y);
     int wins = gpu < cpu;
-    fprintf(stderr, "[place] probe: one [%d x %d] int8 GEMV takes %.3f ms on CUDA dev %d, %.3f ms on the CPU -> trunk %s\n",
-            O, I, gpu * 1e3, dev, cpu * 1e3, wins ? "to VRAM" : "stays on the CPU");
+    fprintf(stderr, "[place] probe: [%d x %d] int8 matmul, %d row(s), takes %.3f ms on %s dev %d, %.3f ms on the CPU -> trunk %s\n",
+            O, I, S, gpu * 1e3, qt_backend_name(), dev, cpu * 1e3, wins ? "to VRAM" : "stays on the CPU");
     return wins;
 }
 
@@ -2945,6 +2987,11 @@ static const char *g_echo_id = NULL;
 static void serve_echo(const char *id, int pos, int token, const float *lo, int V, int k);
 #endif
 
+/* PPL_PREFILL=1 (measurement): score every position of ONE prefill block, so
+ * teacher-forced NLL runs through the batched prefill path (S > 1) instead of
+ * one token per step. */
+static int g_pa_on; static double g_pa_nll; static long g_pa_n;
+
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
     if (m->resident_mode && m->first_step) m->resident_collecting = 1;
@@ -2978,6 +3025,18 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     m->token_count += S; m->freq_token_count += S;
     if (!m->hot_pinned && m->hot_n > 0 && m->freq_token_count >= m->warmup_tokens) pin_hot_experts(m);
     m->kv_len = pos_base + S;
+    if (g_pa_on && S > 1) {
+        float *erow = falloc(D), *elog = falloc(c->vocab);
+        for (int p = 0; p + 1 < S; p++) {
+            rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
+            if (!qt_lmhead_matmul(elog, erow, D, c->vocab))
+                matmul_d(elog, erow, &m->lm_head, 1, D, c->vocab);
+            float mx = elog[0]; for (int v = 1; v < c->vocab; v++) if (elog[v] > mx) mx = elog[v];
+            double Z = 0; for (int v = 0; v < c->vocab; v++) Z += exp((double)elog[v] - mx);
+            g_pa_nll += log(Z) + mx - elog[ids[p+1]]; g_pa_n++;
+        }
+        free(erow); free(elog);
+    }
     /* Lettura del prefill: una passata di lm_head per posizione, pagata SOLO
      * dalle richieste che hanno chiesto il canale. La posizione p predice il
      * token p+1, quindi si copre l'intero blocco fresco tranne il suo primo
@@ -3357,6 +3416,13 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     reset_recurrent(m);
     ensure_kv(m);
     m->kv_len = 0;
+    if (getenv("PPL_PREFILL") && atoi(getenv("PPL_PREFILL")) == 1) {
+        g_pa_on = 1; g_pa_nll = 0; g_pa_n = 0;
+        float *lg = step(m, full, nfull, 0); (void)lg;
+        g_pa_on = 0;
+        *nll_out = g_pa_n ? g_pa_nll / (double)g_pa_n : 0;
+        return (int)g_pa_n;
+    }
     double nll = 0; int scored = 0;
     float *logit = step(m, full, np, 0);
     for (int i = np; i < nfull; i++) {
