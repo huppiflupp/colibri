@@ -3103,6 +3103,8 @@ static int run_expert_prefill_tests(void) {
     bad |= run_expert_prefill(256,128,65,17,0.f); /* GEMV/MR without tiles */
     G.coop = co; g_mr_any = any;
     return bad;
+}
+
 /* DeltaNet recurrence against the CPU loop of qwen36.c (deltanet_phased, step 3):
  * same state layout, key head h/rep, decay then k.S, delta, update, q.S. */
 static int run_dn_recur_case(int S, int vh, int vk, int kdim, int vdim) {
