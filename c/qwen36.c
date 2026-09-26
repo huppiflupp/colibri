@@ -2759,10 +2759,14 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
     float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
     /* GPU: normalised q/k per key head, compact v, beta and exp(g) written in
      * place into the backend's staging buffers, then one dispatch over the block
-     * (f32; not bit-identical to the loop below). QWEN_DN_GPU=0 keeps the CPU. */
+     * (f32; not bit-identical to the loop below). */
     int dn_gpu = 0;
+    /* Opt in (QWEN_DN_GPU=1): measured on a 1011-token prompt the kernel saves
+     * ~85 ms of recurrence but the read-back of state and output takes most of it
+     * back (TTFT 2.77-2.81 s either way). Worth it once the whole DeltaNet block
+     * stays on the GPU. */
     if (S >= 16 && kdim <= 512 && vdim <= 512 && qt_ready() &&
-        !(getenv("QWEN_DN_GPU") && getenv("QWEN_DN_GPU")[0] == '0')) {
+        getenv("QWEN_DN_GPU") && getenv("QWEN_DN_GPU")[0] == '1') {
         size_t nqk = (size_t)S * vk * kdim * sizeof(float);
         float *gq = qt_dn_stage(0, nqk), *gk = qt_dn_stage(1, nqk);
         float *gv = qt_dn_stage(2, (size_t)S * value_dim * sizeof(float));
