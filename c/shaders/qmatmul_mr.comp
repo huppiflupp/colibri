@@ -1,0 +1,124 @@
+#version 450
+// Multi-row variant of qmatmul.comp for S > 1 (prefill, expert groups with more
+// than one routed token, MTP verification):
+//   y[s,o] = ( sum_i x[s,i] * dequant(W[o,i]) ) * scale[o]
+// qmatmul.comp gives every token row its own workgroup (dispatch y = S), so each
+// weight word is fetched and decoded S times. Here one workgroup owns MR
+// consecutive token rows (dispatch y = ceil(S/MR)): a lane fetches a weight word
+// ONCE, decodes it ONCE, and applies it to all MR rows. Everything else is the
+// GEMV unchanged -- one subgroup per output row, lanes stride the row's words,
+// subgroupAdd, grid-stride over rows -- and every row keeps exactly the per-lane
+// summation order of qmatmul.comp, so the result is bit-identical to it.
+// fmt: 1=int8, 2=int4, 4=grouped int4. fmt 5 and 7 stay on qmatmul.comp (the
+// host routes them there). MR is a specialization constant (host default 4).
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int MR = 4;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };   // row o at o*rowWords
+layout(std430, binding = 2) readonly buffer Sc { float scale[]; };
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt;        // 1=int8, 2=int4, 4=grouped int4
+    int S, I, O;
+    int rowWords;   // uint32 words per weight row
+    int gs;         // fmt=4 group size (multiple of 8; host gates otherwise)
+} p;
+
+// MR rows of x staged together when MR*I fits (Qwen3.6 experts: 4 x 2048);
+// larger rows read x straight from the storage buffer, as qmatmul.comp does
+// above its own staging limit. Rows past S read as zero and are never stored.
+#define XS 8192
+shared float xsh[XS];
+
+float i8(uint word, int lane) {
+    int b = int((word >> (uint(lane) * 8u)) & 0xffu);
+    if (b >= 128) b -= 256;
+    return float(b);
+}
+float i4(uint word, int lane) {
+    return float(int((word >> (uint(lane) * 4u)) & 0xfu) - 8);
+}
+
+void main() {
+    int s0  = int(gl_WorkGroupID.y) * MR;
+    int nr  = min(MR, p.S - s0);
+    int tid = int(gl_LocalInvocationID.x);
+    int nth = int(gl_WorkGroupSize.x);
+
+    bool staged = MR * p.I <= XS;
+    if (staged) for (int j = tid; j < MR * p.I; j += nth) {
+        int r = j / p.I;
+        xsh[j] = r < nr ? x[(s0 + r) * p.I + (j - r * p.I)] : 0.0;
+    }
+    barrier();
+
+    int sg      = int(gl_SubgroupID);
+    int lane    = int(gl_SubgroupInvocationID);
+    int sgsize  = int(gl_SubgroupSize);
+    int nsg     = nth / sgsize;
+    int stride  = int(gl_NumWorkGroups.x) * nsg;
+
+    for (int o = int(gl_WorkGroupID.x) * nsg + sg; o < p.O; o += stride) {
+        uint rowBase = uint(o) * uint(p.rowWords);
+        float sum[MR];
+        for (int r = 0; r < MR; r++) sum[r] = 0.0;
+        if (p.fmt == 1) {
+            int words = (p.I + 3) / 4;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 4;
+                for (int k = 0; k < 4; k++) {
+                    int i = i0 + k;
+                    if (i < p.I) {
+                        float wv = i8(pk, k);
+                        for (int r = 0; r < MR; r++) {
+                            float xv = staged ? xsh[r * p.I + i] : (r < nr ? x[(s0 + r) * p.I + i] : 0.0);
+                            sum[r] += xv * wv;
+                        }
+                    }
+                }
+            }
+        } else if (p.fmt == 4) { // grouped int4: per-word partial times its group scale
+            int words = (p.I + 7) / 8, ng = (p.I + p.gs - 1) / p.gs;
+            uint sb = uint(o) * uint(ng);
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                float a[MR];
+                for (int r = 0; r < MR; r++) a[r] = 0.0;
+                for (int k = 0; k < 8; k++) {
+                    int i = i0 + k;
+                    if (i < p.I) {
+                        float wv = i4(pk, k);
+                        for (int r = 0; r < MR; r++) {
+                            float xv = staged ? xsh[r * p.I + i] : (r < nr ? x[(s0 + r) * p.I + i] : 0.0);
+                            a[r] += xv * wv;
+                        }
+                    }
+                }
+                float sc = scale[sb + uint(i0 / p.gs)];
+                for (int r = 0; r < MR; r++) sum[r] += a[r] * sc;
+            }
+        } else { // int4
+            int words = (p.I + 7) / 8;
+            for (int wi = lane; wi < words; wi += sgsize) {
+                uint pk = w[rowBase + uint(wi)]; int i0 = wi * 8;
+                for (int k = 0; k < 8; k++) {
+                    int i = i0 + k;
+                    if (i < p.I) {
+                        float wv = i4(pk, k);
+                        for (int r = 0; r < MR; r++) {
+                            float xv = staged ? xsh[r * p.I + i] : (r < nr ? x[(s0 + r) * p.I + i] : 0.0);
+                            sum[r] += xv * wv;
+                        }
+                    }
+                }
+            }
+        }
+        for (int r = 0; r < MR; r++) {
+            float tot = subgroupAdd(sum[r]);
+            if (lane == 0 && r < nr) y[(s0 + r) * p.O + o] = p.fmt == 4 ? tot : tot * scale[o];
+        }
+    }
+}

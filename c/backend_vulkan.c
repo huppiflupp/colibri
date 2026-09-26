@@ -89,6 +89,10 @@ static struct {
     /* fused dual gate+up+silu pipeline (6 bindings): x, Wg, gscale, Wu, uscale, hidden */
     VkShaderModule shader_gu; VkDescriptorSetLayout dsl_gu; VkPipelineLayout plyt_gu;
     VkPipeline pipe_gu; VkDescriptorPool dpool_gu; VkDescriptorSet dset_gu;
+    /* Multi-row variants (qmatmul_mr / qmatmul_gate_up_mr): one workgroup per MR token
+     * rows, each weight word read once for all of them. Same layouts as pipe / pipe_gu,
+     * so the existing descriptor sets bind to either. Optional: absent -> one-row path. */
+    VkShaderModule shader_mr, shader_gu_mr; VkPipeline pipe_mr, pipe_gu_mr; int mr;
     /* MLA absorb attention core (7 bindings): q, W, scales, Lcache, Rcache, scores, ctx */
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
@@ -337,6 +341,24 @@ static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModul
     return 1;
 }
 
+/* A second pipeline on an existing layout, with the multi-row count MR as
+ * specialization constant 0 (qmatmul_mr.comp / qmatmul_gate_up_mr.comp). */
+static int build_pipeline_mr(VkDevice dev, VkPipelineLayout plyt, VkShaderModule shader, int mr, VkPipeline *pipe) {
+    VkSpecializationMapEntry me = {.constantID = 0, .offset = 0, .size = sizeof(int)};
+    VkSpecializationInfo spi = {.mapEntryCount = 1, .pMapEntries = &me, .dataSize = sizeof(int), .pData = &mr};
+    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main",
+                  .pSpecializationInfo = &spi},
+        .layout = plyt};
+    return vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe) == VK_SUCCESS;
+}
+/* Use the multi-row shader for this dispatch? Only formats it implements, and only
+ * when more than one token row shares the weights. */
+static int mr_use(int fmt, int S) {
+    return G.mr > 1 && S > 1 && (fmt == 1 || fmt == 2 || fmt == 4);
+}
+
 /* "…/qmatmul.spv" -> "…/qmatmul<suffix>" (sibling of the main shader). */
 static void derive_sibling(const char *spv, const char *suffix, char *out, size_t n) {
     const char *dot = strstr(spv, ".spv");
@@ -505,6 +527,27 @@ int coli_vk_init(const char *spv_path) {
     G.shader_gu = load_spv(G.dev, gu_path);
     if (G.shader_gu && !build_pipeline(G.dev, 6, sizeof(struct PCGU), G.shader_gu, &G.dsl_gu, &G.plyt_gu, &G.pipe_gu, &G.dpool_gu, &G.dset_gu))
         return 0;
+
+    /* Optional multi-row pipelines for S > 1. COLI_VK_MR=<rows per workgroup> (default
+     * 4, 1 or 0 = off: every S > 1 dispatch takes the one-row shaders as before). Both
+     * must load, or neither is used. */
+    {
+        const char *e = getenv("COLI_VK_MR");
+        int mr = e ? atoi(e) : 4;
+        if (mr > 8) mr = 8;
+        G.mr = 0;
+        if (mr > 1 && G.shader_gu) {
+            char p1[512], p2[512];
+            derive_sibling(spv_path, "_mr.spv", p1, sizeof(p1));
+            derive_sibling(spv_path, "_gate_up_mr.spv", p2, sizeof(p2));
+            G.shader_mr = load_spv(G.dev, p1);
+            G.shader_gu_mr = G.shader_mr ? load_spv(G.dev, p2) : VK_NULL_HANDLE;
+            if (G.shader_mr && G.shader_gu_mr &&
+                build_pipeline_mr(G.dev, G.plyt, G.shader_mr, mr, &G.pipe_mr) &&
+                build_pipeline_mr(G.dev, G.plyt_gu, G.shader_gu_mr, mr, &G.pipe_gu_mr))
+                G.mr = mr;
+        }
+    }
 
     /* Optional MLA absorb attention pipeline (same directory as the main shader). */
     /* Optional rmsnorm pipeline: enables the pair->norm->q_b single-submit chain
@@ -880,13 +923,15 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+        int mr = mr_use(fmt, S);
+        vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mr ? G.pipe_mr : G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
         struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
         vkCmdPushConstants(G.cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         /* Grid-stride shader: one subgroup per output row (~8 rows/workgroup at wave32).
-         * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width. */
-        vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)S, 1);
+         * Launch ~O/8 workgroups for occupancy; the shader loops to cover any O / wave width.
+         * The multi-row shader covers MR token rows per workgroup in y. */
+        vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
         VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
         G.cmd_ready = 1; G.bound_S = S; G.bound_I = I; G.bound_O = O;
     }
@@ -944,11 +989,12 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
+    int mr = mr_use(fmt, S);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, mr ? G.pipe_gu_mr : G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
     struct PCGU pc = pcgu(fmt, S, D, I, tg->rowWords, tg->gs);   // PC.I = input D, PC.O = moe_inter I
     vkCmdPushConstants(G.cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)S, 1);
+    vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
@@ -1036,21 +1082,29 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VKCHECK(vkBeginCommandBuffer(G.eg_cmd, &begin), "eg beginCmd");
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
-    vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
+    /* Experts with more than one routed row take the multi-row shader, the rest the
+     * one-row shader; order within a phase is free (the dispatches are independent). */
+    VkPipeline bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
+        int mr = mr_use(fmt, rows[c]);
+        VkPipeline want = mr ? G.pipe_gu_mr : G.pipe_gu;
+        if (want != bound) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); bound = want; }
         struct PCGU pc = pcgu(fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs);
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)rows[c], 1);
+        vkCmdDispatch(G.eg_cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
     vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     /* phase 2: down projection hidden -> y */
-    vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+    bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
+        int mr = mr_use(dfmt, rows[c]);
+        VkPipeline want = mr ? G.pipe_mr : G.pipe;
+        if (want != bound) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); bound = want; }
         struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
+        vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
     VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
     if (G.eg_prof) G.eg_t3 = vk_now();
@@ -1841,6 +1895,10 @@ void coli_vk_shutdown(void) {
     vkDestroyPipelineLayout(G.dev, G.plyt, NULL);
     vkDestroyDescriptorSetLayout(G.dev, G.dsl, NULL);
     vkDestroyShaderModule(G.dev, G.shader, NULL);
+    if (G.pipe_mr) vkDestroyPipeline(G.dev, G.pipe_mr, NULL);
+    if (G.pipe_gu_mr) vkDestroyPipeline(G.dev, G.pipe_gu_mr, NULL);
+    if (G.shader_mr) vkDestroyShaderModule(G.dev, G.shader_mr, NULL);
+    if (G.shader_gu_mr) vkDestroyShaderModule(G.dev, G.shader_gu_mr, NULL);
     if (G.shader_gu) {
         vkDestroyDescriptorPool(G.dev, G.dpool_gu, NULL);
         vkDestroyPipeline(G.dev, G.pipe_gu, NULL);
@@ -2328,6 +2386,113 @@ static int run_qprep(int fmt, int S, int I, int Oqa, int Okva, int Oqb) {
     return mq > 1e-2f || mk > 1e-3f;
 }
 
+/* Multi-row shaders (qmatmul_mr / qmatmul_gate_up_mr) against the CPU reference AND
+ * against the one-row shaders they replace for S > 1: same per-row summation order,
+ * so the two must agree bit for bit. Also times both on the same inputs. */
+static double mr_diff(const float *a, const float *b, size_t n) {
+    double m = 0;
+    for (size_t i = 0; i < n; i++) { double e = fabs((double)a[i] - b[i]); if (e > m) m = e; }
+    return m;
+}
+static int run_mr_case(int fmt, int S, int I, int O, int iters) {
+    if (!G.mr) { printf("multi-row shaders not loaded\n"); return 1; }
+    size_t rb = ref_rowbytes(fmt, I), nsc = ref_scales(fmt, I, O), ny = (size_t)S * O;
+    float *x = malloc((size_t)S * I * sizeof(float)), *sc = malloc(nsc * sizeof(float));
+    uint8_t *w = malloc(rb * O);
+    float *ym = malloc(ny * 4), *y1 = malloc(ny * 4), *yc = malloc(ny * 4);
+    for (int i = 0; i < S * I; i++) x[i] = (float)((rand() % 200 - 100) / 100.0);
+    for (size_t i = 0; i < rb * O; i++) w[i] = rand() & 0xff;
+    for (size_t o = 0; o < nsc; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
+    ColiVkTensor *t = NULL;
+    int mr = G.mr, bad = 0;
+    if (!coli_vk_matmul(&t, ym, x, w, sc, fmt, S, I, O, g_ref_gs)) { printf("matmul failed\n"); return 1; }
+    double t0 = now();
+    for (int k = 0; k < iters; k++) coli_vk_matmul(&t, ym, x, w, sc, fmt, S, I, O, g_ref_gs);
+    double ms_mr = (now() - t0) * 1000 / iters;
+    G.mr = 0; G.cmd_ready = 0;
+    coli_vk_matmul(&t, y1, x, w, sc, fmt, S, I, O, g_ref_gs);
+    t0 = now();
+    for (int k = 0; k < iters; k++) coli_vk_matmul(&t, y1, x, w, sc, fmt, S, I, O, g_ref_gs);
+    double ms_1 = (now() - t0) * 1000 / iters;
+    G.mr = mr; G.cmd_ready = 0;
+    cpu_ref(yc, x, w, sc, fmt, S, I, O);
+    double maxrel = 0;
+    for (size_t i = 0; i < ny; i++) { double e = fabs(ym[i] - yc[i]);
+        if (fabs(yc[i]) > 1e-2) { double r = e / fabs(yc[i]); if (r > maxrel) maxrel = r; } }
+    double d1 = mr_diff(ym, y1, ny);
+    printf("MR%d fmt=%d S=%2d I=%5d O=%5d | maxrel=%.4g | vs one-row %s | %.3f ms (one-row %.3f, %.2fx)\n",
+           mr, fmt, S, I, O, maxrel, d1 == 0 ? "bit-identical" : "DIFFERS", ms_mr, ms_1, ms_1 / ms_mr);
+    bad = maxrel > 1e-3 || d1 != 0;
+    coli_vk_tensor_free(t);
+    free(x); free(sc); free(w); free(ym); free(y1); free(yc);
+    return bad;
+}
+/* Expert group with several routed rows per expert (prefill / MTP verify): rows[c]
+ * cycles 1..maxrows, so one group mixes one-row and multi-row dispatches. */
+static int run_mr_expert_group(int fmt, int D, int I, int K, int maxrows, int iters) {
+    if (!G.mr) { printf("multi-row shaders not loaded\n"); return 1; }
+    if (K > 64) K = 64;
+    size_t gu_rb = ref_rowbytes(fmt, D), gu_sc = ref_scales(fmt, D, I);
+    size_t d_rb  = ref_rowbytes(fmt, I), d_sc  = ref_scales(fmt, I, D);
+    ColiVkTensor *tg[64] = {0}, *tu[64] = {0}, *td[64] = {0};
+    uint8_t *hgw[64], *huw[64], *hdw[64]; float *hgs[64], *hus[64], *hds[64];
+    int rows[64], total = 0;
+    for (int c = 0; c < K; c++) { rows[c] = 1 + (c * 5) % maxrows; total += rows[c]; }
+    float *x = malloc((size_t)total*D*4), *ym = malloc((size_t)total*D*4);
+    float *y1 = malloc((size_t)total*D*4), *yc = malloc((size_t)total*D*4);
+    float *tmp = malloc((size_t)(D > I ? D : I) * 4), *hid = malloc((size_t)I*4);
+    for (int i = 0; i < total*D; i++) x[i] = (rand()%200-100)/100.0f;
+    for (int c = 0; c < K; c++) {
+        hgw[c] = malloc(gu_rb*I); huw[c] = malloc(gu_rb*I); hdw[c] = malloc(d_rb*D);
+        for (size_t i = 0; i < gu_rb*I; i++) { hgw[c][i] = rand()&0xff; huw[c][i] = rand()&0xff; }
+        for (size_t i = 0; i < d_rb*D; i++) hdw[c][i] = rand()&0xff;
+        hgs[c] = malloc(gu_sc*4); hus[c] = malloc(gu_sc*4); hds[c] = malloc(d_sc*4);
+        /* int8 draws span +-128 (int4: +-8): scale them down so the gate/up/down chain
+         * stays in the range where a 3e-3 fp32-vs-double bound is meaningful. */
+        float sf = fmt == 1 ? 1.0f / 16 : 1.0f;
+        for (size_t o = 0; o < gu_sc; o++) { hgs[c][o] = sf*(0.01f+(rand()%100)/10000.0f); hus[c][o] = sf*(0.01f+(rand()%100)/10000.0f); }
+        for (size_t o = 0; o < d_sc; o++) hds[c][o] = sf*(0.01f+(rand()%100)/10000.0f);
+        coli_vk_tensor_ensure(&tg[c], hgw[c], hgs[c], fmt, D, I, g_ref_gs);
+        coli_vk_tensor_ensure(&tu[c], huw[c], hus[c], fmt, D, I, g_ref_gs);
+        coli_vk_tensor_ensure(&td[c], hdw[c], hds[c], fmt, I, D, g_ref_gs);
+    }
+    int mr = G.mr, bad = 0;
+    if (!coli_vk_expert_group(tg, tu, td, rows, K, ym, x)) { printf("expert_group failed\n"); return 1; }
+    double t0 = now();
+    for (int k = 0; k < iters; k++) coli_vk_expert_group(tg, tu, td, rows, K, ym, x);
+    double ms_mr = (now() - t0) * 1000 / iters;
+    G.mr = 0;
+    coli_vk_expert_group(tg, tu, td, rows, K, y1, x);
+    t0 = now();
+    for (int k = 0; k < iters; k++) coli_vk_expert_group(tg, tu, td, rows, K, y1, x);
+    double ms_1 = (now() - t0) * 1000 / iters;
+    G.mr = mr;
+    for (int c = 0, off = 0; c < K; off += rows[c], c++)
+        for (int r = 0; r < rows[c]; r++) {
+            const float *xr = x + (size_t)(off + r)*D;
+            for (int o = 0; o < I; o++) {
+                float gt = (float)ref_dot(xr, hgw[c]+(size_t)o*gu_rb, hgs[c], o, fmt, D);
+                float ut = (float)ref_dot(xr, huw[c]+(size_t)o*gu_rb, hus[c], o, fmt, D);
+                hid[o] = (gt/(1.0f+expf(-gt)))*ut;
+            }
+            for (int d = 0; d < D; d++)
+                yc[(size_t)(off + r)*D + d] = (float)ref_dot(hid, hdw[c]+(size_t)d*d_rb, hds[c], d, fmt, I);
+        }
+    double maxrel = 0;
+    for (int i = 0; i < total*D; i++) { double e = fabs(ym[i]-yc[i]);
+        if (fabs(yc[i])>1e-2) { double r = e/fabs(yc[i]); if (r>maxrel) maxrel = r; } }
+    double d1 = mr_diff(ym, y1, (size_t)total*D);
+    printf("MR%d expert_group fmt=%d D=%d I=%d %2d experts, %3d rows (1..%d each) | maxrel=%.4g | vs one-row %s | %.3f ms (one-row %.3f, %.2fx)\n",
+           mr, fmt, D, I, K, total, maxrows, maxrel, d1 == 0 ? "bit-identical" : "DIFFERS", ms_mr, ms_1, ms_1 / ms_mr);
+    bad = maxrel > 3e-3 || d1 != 0;   /* 3e-3: the two-reduction chain, see run_expert_group */
+    free(x); free(ym); free(y1); free(yc); free(tmp); free(hid);
+    for (int c = 0; c < K; c++) {
+        coli_vk_tensor_free(tg[c]); coli_vk_tensor_free(tu[c]); coli_vk_tensor_free(td[c]);
+        free(hgw[c]); free(huw[c]); free(hdw[c]); free(hgs[c]); free(hus[c]); free(hds[c]);
+    }
+    return bad;
+}
+
 int main(int argc, char **argv) {
     char spvbuf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_default_spv(spvbuf, sizeof spvbuf);
@@ -2336,6 +2501,17 @@ int main(int argc, char **argv) {
     printf("weights: %s\n", coli_vk_staged() ? "staged device-local" : "mapped host-visible");
     srand(1234);
     int bad = 0;
+    if (getenv("VK_MR_SWEEP")) {   /* tuning aid: multi-row vs one-row across shapes only */
+        int sh[][2] = {{2048,512},{512,2048},{2048,1536},{1536,2048},{4096,1024},{6144,1536},{6144,2048},{2048,6144},{16384,6144}};
+        int ss[] = {2, 4, 8, 16, 32};
+        g_ref_gs = 64;
+        for (unsigned k = 0; k < sizeof sh / sizeof sh[0]; k++)
+            for (unsigned j = 0; j < sizeof ss / sizeof ss[0]; j++)
+                bad |= run_mr_case(4, ss[j], sh[k][0], sh[k][1], 20);
+        printf(bad ? "FAIL\n" : "PASS\n");
+        coli_vk_shutdown();
+        return bad;
+    }
     /* COLI_VK_TEST_BALLAST=N: allocate N idle 4 MB device buffers before benching.
      * Probes whether per-submit cost scales with the process's ALLOCATION COUNT
      * (RADV/amdgpu CS buffer-list accounting) independent of bytes — the suspected
@@ -2472,6 +2648,23 @@ int main(int argc, char **argv) {
         bad |= run_absorb(4, 1, 64, 192, 64, 256, 512, 0, 300, 7);    // grouped-int4 kv_b + o
         bad |= run_absorb(4, 2, 64, 192, 64, 256, 512, 17, 300, 8);   // fmt=4 S=2 causal + window
     }
+    /* Multi-row shaders: formats 1/2/4, tails (S not a multiple of MR), the staged
+     * (MR*I <= 8192) and unstaged paths, Qwen3.6 and GLM expert shapes. */
+    if (G.mr) {
+        g_ref_gs = 64;
+        int fm[3] = {1, 2, 4}, ss[6] = {2, 3, 4, 5, 8, 33};
+        for (int f = 0; f < 3; f++) for (int k = 0; k < 6; k++) {
+            bad |= run_mr_case(fm[f], ss[k], 2048, 512, 20);    /* Qwen3.6 gate/up, staged */
+            bad |= run_mr_case(fm[f], ss[k], 512, 2048, 20);    /* Qwen3.6 down, staged */
+        }
+        bad |= run_mr_case(2, 8, 6144, 1536, 10);               /* GLM gate/up, unstaged */
+        bad |= run_mr_case(4, 11, 6144, 2048, 10);              /* unstaged, tail */
+        bad |= run_mr_case(2, 3, 16384, 6144, 5);               /* o_proj shape */
+        bad |= run_mr_expert_group(4, 2048, 512, 8, 9, 20);     /* Qwen3.6 experts, gs64 */
+        bad |= run_mr_expert_group(4, 2048, 512, 32, 33, 10);   /* prefill-like: up to 33 rows */
+        bad |= run_mr_expert_group(1, 2048, 512, 8, 9, 20);     /* int8 promotion */
+        bad |= run_mr_expert_group(2, 6144, 2048, 8, 9, 10);    /* GLM shape, unstaged gate_up */
+    } else printf("multi-row shaders not loaded (COLI_VK_MR<=1 or missing .spv): skipped\n");
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();
     return bad;
