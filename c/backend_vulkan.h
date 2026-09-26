@@ -47,6 +47,9 @@ const char *coli_vk_default_spv(char *buf, size_t n);
  * fmt matches QT in glm.c: 1=int8, 2=int4. (0=f32,3=int2 fall back to CPU.)
  * First call uploads W+scales; later calls reuse the resident copy.
  * Returns 1 on success, 0 if unavailable / unsupported fmt. */
+/* Causal attention core of a prefill block (see backend_vulkan.c); 0 -> CPU path. */
+int  coli_vk_attn_prefill(float *ctx, const float *q, const float *K, const float *V, int ldt,
+                          int S, int H, int KV, int hd, int pos_base, float scale);
 int  coli_vk_matmul(ColiVkTensor **tensor,
                     float *y, const float *x,
                     const void *weights, const float *scales,

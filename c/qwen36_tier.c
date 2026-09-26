@@ -924,6 +924,20 @@ int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){
  * while a prefill block runs on the matrix units: so decode stays on the CPU
  * and prefill goes to the GPU. Declining is not a failure -- the caller's CPU
  * path runs and the tensor stays placed. QT_TRUNK_MIN_S overrides. */
+/* Causal attention core of a prefill block on the GPU (Vulkan only for now).
+ * 0 = not available -> the engine's CPU loop. QT_ATTN_MIN_S: fewest rows. */
+int qt_attn_prefill(float *ctx, const float *q, const float *K, const float *V, int ldt,
+                    int S, int H, int KV, int hd, int pos_base, float scale){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    static int mn = -1;
+    if(mn < 0){ const char *e = getenv("QT_ATTN_MIN_S"); mn = e ? atoi(e) : 16; }
+    if(!coli_vk_available() || S < mn || S < 1) return 0;
+    return coli_vk_attn_prefill(ctx,q,K,V,ldt,S,H,KV,hd,pos_base,scale);
+#else
+    (void)ctx;(void)q;(void)K;(void)V;(void)ldt;(void)S;(void)H;(void)KV;(void)hd;(void)pos_base;(void)scale;
+    return 0;
+#endif
+}
 int qt_trunk_min_s(void){
     static int v = -1;
     if(v < 0){

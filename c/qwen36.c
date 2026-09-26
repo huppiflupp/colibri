@@ -2100,6 +2100,7 @@ static void rope_head_partial(float *x, int pos, int rope_dim, int head_dim, flo
  *  - partial RoPE on the first rotary_dim dims of each head (text: mRoPE == standard).
  *  - scale = head_dim^-0.5; GQA repeat_kv.
  *  - attn_out = attn_out * sigmoid(gate), then o_proj (input dim = q_heads*head_dim). */
+static int use_qt_ready_attn(void) { return qt_ready(); }
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, D = c->hidden;
@@ -2153,6 +2154,11 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     if (tm_on() && S > 1) { double t = tm_now(); g_at_pf[0] += t - _a0; _a0 = t; }
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*H*hd);
+    /* A prefill block's attention core on the GPU (K/V were just written to the
+     * caches above, so the keys 0 .. pos_base+S-1 are complete). */
+    int gpu_core = kvd == hd && S > 1 && use_qt_ready_attn() &&
+                   qt_attn_prefill(ctx, query, m->K[layer], m->V[layer], m->max_t, S, H, KV, hd, pos_base, scale);
+    if (!gpu_core)
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
         for (int s = 0; s < S; s++) {

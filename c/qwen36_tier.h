@@ -144,6 +144,8 @@ void qt_note_n(int layer, int eid, const uint8_t *g4, const uint8_t *u4, const u
                const float *gs, const float *us, const float *ds, uint32_t n);
 /* Fewest rows a trunk matmul takes to the GPU (fewer: the caller's CPU path). */
 int qt_trunk_min_s(void);
+int qt_attn_prefill(float *ctx, const float *q, const float *K, const float *V, int ldt,
+                    int S, int H, int KV, int hd, int pos_base, float scale);
 int qt_issue_batch(int layer, const int *eids, int S, int K, const float *x, float *res, uint8_t *done);
 
 /* Warmstart: plan the full fill set (heat order, budget reserved), then any
@@ -192,6 +194,7 @@ static inline int qt_batch_gpu_reduce(void){return 0;}
 static inline int qt_issue_batch_reduce(int a,const int*b,int c,int d,const float*e,const float*f,float*g,uint8_t*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
 static inline void qt_note_n(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h,uint32_t n){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)n;}
 static inline int qt_trunk_min_s(void){return 1;}
+static inline int qt_attn_prefill(float*a,const float*b,const float*c,const float*d,int e,int f,int g,int h,int i,int j,float k){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;return 0;}
 static inline int qt_issue_batch(int a,const int*b,int c,int d,const float*e,float*f,uint8_t*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
