@@ -683,7 +683,7 @@ ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o
-VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/qmatmul_coop2.spv shaders/qmatmul_gate_up_coop2.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
+VK_SPV    = shaders/expert_gather.spv shaders/expert_reduce.spv shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/qmatmul_coop2.spv shaders/qmatmul_gate_up_coop2.spv shaders/attention_absorb.spv shaders/rmsnorm.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:

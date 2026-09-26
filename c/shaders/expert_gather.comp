@@ -1,0 +1,12 @@
+#version 450
+// Copy token rows into the expert-packed layout without a host-side pair copy.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform Params { int S, D, K, rows; } p;
+layout(binding = 0) readonly buffer Input { float x[]; };
+layout(binding = 1) readonly buffer Order { int pair[]; };
+layout(binding = 2) writeonly buffer Packed { float packed[]; };
+void main() {
+    int d = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
+    if (d < p.D && r < p.rows)
+        packed[r*p.D+d] = x[(pair[r]/p.K)*p.D+d];
+}

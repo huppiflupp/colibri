@@ -15,6 +15,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <limits.h>
 #ifdef __linux__
 #include <unistd.h>
 #endif
@@ -62,6 +63,8 @@ typedef struct {
     VkBuffer bl, br; VkDeviceMemory ml, mr; void *pl, *pr;
     int rows, K, R;
 } VkKvLayer;
+
+#define EG_MAX_EXPERTS 1024
 
 static struct {
     int ready;
@@ -115,12 +118,19 @@ static struct {
      * descriptor sets (gate_up: dsl_gu, down: dsl), so gate_up->down runs on-device in
      * one submit with hidden never leaving the GPU. */
     Scratch eg_x, eg_h, eg_y;
-    VkDescriptorPool eg_pool; VkDescriptorSet eg_gu[64], eg_dn[64]; int eg_nsets;
+    VkDescriptorPool eg_pool; VkDescriptorSet eg_gu[EG_MAX_EXPERTS], eg_dn[EG_MAX_EXPERTS]; int eg_nsets;
     /* expert-group ASYNC state: its own command buffer + fence so an in-flight group
      * never collides with the main cmd/fence (dense matmuls, absorb) — issue() returns
      * immediately, the CPU computes its share, take() joins. */
     VkCommandBuffer eg_cmd; VkFence eg_fence; int eg_inflight; size_t eg_pending_yb;
     double eg_t0, eg_t1, eg_t2, eg_t3; int eg_prof;
+    /* Prefill gather/reduce shares the expert command buffer, with persistent
+     * metadata and token-sized host I/O. Packed x/h/y never leave the GPU. */
+    Scratch ep_x, ep_order, ep_inverse, ep_weights, ep_y;
+    VkShaderModule ep_shader[2]; VkDescriptorSetLayout ep_dsl[2];
+    VkPipelineLayout ep_layout[2]; VkPipeline ep_pipe[2];
+    VkDescriptorPool ep_pool[2]; VkDescriptorSet ep_set[2];
+    int eg_reduced;
     /* q-prep chain (pair -> rmsnorm -> q_b in ONE submit): norm pipeline (3 bindings),
      * a 3rd matmul set + norm set, GPU-only latent intermediates, per-layer resident
      * norm-weight buffers (tiny, uploaded once like the KV mirror). */
@@ -160,6 +170,8 @@ void coli_vk_set_swiglu_limit(float limit) { g_swiglu_limit = limit > 0.f ? limi
 static struct PCGU pcgu(int fmt, int S, int I, int O, int rowWords, int gs) {
     return (struct PCGU){fmt, S, I, O, rowWords, gs, g_swiglu_limit, 0};
 }
+struct PCEP { int S, D, K, rows; };
+typedef struct { int S, K; const int *order; const float *weights; } ExpertPrefill;
 struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
@@ -709,6 +721,14 @@ int coli_vk_init(const char *spv_path) {
             .descriptorPool = G.qprep_pool, .descriptorSetCount = 1, .pSetLayouts = &G.dsl};
         VKCHECK(vkAllocateDescriptorSets(G.dev, &dsa3, &G.dset_qp3), "qprep descSet");
     }
+    const char *ep_names[2] = {"expert_gather.spv", "expert_reduce.spv"};
+    for (int i = 0; i < 2; i++) {
+        char path[512]; derive_dir_file(spv_path, ep_names[i], path, sizeof(path));
+        G.ep_shader[i] = load_spv(G.dev, path);
+        if (G.ep_shader[i] && !build_pipeline(G.dev, i ? 4 : 3, sizeof(struct PCEP),
+                G.ep_shader[i], &G.ep_dsl[i], &G.ep_layout[i], &G.ep_pipe[i],
+                &G.ep_pool[i], &G.ep_set[i])) return 0;
+    }
     char att_path[512]; derive_dir_file(spv_path, "attention_absorb.spv", att_path, sizeof(att_path));
     G.shader_att = load_spv(G.dev, att_path);
     if (G.shader_att && !build_pipeline(G.dev, 7, sizeof(struct PCAttn), G.shader_att, &G.dsl_att, &G.plyt_att, &G.pipe_att, &G.dpool_att, &G.dset_att))
@@ -1180,39 +1200,86 @@ static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi
  * main pipeline (dense matmuls, absorb attention). Returns 0 -> caller falls back. */
 static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                              ColiVkTensor *const *downs, const int *rows, int count,
-                             const float *x) {
-    if (!G.ready || !G.shader_gu || count < 1 || count > 64) return 0;
+                             const float *x, const ExpertPrefill *ep) {
+    if (!G.ready || !G.shader_gu || count < 1 || count > (ep ? EG_MAX_EXPERTS : 64)) return 0;
     ColiVkTensor *g0 = gates[0]; if (!g0) return 0;
-    int D = g0->I, I = g0->O, fmt = g0->fmt, total = 0, off[64];
+    int D = g0->I, I = g0->O, fmt = g0->fmt, total = 0, off[EG_MAX_EXPERTS];
     if (D > 6144) return 0;   /* gate_up shader stages x in xsh[6144] */
+    if (!downs[0]) return 0;
     int dfmt = downs[0]->fmt;   /* down may be a different quant than gate/up (per-projection
                                  * containers, e.g. --up-bits 3); gate/up must MATCH — the
                                  * fused gate_up shader decodes both with one fmt. */
     for (int c = 0; c < count; c++) {
+        if (!gates[c] || !ups[c] || !downs[c] || rows[c] < 1 || rows[c] > INT_MAX-total ||
+            gates[c]->dev || ups[c]->dev || downs[c]->dev) return 0;
         off[c] = total; total += rows[c];
         if (rows[c] < 1 || gates[c]->I != D || gates[c]->O != I || gates[c]->fmt != fmt ||
             ups[c]->I != D || ups[c]->O != I || ups[c]->fmt != fmt ||
             downs[c]->I != I || downs[c]->O != D || downs[c]->fmt != dfmt) return 0;
+    }
+    if (ep) {
+        if (!G.ep_pipe[0] || !G.ep_pipe[1] || ep->S < 2 || ep->K < 1 ||
+            ep->S > INT_MAX/ep->K || total > ep->S*ep->K || !ep->order || !ep->weights) return 0;
+        VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(G.phys, &props);
+        VkPhysicalDeviceLimits *lim = &props.limits;
+        /* Shader indexing is signed 32-bit; descriptor slices must be aligned.
+         * Refuse oversized prompts before allocation, allowing CPU fallback. */
+        if (D < 1 || I < 1 || total > INT_MAX/D || total > INT_MAX/I || ep->S > INT_MAX/D ||
+            (size_t)total*D*4 > lim->maxStorageBufferRange ||
+            (size_t)total*I*4 > lim->maxStorageBufferRange ||
+            (size_t)ep->S*D*4 > lim->maxStorageBufferRange ||
+            (size_t)ep->S*ep->K*4 > lim->maxStorageBufferRange ||
+            (D*4) % lim->minStorageBufferOffsetAlignment ||
+            (I*4) % lim->minStorageBufferOffsetAlignment ||
+            (uint32_t)total > lim->maxComputeWorkGroupCount[1] ||
+            (uint32_t)ep->S > lim->maxComputeWorkGroupCount[1]) return 0;
+        size_t pb = (size_t)ep->S*ep->K*4;
+        if (!scratch_reserve(&G.ep_x, (size_t)ep->S*D*4) ||
+            !scratch_reserve(&G.ep_order, (size_t)total*4) ||
+            !scratch_reserve(&G.ep_inverse, pb) || !scratch_reserve(&G.ep_weights, pb) ||
+            !scratch_reserve_mt(&G.ep_y, (size_t)ep->S*D*4, G.memtype_cached)) return 0;
+        int *inv = G.ep_inverse.ptr;
+        for (int p = 0; p < ep->S*ep->K; p++) inv[p] = -1;
+        for (int r = 0; r < total; r++) {
+            int p = ep->order[r];
+            if (p < 0 || p >= ep->S*ep->K || inv[p] != -1) return 0;
+            inv[p] = r;
+        }
     }
     size_t xb = (size_t)total*D*4, hb = (size_t)total*I*4, yb = (size_t)total*D*4;
     if (!scratch_reserve(&G.eg_x, xb) || !scratch_reserve(&G.eg_h, hb) ||
         !scratch_reserve_mt(&G.eg_y, yb, G.memtype_cached)) return 0;   /* eg_y is read back -> cached */
     G.eg_prof = getenv("VK_PROF") != NULL;
     if (G.eg_prof) G.eg_t0 = vk_now();
-    memcpy(G.eg_x.ptr, x, xb);
+    if (ep) {
+        memcpy(G.ep_x.ptr, x, (size_t)ep->S*D*4);
+        memcpy(G.ep_order.ptr, ep->order, (size_t)total*4);
+        memcpy(G.ep_weights.ptr, ep->weights, (size_t)ep->S*ep->K*4);
+    } else memcpy(G.eg_x.ptr, x, xb);
     if (G.eg_prof) G.eg_t1 = vk_now();
 
-    if (!G.eg_pool) {   /* one-time: 64 gate_up (6-binding) + 64 down (4-binding) sets */
-        VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 64*6 + 64*4};
-        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 128, .poolSizeCount = 1, .pPoolSizes = &ps};
+    if (G.eg_nsets < count) {
+        if (G.eg_pool) vkDestroyDescriptorPool(G.dev, G.eg_pool, NULL);
+        G.eg_pool = VK_NULL_HANDLE; G.eg_nsets = 0;
+        int n = count < 64 ? 64 : count;
+        VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = n*10};
+        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = n*2, .poolSizeCount = 1, .pPoolSizes = &ps};
         VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.eg_pool), "eg descPool");
-        VkDescriptorSetLayout lg[64], ld[64];
-        for (int c = 0; c < 64; c++) { lg[c] = G.dsl_gu; ld[c] = G.dsl; }
-        VkDescriptorSetAllocateInfo ag = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = G.eg_pool, .descriptorSetCount = 64, .pSetLayouts = lg};
-        VkDescriptorSetAllocateInfo ad = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = G.eg_pool, .descriptorSetCount = 64, .pSetLayouts = ld};
+        VkDescriptorSetLayout lg[EG_MAX_EXPERTS], ld[EG_MAX_EXPERTS];
+        for (int c = 0; c < n; c++) { lg[c] = G.dsl_gu; ld[c] = G.dsl; }
+        VkDescriptorSetAllocateInfo ag = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = G.eg_pool, .descriptorSetCount = n, .pSetLayouts = lg};
+        VkDescriptorSetAllocateInfo ad = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = G.eg_pool, .descriptorSetCount = n, .pSetLayouts = ld};
         VKCHECK(vkAllocateDescriptorSets(G.dev, &ag, G.eg_gu), "eg gu sets");
         VKCHECK(vkAllocateDescriptorSets(G.dev, &ad, G.eg_dn), "eg dn sets");
-        G.eg_nsets = 64;
+        G.eg_nsets = n;
+    }
+    if (ep) {
+        VkDescriptorBufferInfo gi[3] = {{G.ep_x.buf, 0, (size_t)ep->S*D*4},
+            {G.ep_order.buf, 0, (size_t)total*4}, {G.eg_x.buf, 0, xb}};
+        VkDescriptorBufferInfo ri[4] = {{G.eg_y.buf, 0, yb},
+            {G.ep_inverse.buf, 0, (size_t)ep->S*ep->K*4},
+            {G.ep_weights.buf, 0, (size_t)ep->S*ep->K*4}, {G.ep_y.buf, 0, (size_t)ep->S*D*4}};
+        wr_desc(G.ep_set[0], 3, gi); wr_desc(G.ep_set[1], 4, ri);
     }
     for (int c = 0; c < count; c++) {
         VkDeviceSize xo = (VkDeviceSize)off[c]*D*4, ho = (VkDeviceSize)off[c]*I*4, yo = (VkDeviceSize)off[c]*D*4;
@@ -1232,6 +1299,14 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.eg_cmd, &begin), "eg beginCmd");
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    if (ep) {
+        struct PCEP pc = {ep->S, D, ep->K, total};
+        vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.ep_pipe[0]);
+        vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.ep_layout[0], 0, 1, &G.ep_set[0], 0, NULL);
+        vkCmdPushConstants(G.eg_cmd, G.ep_layout[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.eg_cmd, (D+255)/256, total, 1);
+        vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
     /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
     /* Experts with more than one routed row take the multi-row shader, the rest the
      * one-row shader; order within a phase is free (the dispatches are independent). */
@@ -1261,6 +1336,14 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         if (co) vkCmdDispatch(G.eg_cmd, cgx, cgy, 1);
         else vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
+    if (ep) {
+        vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        struct PCEP pc = {ep->S, D, ep->K, total};
+        vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.ep_pipe[1]);
+        vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.ep_layout[1], 0, 1, &G.ep_set[1], 0, NULL);
+        vkCmdPushConstants(G.eg_cmd, G.ep_layout[1], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.eg_cmd, (D+255)/256, ep->S, 1);
+    }
     host_read_barrier(G.eg_cmd);
     VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
     if (G.eg_prof) G.eg_t3 = vk_now();
@@ -1270,8 +1353,19 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     { double vp0 = G.eg_prof ? vk_now() : 0;
       VKCHECK(vk_submit(G.queue, &si, G.eg_fence), "eg queueSubmit");
       if (G.eg_prof) g_vsub_ms += vk_now() - vp0; }
-    G.eg_pending_yb = yb; G.eg_inflight = 1;
+    G.eg_pending_yb = ep ? (size_t)ep->S*D*4 : yb; G.eg_reduced = ep != NULL; G.eg_inflight = 1;
     return 1;
+}
+
+/* Synchronous token I/O; all experts, gather and reduction share one submit. */
+int coli_vk_expert_prefill(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                           ColiVkTensor *const *downs, const int *rows, int count,
+                           const int *order, const float *weights, int S, int K,
+                           const float *x, float *y) {
+    if (G.eg_inflight || !x || !y) return 0;
+    ExpertPrefill ep = {S, K, order, weights};
+    if (!eg_prepare_submit(gates, ups, downs, rows, count, x, &ep)) return 0;
+    return coli_vk_expert_group_take(y);
 }
 
 /* Issue a group asynchronously: submit and return WITHOUT waiting, so the caller
@@ -1280,7 +1374,7 @@ int coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *
                                ColiVkTensor *const *downs, const int *rows, int count,
                                const float *x) {
     if (G.eg_inflight) return 0;
-    return eg_prepare_submit(gates, ups, downs, rows, count, x);
+    return eg_prepare_submit(gates, ups, downs, rows, count, x, NULL);
 }
 
 /* Join the in-flight group and read back the packed outputs. */
@@ -1292,7 +1386,7 @@ int coli_vk_expert_group_take(float *y) {
         G.ready = 0; return 0;
     }
     double t4 = G.eg_prof ? vk_now() : 0;
-    memcpy(y, G.eg_y.ptr, G.eg_pending_yb);
+    memcpy(y, G.eg_reduced ? G.ep_y.ptr : G.eg_y.ptr, G.eg_pending_yb);
     if (G.eg_prof) {
         double t5 = vk_now();
         fprintf(stderr, "[VK_PROF] memcpy_x %.3f | desc %.3f | record %.3f | issue->take %.3f | memcpy_y %.3f ms\n",
@@ -1306,7 +1400,7 @@ int coli_vk_expert_group(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                          ColiVkTensor *const *downs, const int *rows, int count,
                          float *y, const float *x) {
     if (G.eg_inflight) return 0;
-    if (!eg_prepare_submit(gates, ups, downs, rows, count, x)) return 0;
+    if (!eg_prepare_submit(gates, ups, downs, rows, count, x, NULL)) return 0;
     return coli_vk_expert_group_take(y);
 }
 
@@ -2047,6 +2141,17 @@ void coli_vk_shutdown(void) {
         if (G.lnbuf[l]) { vkDestroyBuffer(G.dev, G.lnbuf[l], NULL); vkFreeMemory(G.dev, G.lnmem[l], NULL); }
     if (G.pair_pool) vkDestroyDescriptorPool(G.dev, G.pair_pool, NULL);
     coli_vk_kv_reset();
+    Scratch *ep_scratch[] = {&G.ep_x, &G.ep_order, &G.ep_inverse, &G.ep_weights, &G.ep_y};
+    for (int i = 0; i < 5; i++) if (ep_scratch[i]->buf) {
+        vkDestroyBuffer(G.dev, ep_scratch[i]->buf, NULL); vkFreeMemory(G.dev, ep_scratch[i]->mem, NULL);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (G.ep_pool[i]) vkDestroyDescriptorPool(G.dev, G.ep_pool[i], NULL);
+        if (G.ep_pipe[i]) vkDestroyPipeline(G.dev, G.ep_pipe[i], NULL);
+        if (G.ep_layout[i]) vkDestroyPipelineLayout(G.dev, G.ep_layout[i], NULL);
+        if (G.ep_dsl[i]) vkDestroyDescriptorSetLayout(G.dev, G.ep_dsl[i], NULL);
+        if (G.ep_shader[i]) vkDestroyShaderModule(G.dev, G.ep_shader[i], NULL);
+    }
     if (G.eg_pool) vkDestroyDescriptorPool(G.dev, G.eg_pool, NULL);
     vkDestroyFence(G.dev, G.fence, NULL);
     vkDestroyFence(G.dev, G.eg_fence, NULL);
@@ -2764,6 +2869,103 @@ static int run_coop_expert_group(int fmt, int D, int I, int K, int maxrows, int 
     return rl2 > 3e-3 || rmax > 2e-2 || nf;
 }
 
+/* End-to-end token input -> gather -> experts -> ordered weighted reduction.
+ * Shuffle pair IDs, leave holes (CPU misses), and reserve one all-miss token.
+ * Compare both CPU math and the old <=64-expert host pack/readback path. */
+static int run_expert_prefill(int D, int I, int E, int maxrows, float limit) {
+    int fmt = 4, K = 8, total = 0, bad = 0;
+    int *rows = malloc(E*sizeof(int));
+    ColiVkTensor **tg = calloc(E, sizeof(*tg)), **tu = calloc(E, sizeof(*tu)), **td = calloc(E, sizeof(*td));
+    for (int c = 0; c < E; c++) { rows[c] = 1+(c*7)%maxrows; total += rows[c]; }
+    int S = total/K + total/(K*3) + 4, pairs = S*K;
+    int *order = malloc(pairs*sizeof(int)), *inv = malloc(pairs*sizeof(int)), eligible = 0;
+    for (int p = 0; p < pairs; p++) {
+        inv[p] = -1;
+        if (p/K < S-1 && p%5) order[eligible++] = p;
+    }
+    for (int r = eligible-1; r > 0; r--) { int j = rand()%(r+1), t = order[r]; order[r] = order[j]; order[j] = t; }
+    for (int r = 0; r < total; r++) inv[order[r]] = r;
+    size_t ny = (size_t)S*D;
+    float *x = malloc(ny*4), *w = malloc(pairs*4), *packed = malloc((size_t)total*D*4);
+    float *yp = malloc((size_t)total*D*4), *yc = malloc((size_t)total*D*4);
+    float *y = malloc(ny*4), *again = malloc(ny*4), *ref = calloc(ny,4), *old = calloc(ny,4);
+    float *hid = malloc(I*4);
+    for (size_t j = 0; j < ny; j++) x[j] = (rand()%200-100)/100.f;
+    for (int p = 0; p < pairs; p++) w[p] = p%11 ? (rand()%100)/400.f : 0.f;
+    for (int r = 0; r < total; r++) memcpy(packed+(size_t)r*D, x+(size_t)(order[r]/K)*D, D*4);
+    size_t rb = ref_rowbytes(fmt,D), drb = ref_rowbytes(fmt,I);
+    size_t ns = ref_scales(fmt,D,I), nds = ref_scales(fmt,I,D);
+    uint8_t *gw = malloc(rb*I), *uw = malloc(rb*I), *dw = malloc(drb*D);
+    float *gs = malloc(ns*4), *us = malloc(ns*4), *ds = malloc(nds*4);
+    for (int c = 0, off = 0; c < E; off += rows[c++]) {
+        for (size_t j = 0; j < rb*I; j++) { gw[j] = rand()&255; uw[j] = rand()&255; }
+        for (size_t j = 0; j < drb*D; j++) dw[j] = rand()&255;
+        for (size_t j = 0; j < ns; j++) { gs[j] = .01f+(rand()%100)/10000.f; us[j] = .01f+(rand()%100)/10000.f; }
+        for (size_t j = 0; j < nds; j++) ds[j] = .01f+(rand()%100)/10000.f;
+        if (!coli_vk_tensor_ensure(&tg[c],gw,gs,fmt,D,I,g_ref_gs) ||
+            !coli_vk_tensor_ensure(&tu[c],uw,us,fmt,D,I,g_ref_gs) ||
+            !coli_vk_tensor_ensure(&td[c],dw,ds,fmt,I,D,g_ref_gs)) { bad = 1; goto done; }
+        for (int r = 0; r < rows[c]; r++) {
+            const float *xr = packed+(size_t)(off+r)*D;
+            for (int o = 0; o < I; o++) {
+                float gt = (float)ref_dot(xr,gw+(size_t)o*rb,gs,o,fmt,D);
+                float ut = (float)ref_dot(xr,uw+(size_t)o*rb,us,o,fmt,D);
+                if (limit > 0) { if (gt > limit) gt = limit; if (ut > limit) ut = limit; if (ut < -limit) ut = -limit; }
+                hid[o] = (gt/(1.f+expf(-gt)))*ut;
+            }
+            for (int d = 0; d < D; d++) yc[(size_t)(off+r)*D+d] = (float)ref_dot(hid,dw+(size_t)d*drb,ds,d,fmt,I);
+        }
+    }
+    coli_vk_set_swiglu_limit(limit);
+    for (int c = 0, off = 0; c < E;) {
+        int n = E-c < 64 ? E-c : 64;
+        if (!coli_vk_expert_group(tg+c,tu+c,td+c,rows+c,n,yp+(size_t)off*D,packed+(size_t)off*D)) { bad = 1; goto done; }
+        for (int j = 0; j < n; j++) off += rows[c++];
+    }
+    for (int p = 0; p < pairs; p++) if (inv[p] >= 0)
+        for (int d = 0; d < D; d++) {
+            ref[(size_t)(p/K)*D+d] += w[p]*yc[(size_t)inv[p]*D+d];
+            old[(size_t)(p/K)*D+d] += w[p]*yp[(size_t)inv[p]*D+d];
+        }
+    if (!coli_vk_expert_prefill(tg,tu,td,rows,E,order,w,S,K,x,y) ||
+        !coli_vk_expert_prefill(tg,tu,td,rows,E,order,w,S,K,x,again)) { bad = 1; goto done; }
+    double l2, mx, lo, mo; size_t nf, no;
+    coop_err(y,ref,ny,&l2,&mx,&nf); coop_err(y,old,ny,&lo,&mo,&no);
+    int repeat = memcmp(y,again,ny*4) == 0;
+    /* coop_err intentionally normalizes by reference energy: separately check
+     * exact zeros for tokens with no residents, where that norm is undefined. */
+    for (int d = 0; d < D; d++) if (y[(size_t)(S-1)*D+d] != 0.f) bad = 1;
+    printf("PREFILL D=%d I=%d E=%d rows=%d S=%d clamp=%.1f coop=%d | CPU relL2 %.2e max %.2e | old relL2 %.2e max %.2e | repeat %s\n",
+           D,I,E,total,S,limit,G.coop,l2,mx,lo,mo,repeat ? "exact" : "DIFF");
+    bad |= nf || no || l2 > 3e-3 || mx > 2e-2 || lo > 2e-6 || mo > 2e-6 || !repeat;
+    /* Reject duplicate/out-of-range metadata and decode without submitting. */
+    int saved = order[0]; order[0] = pairs;
+    bad |= coli_vk_expert_prefill(tg,tu,td,rows,E,order,w,S,K,x,y);
+    if (total > 1) { order[0] = order[1]; bad |= coli_vk_expert_prefill(tg,tu,td,rows,E,order,w,S,K,x,y); }
+    order[0] = saved;
+    bad |= coli_vk_expert_prefill(tg,tu,td,rows,E,order,w,1,K,x,y);
+ done:
+    coli_vk_set_swiglu_limit(0);
+    for (int c = 0; c < E; c++) { coli_vk_tensor_free(tg[c]); coli_vk_tensor_free(tu[c]); coli_vk_tensor_free(td[c]); }
+    free(rows); free(tg); free(tu); free(td); free(order); free(inv); free(x); free(w); free(packed);
+    free(yp); free(yc); free(y); free(again); free(ref); free(old); free(hid);
+    free(gw); free(uw); free(dw); free(gs); free(us); free(ds);
+    return bad;
+}
+
+static int run_expert_prefill_tests(void) {
+    g_ref_gs = 64;
+    int bad = 0, co = G.coop, any = g_mr_any;
+    bad |= run_expert_prefill(256,128,65,17,0.f);
+    bad |= run_expert_prefill(256,128,256,9,0.5f);
+    bad |= run_expert_prefill(2048,512,8,33,0.f);
+    bad |= run_expert_prefill(256,128,1,1,0.f);  /* shrink after large buffers */
+    G.coop = 0; g_mr_any = 1;
+    bad |= run_expert_prefill(256,128,65,17,0.f); /* GEMV/MR without tiles */
+    G.coop = co; g_mr_any = any;
+    return bad;
+}
+
 /* Expert group with several routed rows per expert (prefill / MTP verify): rows[c]
  * cycles 1..maxrows, so one group mixes one-row and multi-row dispatches. */
 static int run_mr_expert_group(int fmt, int D, int I, int K, int maxrows, int iters) {
@@ -2840,6 +3042,11 @@ int main(int argc, char **argv) {
     printf("weights: %s\n", coli_vk_staged() ? "staged device-local" : "mapped host-visible");
     srand(1234);
     int bad = 0;
+    if (getenv("VK_PREFILL_TEST")) {
+        bad = run_expert_prefill_tests();
+        printf(bad ? "FAIL\n" : "PASS\n");
+        coli_vk_shutdown(); return bad;
+    }
     if (getenv("VK_MR_SWEEP")) {   /* tuning aid: multi-row vs one-row across shapes only */
         G.coop = 0;
         g_mr_any = 1;
@@ -3039,6 +3246,7 @@ int main(int argc, char **argv) {
         bad |= run_coop_expert_group(4, 2048, 512, 16, 40, 5, 0.5f);   /* clamp */
         bad |= run_coop_expert_group(2, 6144, 2048, 8, 40, 3, 0.f);
     } else printf("coopmat shaders not loaded (no VK_KHR_cooperative_matrix f16 config, COLI_VK_COOP=0 or missing .spv): skipped\n");
+    bad |= run_expert_prefill_tests();
     printf(bad ? "FAIL\n" : "PASS\n");
     coli_vk_shutdown();
     return bad;

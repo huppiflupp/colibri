@@ -16,8 +16,8 @@
  *     evicts a resident one (the Vulkan arena never reclaims a freed slice);
  *   - issue/take go through the tier's own ybuf and accumulate correctly, and
  *     a failed take skips those experts instead of crashing;
- *   - what Vulkan does not do yet is refused, not faked: the fp8 streaming
- *     mode and the resident trunk both land on the CPU path. */
+ *   - fp8 streaming and injected resident-trunk upload failures fall back
+ *     to the CPU path. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,24 +136,54 @@ int main(void) {
     check(G.is_cnt[0] == 0 && G.issue_open == 0, "a failed take must still close the group");
     fake_vk_take_ok = 1;
 
-    /* ---- 6. the resident trunk is CUDA-only: refused, not faked ---------- */
-    check(G_lmh.dev_ok == 1, "COLI_LMHEAD_GPU=0 should have reached the lm_head gate (the refusal below is the shim's)");
+    /* Prefill: interleaved residents, misses, an all-miss token and failure.
+     * First-seen expert order is 1,0, so their fake values are 1,2. */
+    {
+        int ids[6] = {1,2,0,1,2,2};
+        float weights[6] = {.5f,1.f,.25f,.75f,1.f,1.f};
+        float bx[3*D], by[3*D]; uint8_t done[6];
+        for (int j = 0; j < 3*D; j++) bx[j] = 1.f+j/D;
+        setenv("QT_PREFILL_GPU_REDUCE","0",1);
+        check(!qt_batch_gpu_reduce(), "GPU reduction can be disabled");
+        setenv("QT_PREFILL_GPU_REDUCE","1",1);
+        check(qt_batch_gpu_reduce(), "GPU reduction is available on one Vulkan device");
+        uint64_t hits = G.hits[0], misses = G.miss;
+        check(qt_issue_batch_reduce(0,ids,3,2,bx,weights,by,done), "reduced batch succeeds");
+        check(done[0] && !done[1] && done[2] && done[3] && !done[4] && !done[5], "done marks only resident pairs");
+        int correct = 1;
+        for (int d = 0; d < D; d++) if (by[d] != .5f || by[D+d] != 2.5f || by[2*D+d] != 0.f) correct = 0;
+        check(correct, "gather order, weights and missing tokens reach the backend correctly");
+        check(G.hits[0]-hits == 3 && G.miss-misses == 3, "batch statistics count pairs");
+        check(!G.issue_open, "reduced batch releases the uploader guard");
+        fake_vk_take_ok = 0;
+        check(!qt_issue_batch_reduce(0,ids,3,2,bx,weights,by,done), "failed backend returns failure");
+        check(!done[0] && !done[2] && !done[3] && !G.issue_open, "failure clears claims and releases guard");
+        fake_vk_take_ok = 1;
+        for (int p = 0; p < 6; p++) ids[p] = 2;
+        int calls = fake_vk_prefill_calls;
+        check(qt_issue_batch_reduce(0,ids,3,2,bx,weights,by,done), "all-miss batch succeeds with zeros");
+        correct = 1;
+        for (int j = 0; j < 3*D; j++) if (by[j] != 0.f) correct = 0;
+        check(correct && calls == fake_vk_prefill_calls, "all-miss batch needs no GPU submit");
+        check(!qt_issue_batch_reduce(0,ids,1,2,bx,weights,by,done), "decode stays on its old path");
+    }
+
+    /* ---- 6. injected resident trunk upload failures fall back to CPU ---- */
+    check(G_lmh.dev_ok == 1, "COLI_LMHEAD_GPU=0 should have reached the lm_head gate (the fake rejects dense uploads below)");
     static int8_t lmq[16 * 8]; static float lms[8];
     int before = fake_vk_uploads;
-    check(qt_lmhead_init(lmq, lms, 16, 8) == 0, "qt_lmhead_init must return 0 on Vulkan");
-    check(G_lmh.on == 0, "the lm_head must stay on the CPU on Vulkan");
+    check(qt_lmhead_init(lmq, lms, 16, 8) == 0, "qt_lmhead_init must return 0 after upload failure");
+    check(G_lmh.on == 0, "a failed lm_head upload must stay on the CPU");
     float ly[8], lx[16] = { 0 };
-    check(qt_lmhead_matmul(ly, lx, 16, 8) == 0, "qt_lmhead_matmul must return 0 on Vulkan");
-    check(fake_vk_uploads == before, "the trunk refusal must not touch the backend");
+    check(qt_lmhead_matmul(ly, lx, 16, 8) == 0, "unplaced lm_head must return 0");
+    check(fake_vk_uploads == before, "failed trunk upload must not create a tensor");
 
-    /* Same mechanism, addressed by a handle instead of a name: the generic
-     * dense matrices must refuse here too, or a Vulkan build calls into
-     * backend_cuda. qt_dense_init returns a handle >= 0 on success. */
-    check(qt_dense_init(lmq, lms, 16, 8, 0) < 0, "qt_dense_init must refuse on Vulkan");
+    /* Dense handles must also propagate the injected upload failure. */
+    check(qt_dense_init(lmq, lms, 16, 8, 0) < 0, "qt_dense_init must report upload failure");
     check(qt_dense_count() == 0, "a refused dense handle must not be registered");
     float dy[8];
-    check(qt_dense_matmul(0, dy, lx, 16, 8) == 0, "qt_dense_matmul must return 0 on Vulkan");
-    check(fake_vk_uploads == before, "the dense refusal must not touch the backend either");
+    check(qt_dense_matmul(0, dy, lx, 16, 8) == 0, "unplaced dense matmul must return 0");
+    check(fake_vk_uploads == before, "failed dense upload must not create a tensor either");
 
     /* ---- 7. shutdown -------------------------------------------------- */
     /* every resident expert's three tensors go back through coli_vk_tensor_free

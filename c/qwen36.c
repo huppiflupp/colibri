@@ -2568,12 +2568,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
     }
     if (use_qtb) {
-        /* Same per-token order as the qt_issue/qt_take path: CPU misses, shared
-         * expert, then the GPU results in k order -- so each token's sum is
-         * formed exactly as it is token by token. A failed batch computes every
-         * pair on the CPU. */
-        /* [S*K*D] results: large for a long prompt, so a failed allocation computes
-         * every pair on the CPU instead of ending the run */
+        /* CPU misses, then shared expert, then resident contributions. With
+         * QT_PREFILL_GPU_REDUCE=1 the latter arrive as one sum per token; the
+         * changed association is not bit-equivalent to sequential CPU addition.
+         * The old path retains [S*K*D] results and k-ordered CPU accumulation.
+         * A failed batch computes every pair on the CPU. */
         /* One expert_get + offer per DISTINCT expert of the layer, carrying its
          * use count (heat and hit statistics as for per-token offers), instead
          * of one mutex round per routed (token, expert) pair. */
@@ -2591,10 +2590,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 for (int i = 0; i < S * K; i++) { Slot *sl; expert_get(m, layer, bidx[i], &sl); tier_offer_slot(layer, bidx[i], sl); }
             }
         }
-        float *res = malloc(sizeof(float) * (size_t)S * K * D);
+        int reduce = qt_batch_gpu_reduce();
+        float *res = malloc(sizeof(float) * (size_t)S * (reduce ? 1 : K) * D);
         uint8_t *done = calloc((size_t)S * K, 1);
         if (!done) { fprintf(stderr, "qwen36: out of memory in the prefill batch\n"); exit(1); }
-        if (!res || !qt_issue_batch(layer, bidx, S, K, x, res, done)) memset(done, 0, (size_t)S * K);
+        int batch_ok = res && (reduce ? qt_issue_batch_reduce(layer, bidx, S, K, x, bval, res, done)
+                                     : qt_issue_batch(layer, bidx, S, K, x, res, done));
+        if (!batch_ok) memset(done, 0, (size_t)S * K);
         /* Shared expert of all S tokens in three batched matmuls when it is GPU-
          * placed (a prefill block); the sum per token keeps its old place below. */
         int Ish = c->shared_inter;
@@ -2625,7 +2627,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 if (!done[s*K+kk]) qt_cpu_expert(m, layer, bidx[s*K+kk], bval[s*K+kk], xs, os, g, u, hh);
             if (shb) { const float *sr = shb + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += sgb[s] * sr[d]; }
             else qt_shared_token(c, l, xs, os, sh, shu, shd, S);
-            for (int kk = 0; kk < K; kk++) if (done[s*K+kk]) {
+            if (reduce && batch_ok) {
+                const float *row = res + (int64_t)s*D;
+                for (int d = 0; d < D; d++) os[d] += row[d];
+            }
+            for (int kk = 0; !reduce && kk < K; kk++) if (done[s*K+kk]) {
                 float w = bval[s*K+kk]; const float *row = res + ((int64_t)s*K + kk) * D;
                 for (int d = 0; d < D; d++) os[d] += w * row[d];
             }

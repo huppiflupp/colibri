@@ -48,6 +48,7 @@ static int test_setenv(const char *name, const char *value, int overwrite) {
 struct ColiVkTensor { int fmt, I, O, gs; const void *w; };
 
 static int fake_vk_available = 1;
+static int fake_vk_trunk_upload_ok;  /* inject dense upload failure by default */
 static int fake_vk_budget_known = 1;
 static double fake_vk_budget_gb = 2.0, fake_vk_used_gb = 0.0;
 static int (*fake_vk_issue_hook)(int count, const float *x) = NULL;
@@ -77,6 +78,7 @@ int coli_vk_mem_budget(double *used_gb, double *budget_gb) {
 int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales,
                           int fmt, int I, int O, int grp) {
     (void)scales;
+    if (fmt == 1 && !fake_vk_trunk_upload_ok) return 0;
     if (*tensor) return 1;                       /* ensure: a second call is a no-op */
     ColiVkTensor *t = (ColiVkTensor *)calloc(1, sizeof *t);
     if (!t) return 0;
@@ -87,6 +89,13 @@ int coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const floa
     fake_vk_last_bytes = (size_t)I * O / (fmt == 1 ? 1 : 2);
     fake_vk_live_tensors++; fake_vk_live_bytes += fake_vk_last_bytes;
     return 1;
+}
+int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
+                   const void *weights, const float *scales,
+                   int fmt, int S, int I, int O, int gs) {
+    (void)tensor; (void)y; (void)x; (void)weights; (void)scales;
+    (void)fmt; (void)S; (void)I; (void)O; (void)gs;
+    return 0;
 }
 void coli_vk_tensor_free(ColiVkTensor *t) {
     if (!t) return;
@@ -107,6 +116,26 @@ int coli_vk_expert_group_take(float *y) {
     if (!fake_vk_take_ok) return 0;
     for (int j = 0; j < fake_vk_last_issue_count; j++)
         for (int d = 0; d < fake_vk_take_D; d++) y[(size_t)j * fake_vk_take_D + d] = (float)(j + 1);
+    return 1;
+}
+
+/* Distinct per-expert output, scaled by token input: exposes pair permutation
+ * and weight mistakes in the tier without reproducing the real shaders. */
+static int fake_vk_prefill_calls;
+int coli_vk_expert_prefill(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                           ColiVkTensor *const *downs, const int *rows, int count,
+                           const int *order, const float *weights, int S, int K,
+                           const float *x, float *y) {
+    (void)ups; (void)downs;
+    fake_vk_prefill_calls++;
+    if (!fake_vk_take_ok) return 0;
+    int D = gates[0]->I;
+    memset(y, 0, (size_t)S*D*sizeof(float));
+    for (int c = 0, r = 0; c < count; c++)
+        for (int j = 0; j < rows[c]; j++, r++) {
+            int p = order[r], token = p/K;
+            for (int d = 0; d < D; d++) y[(size_t)token*D+d] += weights[p]*(c+1)*x[(size_t)token*D+d];
+        }
     return 1;
 }
 

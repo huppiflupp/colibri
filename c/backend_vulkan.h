@@ -77,6 +77,17 @@ int  coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const 
                                 const float *x);
 int  coli_vk_expert_group_take(float *y);
 
+/* Prefill on device 0, S>1: x[S,D] is uploaded once, order[sum(rows)] maps
+ * expert-packed rows to token pairs s*K+k. Missing pairs contribute zero.
+ * weights[S,K] is reduced in ascending k order into y[S,D], using one submit
+ * for up to 1024 experts. No float atomics. Returns 0 on failure; synchronous,
+ * exclusive with group issue/take. The resident sum starts at zero, so adding
+ * it to CPU/shared results as a block changes floating-point association. */
+int coli_vk_expert_prefill(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
+                           ColiVkTensor *const *downs, const int *rows, int count,
+                           const int *order, const float *weights, int S, int K,
+                           const float *x, float *y);
+
 /* Upload a resident tensor without computing (expert tier: gate/up/down uploaded once,
  * then driven by coli_vk_expert_group). Returns 0 on failure/unsupported fmt. */
 int  coli_vk_tensor_ensure(ColiVkTensor **tensor, const void *weights, const float *scales, int fmt, int I, int O, int grp);
