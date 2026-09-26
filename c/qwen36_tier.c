@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <limits.h>
 #ifdef __linux__
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -1325,8 +1326,13 @@ int qt_batch_ok(void){
     return 0;
 #endif
 }
-int qt_issue_batch(int layer,const int *eids,int S,int K,const float *x,float *res,uint8_t *done){
-    if(!qt_batch_ok()) return 0;
+int qt_batch_gpu_reduce(void){
+    const char *e=getenv("QT_PREFILL_GPU_REDUCE");
+    return qt_batch_ok() && e && *e=='1';  /* opt in until model quality is checked */
+}
+static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float *x,
+                               const float *weights,float *res,uint8_t *done){
+    if(!qt_batch_ok() || S<2 || K<1 || S>INT_MAX/K || layer<0 || layer>=G.nl) return 0;
     int E=G.ne, D=G.D;
     size_t pairs=(size_t)S*K;
     int *cnt=calloc((size_t)E,sizeof(int)), *first=malloc((size_t)E*sizeof(int));
@@ -1357,18 +1363,26 @@ int qt_issue_batch(int layer,const int *eids,int S,int K,const float *x,float *r
     QtTensor **pg=malloc((size_t)(nex?nex:1)*3*sizeof(QtTensor*));
     int ok=pg!=NULL;
     size_t total=0; for(int j=0;j<nex;j++) total+=(size_t)cnt[ex[j]];
-    float *xb=total?malloc(total*(size_t)D*sizeof(float)):NULL, *yb=total?malloc(total*(size_t)D*sizeof(float)):NULL;
-    if(total&&(!xb||!yb)) ok=0;
+    float *xb=total&&!weights?malloc(total*(size_t)D*sizeof(float)):NULL;
+    float *yb=total&&!weights?malloc(total*(size_t)D*sizeof(float)):NULL;
+    int *allrows=weights&&nex?malloc((size_t)nex*sizeof(int)):NULL;
+    if(total && (weights ? !allrows : (!xb||!yb))) ok=0;
     /* the group runs while the tier lock is released, as qt_issue does; issue_open
      * keeps the uploader from swapping a resident expert out underneath it */
-    if(ok) for(int j=0;j<nex;j++){ QSlot *q=qs(layer,ex[j]); pg[3*j]=q->tg; pg[3*j+1]=q->tu; pg[3*j+2]=q->td; }
+    if(ok) for(int j=0;j<nex;j++){ QSlot *q=qs(layer,ex[j]); pg[j]=q->tg; pg[nex+j]=q->tu; pg[2*nex+j]=q->td; if(allrows) allrows[j]=cnt[ex[j]]; }
     pthread_mutex_unlock(&G.mx);
 
-    for(int j0=0;ok&&j0<nex;j0+=QT_BATCH_GROUP){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    if(ok && weights){
+        if(nex) ok=coli_vk_expert_prefill(pg,pg+nex,pg+2*nex,allrows,nex,order,weights,S,K,x,res);
+        else memset(res,0,(size_t)S*D*sizeof(float));
+    }
+#endif
+    for(int j0=0;ok&&!weights&&j0<nex;j0+=QT_BATCH_GROUP){
         int c=nex-j0<QT_BATCH_GROUP?nex-j0:QT_BATCH_GROUP, rows[QT_BATCH_GROUP];
         size_t r0=(size_t)first[ex[j0]], nr=0;
         for(int j=0;j<c;j++){
-            tg[j]=pg[3*(j0+j)]; tu[j]=pg[3*(j0+j)+1]; td[j]=pg[3*(j0+j)+2]; rows[j]=cnt[ex[j0+j]];
+            tg[j]=pg[j0+j]; tu[j]=pg[nex+j0+j]; td[j]=pg[2*nex+j0+j]; rows[j]=cnt[ex[j0+j]];
             for(int r=0;r<rows[j];r++){
                 int pi=order[r0+nr+(size_t)r];
                 memcpy(xb+(r0+nr+(size_t)r)*D, x+(size_t)(pi/K)*D, (size_t)D*sizeof(float));
@@ -1379,16 +1393,25 @@ int qt_issue_batch(int layer,const int *eids,int S,int K,const float *x,float *r
     }
     if(ok) for(size_t r=0;r<total;r++){
         int pi=order[r];
-        memcpy(res+(size_t)pi*D, yb+r*D, (size_t)D*sizeof(float));
+        if(!weights) memcpy(res+(size_t)pi*D, yb+r*D, (size_t)D*sizeof(float));
         done[pi]=1;
     }
     pthread_mutex_lock(&G.mx);
     G.issue_open=0;
     pthread_cond_broadcast(&G.cv_take);
     pthread_mutex_unlock(&G.mx);
-    free(cnt); free(first); free(order); free(ex); free(fill); free(xb); free(yb); free(pg);
+    free(cnt); free(first); free(order); free(ex); free(fill); free(xb); free(yb); free(pg); free(allrows);
     if(!ok){ memset(done,0,pairs); fprintf(stderr,"[qtier] prefill batch failed at layer %d\n",layer); }
     return ok;
+}
+
+int qt_issue_batch(int layer,const int *eids,int S,int K,const float *x,float *res,uint8_t *done){
+    return qt_issue_batch_impl(layer,eids,S,K,x,NULL,res,done);
+}
+int qt_issue_batch_reduce(int layer,const int *eids,int S,int K,const float *x,
+                          const float *weights,float *res,uint8_t *done){
+    if(!weights) return 0;
+    return qt_issue_batch_impl(layer,eids,S,K,x,weights,res,done);
 }
 
 void qt_stats(void){

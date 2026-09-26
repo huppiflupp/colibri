@@ -1,0 +1,19 @@
+#version 450
+// One invocation owns (token, channel); missing pairs are skipped. No atomics.
+layout(local_size_x = 256) in;
+layout(push_constant) uniform Params { int S, D, K, rows; } p;
+layout(binding = 0) readonly buffer Experts { float y[]; };
+layout(binding = 1) readonly buffer Inverse { int row[]; };
+layout(binding = 2) readonly buffer Weights { float weight[]; };
+layout(binding = 3) writeonly buffer Output { float out_y[]; };
+void main() {
+    int d = int(gl_GlobalInvocationID.x), s = int(gl_GlobalInvocationID.y);
+    if (d >= p.D || s >= p.S) return;
+    // Prevent contraction/reassociation; resident contributions always follow k.
+    precise float sum = 0.0;
+    for (int k = 0; k < p.K; k++) {
+        int pair = s*p.K+k, r = row[pair];
+        if (r >= 0) sum += weight[pair] * y[r*p.D+d];
+    }
+    out_y[s*p.D+d] = sum;
+}
