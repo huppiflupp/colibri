@@ -52,7 +52,13 @@ shared float spatch[8u * 256u];        // per-subgroup 16x16 patch for partial t
 // array are what made the first version slow (RADV, cf. Kernel-Lab E020/E030).
 //   x:  A tile (token tile t, k tile kt), element (row r, col k)  -> r*16 + k
 //   W:  B tile (out tile q, k tile kt), B(k, n) = W[n][k], row-major -> k*16 + n
+#ifdef BCOL   // B tile stored column-major (W[n][k] contiguous in k), loaded ColumnMajor
+uint wix(uint n, uint k) { return ((n >> 4u) * 4u + (k >> 4u)) * 256u + (n & 15u) * 16u + (k & 15u); }
+#define BLAYOUT gl_CooperativeMatrixLayoutColumnMajor
+#else
 uint wix(uint n, uint k) { return ((n >> 4u) * 4u + (k >> 4u)) * 256u + (k & 15u) * 16u + (n & 15u); }
+#define BLAYOUT gl_CooperativeMatrixLayoutRowMajor
+#endif
 uint xix(uint r, uint k) { return ((r >> 4u) * 4u + (k >> 4u)) * 256u + (r & 15u) * 16u + (k & 15u); }
 
 // Lanes 2n and 2n+1 dequantise weight row o0+n: inputs k0 + 32*hf .. +31.
@@ -228,12 +234,12 @@ void main() {
                 if (qi >= nq) break;                       // subgroup-uniform
                 uint q = sgi + qi * nsg;
                 if (q >= 8u) break;
-                coopMatLoad(B, sg, (q * 4u + kt) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B, sg, (q * 4u + kt) * 256u, 16u, BLAYOUT);
 #ifndef EXP_NOMMA
                 [[unroll]] for (uint t = 0u; t < TT; t++) G[qi * TT + t] = coopMatMulAdd(A[t], B, G[qi * TT + t]);
 #endif
 #ifdef GATE_UP
-                coopMatLoad(B, su, (q * 4u + kt) * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B, su, (q * 4u + kt) * 256u, 16u, BLAYOUT);
                 [[unroll]] for (uint t = 0u; t < TT; t++) U[qi * TT + t] = coopMatMulAdd(A[t], B, U[qi * TT + t]);
 #endif
             }
