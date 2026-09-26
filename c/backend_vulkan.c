@@ -461,6 +461,9 @@ int coli_vk_init(const char *spv_path) {
                 build_pipeline_mr(G.dev, G.plyt, G.shader_mr, mr, &G.pipe_mr) &&
                 build_pipeline_mr(G.dev, G.plyt_gu, G.shader_gu_mr, mr, &G.pipe_gu_mr))
                 G.mr = mr;
+            /* COLI_VK_MR_ALL=1: multi-row for every S > 1, bypassing the size rule (tuning) */
+            const char *a = getenv("COLI_VK_MR_ALL");
+            if (a && *a == '1') g_mr_any = 1;
         }
     }
 
