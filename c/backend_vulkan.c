@@ -308,13 +308,17 @@ static int mr_use(int fmt, int S, int I, int O) {
     return S >= 8 && I <= 8192 && (size_t)I * (size_t)O >= ((size_t)4 << 20);
 }
 /* Tiled cooperative-matrix shader for this dispatch? int4 formats, both dims a
- * multiple of its 64-wide tiles, at least coop_min token rows. Takes precedence
- * over the multi-row shader. 32 token rows x 64 outputs per workgroup. */
+ * multiple of its 64-wide tiles, enough token rows. Takes precedence over the
+ * multi-row shader. One workgroup = 64 outputs x 16*coop_tt token rows, so a
+ * lone matmul launches only O/64 workgroups: measured on gfx1151 it loses to the
+ * GEMV below ~64 rows, while inside an expert group (many experts in flight in
+ * one submit) it wins from 8 rows on. `grouped` picks the threshold. */
 static int g_coop_any;
-static int coop_use(int fmt, int S, int I, int O, int gs) {
+static int coop_use(int fmt, int S, int I, int O, int gs, int grouped) {
     if (!G.coop || !(fmt == 2 || fmt == 4) || I % 64 || O % 64) return 0;
     if (fmt == 4 && (gs < 8 || gs % 8)) return 0;
-    return S >= (g_coop_any ? 1 : G.coop_min);
+    if (g_coop_any) return 1;
+    return S >= (grouped ? G.coop_min : (G.coop_min > 64 ? G.coop_min : 64));
 }
 
 /* "…/qmatmul.spv" -> "…/qmatmul<suffix>" (sibling of the main shader). */
@@ -524,10 +528,11 @@ int coli_vk_init(const char *spv_path) {
     }
 
     /* Optional tiled cooperative-matrix pipelines. COLI_VK_COOP=0 turns them off,
-     * COLI_VK_COOP_MIN=<rows> sets the fewest token rows that take them (default 16). */
+     * COLI_VK_COOP_MIN=<rows> sets the fewest token rows per expert that take them in an
+     * expert group (default 8; a lone matmul needs max(that, 64)). */
     {
         const char *e = getenv("COLI_VK_COOP"), *mn = getenv("COLI_VK_COOP_MIN"), *tt = getenv("COLI_VK_COOP_TT");
-        G.coop = 0; G.coop_min = mn ? atoi(mn) : 16;
+        G.coop = 0; G.coop_min = mn ? atoi(mn) : 8;
         if (G.coop_min < 2) G.coop_min = 2;
         /* 16-row token tiles per workgroup (1, 2 or 4; COLI_VK_COOP_TT) */
         G.coop_tt = tt ? atoi(tt) : 2;
@@ -763,7 +768,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-        int co = coop_use(fmt, S, I, O, t->gs), mr = !co && mr_use(fmt, S, I, O);
+        int co = coop_use(fmt, S, I, O, t->gs, 0), mr = !co && mr_use(fmt, S, I, O);
         vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, co ? G.pipe_co : mr ? G.pipe_mr : G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
         struct PC pc = {fmt, S, I, O, t->rowWords, t->gs};
@@ -830,7 +835,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-    int co = coop_use(fmt, S, D, I, tg->gs), mr = !co && mr_use(fmt, S, D, I);
+    int co = coop_use(fmt, S, D, I, tg->gs, 0), mr = !co && mr_use(fmt, S, D, I);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, co ? G.pipe_gu_co : mr ? G.pipe_gu_mr : G.pipe_gu);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.dset_gu, 0, NULL);
     struct PCGU pc = pcgu(fmt, S, D, I, tg->rowWords, tg->gs);   // PC.I = input D, PC.O = moe_inter I
@@ -928,7 +933,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
      * one-row shader; order within a phase is free (the dispatches are independent). */
     VkPipeline bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
-        int co = coop_use(fmt, rows[c], D, I, gates[c]->gs), mr = !co && mr_use(fmt, rows[c], D, I);
+        int co = coop_use(fmt, rows[c], D, I, gates[c]->gs, 1), mr = !co && mr_use(fmt, rows[c], D, I);
         VkPipeline want = co ? G.pipe_gu_co : mr ? G.pipe_gu_mr : G.pipe_gu;
         if (want != bound) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); bound = want; }
         struct PCGU pc = pcgu(fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs);
@@ -941,7 +946,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     /* phase 2: down projection hidden -> y */
     bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
-        int co = coop_use(dfmt, rows[c], I, D, downs[c]->gs), mr = !co && mr_use(dfmt, rows[c], I, D);
+        int co = coop_use(dfmt, rows[c], I, D, downs[c]->gs, 1), mr = !co && mr_use(dfmt, rows[c], I, D);
         VkPipeline want = co ? G.pipe_co : mr ? G.pipe_mr : G.pipe;
         if (want != bound) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); bound = want; }
         struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
@@ -2338,7 +2343,7 @@ static int run_coop_case(int fmt, int S, int I, int O, int iters) {
     for (size_t i = 0; i < rb * O; i++) w[i] = rand() & 0xff;
     for (size_t o = 0; o < nsc; o++) sc[o] = 0.01f + (rand() % 100) / 10000.0f;
     ColiVkTensor *t = NULL;
-    int cmin = G.coop_min; G.coop_min = 1;
+    int cmin = G.coop_min; G.coop_min = 1; g_coop_any = 1;
     if (!coli_vk_matmul(&t, yco, x, w, sc, fmt, S, I, O, g_ref_gs)) { printf("matmul failed\n"); return 1; }
     double t0 = now();
     for (int k = 0; k < iters; k++) coli_vk_matmul(&t, yco, x, w, sc, fmt, S, I, O, g_ref_gs);
@@ -2348,7 +2353,7 @@ static int run_coop_case(int fmt, int S, int I, int O, int iters) {
     t0 = now();
     for (int k = 0; k < iters; k++) coli_vk_matmul(&t, y1, x, w, sc, fmt, S, I, O, g_ref_gs);
     double ms_1 = (now() - t0) * 1000 / iters;
-    G.coop = co; G.coop_min = cmin; G.cmd_ready = 0;
+    G.coop = co; G.coop_min = cmin; g_coop_any = 0; G.cmd_ready = 0;
     cpu_ref(yc, x, w, sc, fmt, S, I, O);
     double rl2, rmax, rl2g, rmaxg; size_t nf, nfg;
     coop_err(yco, yc, ny, &rl2, &rmax, &nf);
