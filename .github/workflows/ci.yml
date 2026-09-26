@@ -119,8 +119,9 @@ jobs:
           cd c
           make colibri VK=1
           # The shaders are a separate failure mode from the C: glslc can reject a .comp
-          # while backend_vulkan.c compiles perfectly. Assert all four exist.
+          # while backend_vulkan.c compiles perfectly. Assert all six exist.
           ls -l shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
+                shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv \
                 shaders/attention_absorb.spv shaders/rmsnorm.spv
           ldd colibri | grep -q libvulkan || { echo "FAIL: built without linking libvulkan"; exit 1; }
       - name: Initialise the backend against Lavapipe
