@@ -1061,6 +1061,22 @@ void qt_note(int layer,int eid,
     pthread_mutex_unlock(&G.mx);
 }
 
+/* qt_note for n uses at once (prefill batch: one call per distinct expert of a
+ * layer instead of one per routed token): the same heat as n qt_note calls, one
+ * enqueue (a repeated enqueue of the same expert is a no-op). */
+void qt_note_n(int layer,int eid,
+               const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
+               const float *gs,const float *us,const float *ds,uint32_t n){
+    if(!G.on || !g4 || !n) return;
+    if(G_fp8_stream){ for(uint32_t i=0;i<n;i++) qt_note(layer,eid,g4,u4,d4,gs,us,ds); return; }
+    QSlot *s=qs(layer,eid);
+    pthread_mutex_lock(&G.mx);
+    if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
+    s->heat = s->heat > 0xFFFFFFFFu - n ? 0xFFFFFFFFu : s->heat + n;
+    enqueue_locked(layer,eid,-1,-1,0);
+    pthread_mutex_unlock(&G.mx);
+}
+
 /* blocking variant for the warmstart (waits for queue space). */
 void qt_note_block(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,

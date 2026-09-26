@@ -871,6 +871,8 @@ static double tm_now(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&t
 static int tm_on(void){ if(g_timers<0){ const char *e=getenv("COLI_TIMERS"); g_timers = (e && *e=='1'); } return g_timers; }
 double g_qt_iss=0, g_qt_cpu=0, g_qt_tak=0;   /* QTIER-Phasen (Decode) */
 double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec, norm+out */
+double g_dn_pf[4];                            /* the same split over prefill blocks (S > 1) */
+double g_at_pf[3];                            /* prefill attention: qkv proj+norm+rope, core, gate+o */
 double g_tm_step=0;                           /* step() total (decode) */
 static double g_xf_load=0, g_xf_run=0;        /* expert_ffn path: expert fetch (misses) vs compute, decode */
 static double g_tm_win_moe=0; static int g_tm_win_n=0;
@@ -910,6 +912,10 @@ static void tm_report(void){
                 g_qt_iss/g_tm_dec_tokens, g_qt_cpu/g_tm_dec_tokens, g_qt_tak/g_tm_dec_tokens);
     fprintf(stderr,"[timers] prefill: %ld tokens  dn=%.0f attn=%.0f moe=%.0f(sh=%.0f rt=%.0f) head=%.0f ms\n",
             g_tm_pre_tokens,g_tm_pre[0],g_tm_pre[1],g_tm_pre[2],g_tm_pre[3],g_tm_pre[4],g_tm_pre[5]);
+    fprintf(stderr,"[timers] prefill dn-sub: proj %.0f | conv %.0f | l2n+rec %.0f | norm+out %.0f ms\n",
+            g_dn_pf[0], g_dn_pf[1], g_dn_pf[2], g_dn_pf[3]);
+    fprintf(stderr,"[timers] prefill attn-sub: qkv+norm+rope %.0f | core %.0f | gate+o %.0f ms\n",
+            g_at_pf[0], g_at_pf[1], g_at_pf[2]);
 }
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
@@ -1086,6 +1092,13 @@ static int xf_mode(Model *m) {
  * #1391 test all call THIS function, so the gate can't drift between them.
  * Read-only: never frees, never rewrites -- ownership stays in warmstart
  * (#1341). */
+static void tier_offer_slot_n(int layer, int eid, const Slot *s, uint32_t n) {
+    if (s->g4)
+        qt_note_n(layer, eid, s->g4, s->u4, s->d4, s->gs, s->us, s->ds, n);
+    else if (!g_expert_is_int4 && s->g)
+        qt_note_n(layer, eid, (const uint8_t *)s->g, (const uint8_t *)s->u,
+                  (const uint8_t *)s->d, s->gs, s->us, s->ds, n);
+}
 static void tier_offer_slot(int layer, int eid, const Slot *s) {
     if (s->g4)
         qt_note(layer, eid, s->g4, s->u4, s->d4, s->gs, s->us, s->ds);
@@ -2100,6 +2113,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
      * regardless of the attn_output_gate config flag -- so split whenever the
      * q per-head dim exceeds the (k/v) head dim. */
     int gate_dim = (qdim > hd) ? (qdim - hd) : 0;
+    extern double g_at_pf[3];
+    double _a0 = tm_now();
     float *q = falloc((int64_t)S*q_out);
     float *k = falloc((int64_t)S*kv_out);
     float *vv= falloc((int64_t)S*kv_out);
@@ -2135,6 +2150,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         memcpy(m->K[layer] + ((int64_t)kvh*m->max_t + t)*kvd, k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
         memcpy(m->V[layer] + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
     }
+    if (tm_on() && S > 1) { double t = tm_now(); g_at_pf[0] += t - _a0; _a0 = t; }
     float scale = 1.f / sqrtf((float)hd);
     float *ctx = falloc((int64_t)S*H*hd);
     #pragma omp parallel for collapse(2) schedule(static)
@@ -2162,6 +2178,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
         }
     }
+    if (tm_on() && S > 1) { double t = tm_now(); g_at_pf[1] += t - _a0; _a0 = t; }
     /* apply attn_output_gate: attn_out *= sigmoid(gate) */
     float *ag = falloc((int64_t)S*H*hd);
     for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
@@ -2170,6 +2187,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
     }
     if (!qtd_batch(l->qth_o, out, ag, S, H*hd, D)) matmul_d(out, ag, &l->o, S, H*hd, D);
+    if (tm_on() && S > 1) g_at_pf[2] += tm_now() - _a0;
     free(q); free(k); free(vv); free(query); free(gate); free(ctx); free(ag);
 }
 
@@ -2432,7 +2450,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * (qt_issue_batch) instead of one submit per token. */
     int use_qtb = use_qt && S > 1 && qt_batch_ok();
     int *bidx = use_qtb ? malloc(sizeof(int) * (size_t)S * K) : NULL;
-    float *bval = use_qtb ? falloc((int64_t)S * K) : NULL;
+    float *bval = use_qtb ? malloc(sizeof(float) * (size_t)S * K) : NULL;
+    if (use_qtb && (!bidx || !bval)) { free(bidx); free(bval); bidx = NULL; bval = NULL; use_qtb = 0; }  /* token by token */
     for (int s = 0; s < S; s++) {
         float *pr = logits + (int64_t)s*E;
         if (m->momentum_logits && m->pilot_smooth > 0.f) {
@@ -2469,14 +2488,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             route_select(pr, keep, E, K, g_route_j, g_route_m, g_route_p, g_route_alpha,
                          route_level, &rc, idx, val, &m->route);
         } else {
+            /* same scan as before (first maximum wins, earlier picks excluded);
+             * a mask replaces the inner walk over the picks so far */
+            uint8_t taken[1024] = {0};
             for (int kk = 0; kk < K; kk++) {
                 int best = -1; float bv = -1e30f;
                 for (int e = 0; e < E; e++) {
-                    if (!keep[e]) continue;
-                    int taken = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){taken=1;break;}
-                    if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
+                    if (!keep[e] || (e < 1024 && taken[e])) continue;
+                    if (e >= 1024) { int t = 0; for (int j = 0; j < kk; j++) if (idx[j]==e){t=1;break;} if (t) continue; }
+                    if (pr[e] > bv) { bv = pr[e]; best = e; }
                 }
                 idx[kk] = best; val[kk] = bv;
+                if (best >= 0 && best < 1024) taken[best] = 1;
             }
             if (g_route_agree) {            /* plain routing: full agreement by construction */
                 m->route.agree_hit += (uint64_t)K; m->route.agree_tot += (uint64_t)K; m->route.kl_n++;
@@ -2498,6 +2521,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             /* CUDA expert tier: run the resident experts as async groups on
              * all devices, compute the misses on the CPU (overlapped), then
              * collect the GPU results. */
+            if (use_qtb) {   /* offered once per distinct expert after the loop */
+                for (int kk = 0; kk < K; kk++) { bidx[s*K+kk] = idx[kk]; bval[s*K+kk] = val[kk]; }
+                continue;
+            }
             for (int kk = 0; kk < K; kk++) {
                 Slot *e; expert_get(m, layer, idx[kk], &e);
                 /* Offer whichever format the container actually packed. The old
@@ -2506,10 +2533,6 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                  * the process (#1391). tier_offer_slot is the shared decision:
                  * same pointer choice tier_warmstart makes, one place. */
                 tier_offer_slot(layer, idx[kk], e);
-            }
-            if (use_qtb) {
-                for (int kk = 0; kk < K; kk++) { bidx[s*K+kk] = idx[kk]; bval[s*K+kk] = val[kk]; }
-                continue;
             }
             double _q0 = tm_now();
             uint32_t qmask = qt_issue(layer, idx, K, xs);
@@ -2549,9 +2572,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
          * expert, then the GPU results in k order -- so each token's sum is
          * formed exactly as it is token by token. A failed batch computes every
          * pair on the CPU. */
-        float *res = falloc((int64_t)S * K * D);
-        uint8_t *done = malloc((size_t)S * K);
-        if (!qt_issue_batch(layer, bidx, S, K, x, res, done)) memset(done, 0, (size_t)S * K);
+        /* [S*K*D] results: large for a long prompt, so a failed allocation computes
+         * every pair on the CPU instead of ending the run */
+        /* One expert_get + offer per DISTINCT expert of the layer, carrying its
+         * use count (heat and hit statistics as for per-token offers), instead
+         * of one mutex round per routed (token, expert) pair. */
+        {
+            uint32_t *uses = calloc((size_t)E, sizeof(uint32_t));
+            if (uses) {
+                for (int i = 0; i < S * K; i++) if (bidx[i] >= 0 && bidx[i] < E) uses[bidx[i]]++;
+                for (int e = 0; e < E; e++) if (uses[e]) {
+                    Slot *sl; expert_get(m, layer, e, &sl);
+                    if (uses[e] > 1) { pthread_mutex_lock(&g_pilot_mx); m->hits += uses[e] - 1; pthread_mutex_unlock(&g_pilot_mx); }
+                    tier_offer_slot_n(layer, e, sl, uses[e]);
+                }
+                free(uses);
+            } else {
+                for (int i = 0; i < S * K; i++) { Slot *sl; expert_get(m, layer, bidx[i], &sl); tier_offer_slot(layer, bidx[i], sl); }
+            }
+        }
+        float *res = malloc(sizeof(float) * (size_t)S * K * D);
+        uint8_t *done = calloc((size_t)S * K, 1);
+        if (!done) { fprintf(stderr, "qwen36: out of memory in the prefill batch\n"); exit(1); }
+        if (!res || !qt_issue_batch(layer, bidx, S, K, x, res, done)) memset(done, 0, (size_t)S * K);
         /* Shared expert of all S tokens in three batched matmuls when it is GPU-
          * placed (a prefill block); the sum per token keeps its old place below. */
         int Ish = c->shared_inter;
@@ -2617,9 +2660,158 @@ static int dnproj_batch_rows(int S, int H, int O) {
     return S < rows ? S : (int)rows;
 }
 
+/* Prefill (S > 1) form of deltanet(): the same arithmetic in phases over the
+ * whole block instead of one token at a time. Only the recurrence is truly
+ * sequential, and only per value head; everything around it (projections,
+ * the depthwise conv, the gated norm, out_proj) has no dependency between
+ * tokens. Token by token, a 1011-token prompt paid ~30 000 small OpenMP
+ * regions per layer stack. Per element the operations and their order are
+ * exactly those of the token loop (the conv walks its ring per channel, the
+ * recurrence per head, matmul_d/matmul are row-exact across S), so the
+ * result is bit-identical. QWEN_DN_TOKENWISE=1 keeps the token loop. */
+static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    Cfg *c = &m->c;
+    int vh = c->dn_vheads, vk = c->dn_kheads, kdim = c->dn_kdim, vdim = c->dn_vdim;
+    int convk = c->dn_convk, conv_dim = c->dn_conv_dim;
+    int rep = vh / vk, key_dim_tot = vk * kdim, value_dim = vh * vdim, H = c->hidden;
+    float scale = 1.f / sqrtf((float)kdim);
+    int proj_dim = conv_dim + value_dim;
+    extern double g_dn_pf[4];
+    double _d0 = tm_now();
+    /* 1. projections of every token */
+    float *qkv = falloc((int64_t)S * conv_dim), *z = falloc((int64_t)S * value_dim);
+    float *b = falloc((int64_t)S * vh), *a = falloc((int64_t)S * vh);
+    if (qt_dnproj_ready(layer)) {
+        int B = dnproj_batch_rows(S, H, proj_dim);
+        float *qkvz = falloc((int64_t)B * proj_dim);
+        for (int s0 = 0; s0 < S; s0 += B) {
+            int rows = S - s0 < B ? S - s0 : B;
+            if (qt_dnproj_matmul_batch(layer, qkvz, x + (int64_t)s0 * H, rows, H, proj_dim)) {
+                for (int r = 0; r < rows; r++) {
+                    memcpy(qkv + (int64_t)(s0 + r) * conv_dim, qkvz + (int64_t)r * proj_dim, (size_t)conv_dim * sizeof(float));
+                    memcpy(z + (int64_t)(s0 + r) * value_dim, qkvz + (int64_t)r * proj_dim + conv_dim, (size_t)value_dim * sizeof(float));
+                }
+            } else {
+                matmul_d(qkv + (int64_t)s0 * conv_dim, x + (int64_t)s0 * H, &l->dn_qkv, rows, H, conv_dim);
+                matmul_d(z + (int64_t)s0 * value_dim, x + (int64_t)s0 * H, &l->dn_z, rows, H, value_dim);
+            }
+        }
+        free(qkvz);
+    } else {
+        matmul_d(qkv, x, &l->dn_qkv, S, H, conv_dim);
+        matmul_d(z, x, &l->dn_z, S, H, value_dim);
+    }
+    matmul(b, x, l->dn_b, S, H, vh);
+    matmul(a, x, l->dn_a, S, H, vh);
+    if (tm_on()) { double t = tm_now(); g_dn_pf[0] += t - _d0; _d0 = t; }
+    /* 2. causal depthwise conv. Token s reads the inputs s-(convk-1) .. s; the
+     * ones before the block come from the carried ring, whose slot kk holds the
+     * input convk-1-kk tokens back -- so every token is independent and the rows
+     * run in parallel, channels contiguous. Same sum order as the token loop:
+     * ring slots oldest first, then the current input. */
+    float *conv = falloc((int64_t)S * conv_dim);
+    float *ring = m->DN_conv[layer];    /* [conv_dim*(convk-1)] */
+    #pragma omp parallel for schedule(static)
+    for (int s = 0; s < S; s++) {
+        const float *xs = qkv + (int64_t)s * conv_dim;
+        float *co = conv + (int64_t)s * conv_dim;
+        for (int cc = 0; cc < conv_dim; cc++) {
+            const float *w = l->dn_conv + (int64_t)cc * convk;
+            const float *rg = ring + (int64_t)cc * (convk - 1);
+            float acc = 0.f;
+            for (int kk = 0; kk < convk - 1; kk++) {
+                int src = s - (convk - 1) + kk;          /* token this slot holds */
+                float v = src >= 0 ? qkv[(int64_t)src * conv_dim + cc] : rg[src + convk - 1];
+                acc += w[kk] * v;
+            }
+            acc += w[convk - 1] * xs[cc];
+            co[cc] = acc / (1.f + expf(-acc));   /* silu */
+        }
+    }
+    /* carry the ring: the last convk-1 inputs (older ones from the old ring) */
+    #pragma omp parallel for schedule(static)
+    for (int cc = 0; cc < conv_dim; cc++) {
+        float *rg = ring + (int64_t)cc * (convk - 1);
+        float old[16];
+        for (int kk = 0; kk < convk - 1; kk++) old[kk] = rg[kk];
+        for (int kk = 0; kk < convk - 1; kk++) {
+            int src = S - (convk - 1) + kk;
+            rg[kk] = src >= 0 ? qkv[(int64_t)src * conv_dim + cc] : old[src + convk - 1];
+        }
+    }
+    if (tm_on()) { double t = tm_now(); g_dn_pf[1] += t - _d0; _d0 = t; }
+    /* 3. per value head over the block: l2norm of q/k (key head h/rep, as
+     * repeat_interleave), then the gated delta rule on the carried state */
+    float *outv = falloc((int64_t)S * value_dim);
+    float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
+    #pragma omp parallel for schedule(static)
+    for (int h = 0; h < vh; h++) {
+        float qh[512], kh[512], kvl[512], dl[512];   /* kdim, vdim <= 512 */
+        float *Sh = rec + (int64_t)h * kdim * vdim;
+        int vk_idx = h / rep;
+        for (int s = 0; s < S; s++) {
+            const float *cv = conv + (int64_t)s * conv_dim;
+            memcpy(qh, cv + (int64_t)vk_idx * kdim, kdim * sizeof(float));
+            memcpy(kh, cv + key_dim_tot + (int64_t)vk_idx * kdim, kdim * sizeof(float));
+            const float *vd = cv + 2 * key_dim_tot + (int64_t)h * vdim;
+            double sq = 1e-6; for (int d = 0; d < kdim; d++) sq += (double)qh[d] * qh[d];
+            double nq = sqrt(sq);
+            for (int d = 0; d < kdim; d++) qh[d] = (float)((double)qh[d] / nq * scale);
+            double sk = 1e-6; for (int d = 0; d < kdim; d++) sk += (double)kh[d] * kh[d];
+            double nk = sqrt(sk);
+            for (int d = 0; d < kdim; d++) kh[d] = (float)((double)kh[d] / nk);
+            float bt = 1.f / (1.f + expf(-b[(int64_t)s * vh + h]));
+            float gt = -expf(l->dn_alog[h]) * softplus_f(a[(int64_t)s * vh + h] + l->dn_dtbias[h]);
+            float egh = expf(gt);
+            for (int t = 0; t < kdim * vdim; t++) Sh[t] *= egh;
+            for (int vv = 0; vv < vdim; vv++) kvl[vv] = 0.f;
+            for (int kk = 0; kk < kdim; kk++) {
+                float kkd = kh[kk]; const float *Sr = Sh + (int64_t)kk * vdim;
+                for (int vv = 0; vv < vdim; vv++) kvl[vv] += kkd * Sr[vv];
+            }
+            for (int vv = 0; vv < vdim; vv++) dl[vv] = (vd[vv] - kvl[vv]) * bt;
+            for (int kk = 0; kk < kdim; kk++) {
+                float kkd = kh[kk]; float *Sr = Sh + (int64_t)kk * vdim;
+                for (int vv = 0; vv < vdim; vv++) Sr[vv] += kkd * dl[vv];
+            }
+            float *ov = outv + (int64_t)s * value_dim + (int64_t)h * vdim;
+            for (int vv = 0; vv < vdim; vv++) ov[vv] = 0.f;
+            for (int kk = 0; kk < kdim; kk++) {
+                float qkd = qh[kk]; const float *Sr = Sh + (int64_t)kk * vdim;
+                for (int vv = 0; vv < vdim; vv++) ov[vv] += qkd * Sr[vv];
+            }
+        }
+    }
+    if (tm_on()) { double t = tm_now(); g_dn_pf[2] += t - _d0; _d0 = t; }
+    /* 4. gated RMSNorm (silu(z) gate) of every row, then one out_proj */
+    float *outr = falloc((int64_t)S * value_dim);
+    #pragma omp parallel for schedule(static)
+    for (int sh = 0; sh < S * vh; sh++) {
+        int s = sh / vh, h = sh % vh;
+        const float *o = outv + (int64_t)s * value_dim + (int64_t)h * vdim;
+        const float *zr = z + (int64_t)s * value_dim + (int64_t)h * vdim;
+        const float *w = l->dn_norm;
+        double ms = 0; for (int d = 0; d < vdim; d++) ms += (double)o[d] * o[d];
+        float r = 1.f / sqrtf((float)(ms / vdim) + c->eps);
+        float *orr = outr + (int64_t)s * value_dim + (int64_t)h * vdim;
+        for (int d = 0; d < vdim; d++) {
+            float val = o[d] * r * w[d];
+            orr[d] = val * zr[d] / (1.f + expf(-zr[d]));
+        }
+    }
+    if (!qtd_batch(l->qth_dnout, out, outr, S, value_dim, H))
+        matmul_d(out, outr, &l->dn_out, S, value_dim, H);
+    if (tm_on()) { g_dn_pf[3] += tm_now() - _d0; }
+    free(qkv); free(z); free(b); free(a); free(conv); free(outv); free(outr);
+}
+
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     (void)pos_base;
     Cfg *c = &m->c;
+    if (S > 1 && c->dn_convk <= 17 && !getenv("DN_DBG") && !(getenv("QWEN_DN_TOKENWISE") && getenv("QWEN_DN_TOKENWISE")[0] == '1')) {
+        deltanet_phased(m, l, layer, x, S, out);
+        return;
+    }
     int vh = c->dn_vheads, vk = c->dn_kheads, kdim = c->dn_kdim, vdim = c->dn_vdim;
     int convk = c->dn_convk, conv_dim = c->dn_conv_dim;
     int rep = vh / vk;
@@ -2656,7 +2848,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
 
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s * H;
-        extern double g_dn_sub[4];
+        extern double g_dn_sub[4], g_dn_pf[4];
         double _d0 = tm_now();
         if (s % B == 0) {
             int rows = S - s < B ? S - s : B;
@@ -2670,7 +2862,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         }
         matmul(b,   xs, l->dn_b,   1, H, vh);
         matmul(a,   xs, l->dn_a,   1, H, vh);
-        if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[0]+=t-_d0; _d0=t; }
+        if (tm_on()){ double t=tm_now(); if (S==1) g_dn_sub[0]+=t-_d0; else g_dn_pf[0]+=t-_d0; _d0=t; }
         for (int h = 0; h < vh; h++) {
             beta[h] = 1.f / (1.f + expf(-b[h]));
             gg[h] = -expf(l->dn_alog[h]) * softplus_f(a[h] + l->dn_dtbias[h]);
@@ -2691,7 +2883,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
             for (int kk = 0; kk < convk - 2; kk++) rg[kk] = rg[kk + 1];
             rg[convk - 2] = qkv[cc];
         }
-        if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[1]+=t-_d0; _d0=t; }
+        if (tm_on()){ double t=tm_now(); if (S==1) g_dn_sub[1]+=t-_d0; else g_dn_pf[1]+=t-_d0; _d0=t; }
         /* split into query/key (key_dim_tot each) + value (value_dim) */
         const float *q_in = conv_out;
         const float *k_in = conv_out + key_dim_tot;
@@ -2748,7 +2940,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                 for (int vv = 0; vv < vdim; vv++) ov[vv] += qkd * Sr[vv];
             }
         }
-        if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[2]+=t-_d0; _d0=t; }
+        if (tm_on()){ double t=tm_now(); if (S==1) g_dn_sub[2]+=t-_d0; else g_dn_pf[2]+=t-_d0; _d0=t; }
         /* per-head Gated RMSNorm (plain weight, r=1/sqrt(mean+eps)) then silu(z) gate, then out_proj.
          * HF Qwen3_5MoeRMSNormGated: out = (o*r)*weight * silu(z) = (o*r)*weight * z/(1+e^-z).
          * NB: it is silu (z in numerator), NOT sigmoid. */
@@ -2767,7 +2959,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         if (dnout_batch) memcpy(outr_all + (int64_t)s * value_dim, outr, (size_t)value_dim * sizeof(float));
         else if (!qtd(l->qth_dnout, out + (int64_t)s * H, outr, value_dim, H))
             matmul_d(out + (int64_t)s * H, outr, &l->dn_out, 1, value_dim, H);
-        if (tm_on() && S==1){ g_dn_sub[3]+=tm_now()-_d0; }
+        if (tm_on()){ if (S==1) g_dn_sub[3]+=tm_now()-_d0; else g_dn_pf[3]+=tm_now()-_d0; }
         if (layer == 0 && s == 0 && getenv("DN_DBG")) {
             FILE *dbg = fopen(getenv("DN_DBG"), "wb");
             if (dbg) {
@@ -2990,7 +3182,7 @@ static void serve_echo(const char *id, int pos, int token, const float *lo, int 
 /* PPL_PREFILL=1 (measurement): score every position of ONE prefill block, so
  * teacher-forced NLL runs through the batched prefill path (S > 1) instead of
  * one token per step. */
-static int g_pa_on; static double g_pa_nll; static long g_pa_n;
+static int g_pa_on, g_pa_from; static double g_pa_nll; static long g_pa_n;
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
@@ -3027,7 +3219,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     m->kv_len = pos_base + S;
     if (g_pa_on && S > 1) {
         float *erow = falloc(D), *elog = falloc(c->vocab);
-        for (int p = 0; p + 1 < S; p++) {
+        /* position p predicts token p+1; score the targets tf_nll scores, [np, nfull) */
+        for (int p = g_pa_from > 0 ? g_pa_from - 1 : 0; p + 1 < S; p++) {
             rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
             if (!qt_lmhead_matmul(elog, erow, D, c->vocab))
                 matmul_d(elog, erow, &m->lm_head, 1, D, c->vocab);
@@ -3417,7 +3610,7 @@ static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out)
     ensure_kv(m);
     m->kv_len = 0;
     if (getenv("PPL_PREFILL") && atoi(getenv("PPL_PREFILL")) == 1) {
-        g_pa_on = 1; g_pa_nll = 0; g_pa_n = 0;
+        g_pa_on = 1; g_pa_from = np; g_pa_nll = 0; g_pa_n = 0;
         float *lg = step(m, full, nfull, 0); (void)lg;
         g_pa_on = 0;
         *nll_out = g_pa_n ? g_pa_nll / (double)g_pa_n : 0;

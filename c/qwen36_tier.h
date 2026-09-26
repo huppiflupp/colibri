@@ -134,6 +134,8 @@ int qt_take(uint32_t mask, const float *val, int K, float *out);
  * expert (see qwen36_tier.c). qt_batch_ok() says whether it is available;
  * qt_issue_batch() returns 0 with nothing computed when it is not. */
 int qt_batch_ok(void);
+void qt_note_n(int layer, int eid, const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
+               const float *gs, const float *us, const float *ds, uint32_t n);
 /* Fewest rows a trunk matmul takes to the GPU (fewer: the caller's CPU path). */
 int qt_trunk_min_s(void);
 int qt_issue_batch(int layer, const int *eids, int S, int K, const float *x, float *res, uint8_t *done);
@@ -180,6 +182,7 @@ static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uin
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
 static inline int qt_batch_ok(void){return 0;}
+static inline void qt_note_n(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h,uint32_t n){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)n;}
 static inline int qt_trunk_min_s(void){return 1;}
 static inline int qt_issue_batch(int a,const int*b,int c,int d,const float*e,float*f,uint8_t*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
