@@ -870,7 +870,7 @@ static long g_tm_dec_tokens = 0, g_tm_pre_tokens = 0;
 static double tm_now(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1e3 + ts.tv_nsec/1e6; }
 static int tm_on(void){ if(g_timers<0){ const char *e=getenv("COLI_TIMERS"); g_timers = (e && *e=='1'); } return g_timers; }
 double g_qt_iss=0, g_qt_cpu=0, g_qt_tak=0;   /* QTIER-Phasen (Decode) */
-double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec, norm+out */
+double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec+norm, out */
 double g_dn_pf[4];                            /* the same split over prefill blocks (S > 1) */
 double g_at_pf[3];                            /* prefill attention: qkv proj+norm+rope, core, gate+o */
 double g_moe_pf[4];                           /* prefill MoE batch: offer, gpu batch, shared, accumulate */
@@ -903,7 +903,7 @@ static void tm_report(void){
             g_tm_step/g_tm_dec_tokens,
             (g_tm_step-(g_tm_dec[0]+g_tm_dec[1]+g_tm_dec[2]+g_tm_dec[5]))/g_tm_dec_tokens);
     if(g_dn_sub[0]+g_dn_sub[1]+g_dn_sub[2]+g_dn_sub[3]>0)
-        fprintf(stderr,"[timers]   dn-sub: proj %.1f | conv %.1f | l2n+rec %.1f | norm+out %.1f ms/token\n",
+        fprintf(stderr,"[timers]   dn-sub: proj %.1f | conv %.1f | l2n+rec+norm %.1f | out %.1f ms/token\n",
             g_dn_sub[0]/g_tm_dec_tokens,g_dn_sub[1]/g_tm_dec_tokens,g_dn_sub[2]/g_tm_dec_tokens,g_dn_sub[3]/g_tm_dec_tokens);
     if(g_xf_load+g_xf_run>0)
         fprintf(stderr,"[timers]   expert kernel: fetch %.2f | compute %.2f ms/token\n",
@@ -913,7 +913,7 @@ static void tm_report(void){
                 g_qt_iss/g_tm_dec_tokens, g_qt_cpu/g_tm_dec_tokens, g_qt_tak/g_tm_dec_tokens);
     fprintf(stderr,"[timers] prefill: %ld tokens  dn=%.0f attn=%.0f moe=%.0f(sh=%.0f rt=%.0f) head=%.0f ms\n",
             g_tm_pre_tokens,g_tm_pre[0],g_tm_pre[1],g_tm_pre[2],g_tm_pre[3],g_tm_pre[4],g_tm_pre[5]);
-    fprintf(stderr,"[timers] prefill dn-sub: proj %.0f | conv %.0f | l2n+rec %.0f | norm+out %.0f ms\n",
+    fprintf(stderr,"[timers] prefill dn-sub: proj %.0f | conv %.0f | l2n+rec+norm %.0f | out %.0f ms\n",
             g_dn_pf[0], g_dn_pf[1], g_dn_pf[2], g_dn_pf[3]);
     fprintf(stderr,"[timers] prefill attn-sub: qkv+norm+rope %.0f | core %.0f | gate+o %.0f ms\n",
             g_at_pf[0], g_at_pf[1], g_at_pf[2]);
@@ -2163,8 +2163,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* split q into query (first hd) and gate (next gate_dim), both per head */
     float *query = falloc((int64_t)S*H*hd);
     float *gate  = falloc((int64_t)S*H*gate_dim);
-    /* parallel only for a block: an OpenMP region with if(false) still
-     * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+    /* parallel only for a block: a real branch instead of an if() clause, so
+     * decode (S = 1) never enters an OpenMP region here */
     if (S > 1) {
         #pragma omp parallel for schedule(static)
         for (int s = 0; s < S; s++) {
@@ -2183,8 +2183,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
         }
     }
-    /* parallel only for a block: an OpenMP region with if(false) still
-     * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+    /* parallel only for a block: a real branch instead of an if() clause, so
+     * decode (S = 1) never enters an OpenMP region here */
     if (S > 1) {
         #pragma omp parallel for schedule(static)
         for (int s = 0; s < S; s++) {
@@ -2213,8 +2213,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             }
         }
     }
-    /* parallel only for a block: an OpenMP region with if(false) still
-     * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+    /* parallel only for a block: a real branch instead of an if() clause, so
+     * decode (S = 1) never enters an OpenMP region here */
     if (S > 1) {
         #pragma omp parallel for schedule(static)
         for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
@@ -2265,8 +2265,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     if (tm_on() && S > 1) { double t = tm_now(); g_at_pf[1] += t - _a0; _a0 = t; }
     /* apply attn_output_gate: attn_out *= sigmoid(gate) */
     float *ag = falloc((int64_t)S*H*hd);
-    /* parallel only for a block: an OpenMP region with if(false) still
-     * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+    /* parallel only for a block: a real branch instead of an if() clause, so
+     * decode (S = 1) never enters an OpenMP region here */
     if (S > 1) {
         #pragma omp parallel for schedule(static)
         for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
@@ -2805,9 +2805,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
          * GPU took every pair and the shared expert came batched. */
         int any_miss = 0;
         for (int i = 0; i < S * K && !any_miss; i++) any_miss = !done[i];
-        /* A real branch, not an if() clause: an inactive OpenMP region still makes
-         * every region nested inside it (qt_shared_token's matmuls, the CPU-miss
-         * experts) single-threaded -- measured 1 s on a 32-token prompt. */
+        /* A real branch, not an if() clause: with `parallel for if(...)` here a
+         * 32-token prompt took 1.31 s instead of 0.24 s to the first token, because
+         * the regions nested inside (qt_shared_token's matmuls, the CPU-miss experts)
+         * ran far slower. The exact libgomp mechanism is not confirmed: an inactive
+         * region alone should not serialise inner teams (max-active-levels counts
+         * active levels only); lost worker reuse under the extra level is the
+         * likelier cause. */
         if (!any_miss && (shb || folded)) {
             #pragma omp parallel for schedule(static)
             for (int s = 0; s < S; s++) {
@@ -3218,23 +3222,25 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
                 float qkd = qd[kk]; const float *Sr = Sh + (int64_t)kk * vdim;
                 for (int vv = 0; vv < vdim; vv++) ov[vv] += qkd * Sr[vv];
             }
-        }
-        if (tm_on()){ double t=tm_now(); if (S==1) g_dn_sub[2]+=t-_d0; else g_dn_pf[2]+=t-_d0; _d0=t; }
-        /* per-head Gated RMSNorm (plain weight, r=1/sqrt(mean+eps)) then silu(z) gate, then out_proj.
-         * HF Qwen3_5MoeRMSNormGated: out = (o*r)*weight * silu(z) = (o*r)*weight * z/(1+e^-z).
-         * NB: it is silu (z in numerator), NOT sigmoid. */
-        #pragma omp parallel for schedule(static)
-        for (int h = 0; h < vh; h++) {
-            const float *o = outv + (int64_t)h * vdim;
-            const float *zr = z + (int64_t)h * vdim;
-            const float *w = l->dn_norm;
-            double ms = 0; for (int d = 0; d < vdim; d++) ms += (double)o[d] * o[d];
-            float r = 1.f / sqrtf((float)(ms / vdim) + c->eps);
-            for (int d = 0; d < vdim; d++) {
-                float val = o[d] * r * w[d];
-                outr[(int64_t)h * vdim + d] = val * zr[d] / (1.f + expf(-zr[d]));
+            /* per-head Gated RMSNorm (plain weight, r=1/sqrt(mean+eps)) then silu(z) gate, then out_proj.
+             * HF Qwen3_5MoeRMSNormGated: out = (o*r)*weight * silu(z) = (o*r)*weight * z/(1+e^-z).
+             * NB: it is silu (z in numerator), NOT sigmoid. */
+            /* (inside the recurrence loop: a head's norm needs only its own output,
+             * so no second OpenMP region per layer and token) */
+            {
+                const float *o = outv + (int64_t)h * vdim;
+                const float *zr = z + (int64_t)h * vdim;
+                const float *w = l->dn_norm;
+                double ms = 0; for (int d = 0; d < vdim; d++) ms += (double)o[d] * o[d];
+                float r = 1.f / sqrtf((float)(ms / vdim) + c->eps);
+                for (int d = 0; d < vdim; d++) {
+                    float val = o[d] * r * w[d];
+                    outr[(int64_t)h * vdim + d] = val * zr[d] / (1.f + expf(-zr[d]));
+                }
             }
         }
+        /* this timer (l2n+rec) now includes the gated norm */
+        if (tm_on()){ double t=tm_now(); if (S==1) g_dn_sub[2]+=t-_d0; else g_dn_pf[2]+=t-_d0; _d0=t; }
         if (dnout_batch) memcpy(outr_all + (int64_t)s * value_dim, outr, (size_t)value_dim * sizeof(float));
         else if (!qtd(l->qth_dnout, out + (int64_t)s * H, outr, value_dim, H))
             matmul_d(out + (int64_t)s * H, outr, &l->dn_out, 1, value_dim, H);
@@ -3395,8 +3401,8 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         Layer *l = &m->L[i];
         /* rows are independent: a prefill block normalises them in parallel,
          * each row exactly as before (decode, S=1, stays serial) */
-        /* parallel only for a block: an OpenMP region with if(false) still
-         * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+        /* parallel only for a block: a real branch instead of an if() clause, so
+         * decode (S = 1) never enters an OpenMP region here */
         if (S > 1) {
             #pragma omp parallel for schedule(static)
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
@@ -3412,8 +3418,8 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
             tm_add(S, 0, tm_now()-_t0);
         }
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
-        /* parallel only for a block: an OpenMP region with if(false) still
-         * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+        /* parallel only for a block: a real branch instead of an if() clause, so
+         * decode (S = 1) never enters an OpenMP region here */
         if (S > 1) {
             #pragma omp parallel for schedule(static)
             for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
@@ -3423,8 +3429,8 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* post-deltanet residual */
         if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
             pilot_prefetch(m, i + 1, x, S);
-        /* parallel only for a block: an OpenMP region with if(false) still
-         * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+        /* parallel only for a block: a real branch instead of an if() clause, so
+         * decode (S = 1) never enters an OpenMP region here */
         if (S > 1) {
             #pragma omp parallel for schedule(static)
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
@@ -3434,8 +3440,8 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         _t0 = tm_now();
         moe(m, l, i, nrm, S, tmp);
         tm_add(S, 2, tm_now()-_t0);
-        /* parallel only for a block: an OpenMP region with if(false) still
-         * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+        /* parallel only for a block: a real branch instead of an if() clause, so
+         * decode (S = 1) never enters an OpenMP region here */
         if (S > 1) {
             #pragma omp parallel for schedule(static)
             for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
@@ -4966,6 +4972,17 @@ static int qwen36_segment_session_run(void *session_impl,
         memcpy(request->output, request->input, request->input_bytes);
     pthread_mutex_lock(&engine->run_lock);
     Model *model = &engine->model;
+#ifdef _OPENMP
+    /* attention() indexes its score scratch by omp_get_thread_num(): the rows were
+     * sized with the opening thread's omp_get_max_threads(), grow them if this
+     * caller runs a larger team */
+    if (omp_get_max_threads() > model->attn_sc_thr) {
+        int thr = omp_get_max_threads();
+        float *sc = realloc(model->attn_sc, (size_t)thr * (size_t)model->kv_cap * sizeof(float));
+        if (!sc) { pthread_mutex_unlock(&engine->run_lock); return coli_segment_adapter_error(error, error_size, "Qwen3.6 attention scratch grow failed"); }
+        model->attn_sc = sc; model->attn_sc_thr = thr;
+    }
+#endif
     model->K = session->K; model->V = session->V;
     model->DN_rec = session->DN_rec; model->DN_conv = session->DN_conv;
     model->max_t = (int)session->context_tokens;

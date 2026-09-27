@@ -324,6 +324,18 @@ static inline size_t xf_moe_scratch_bytes(int S, int K, int H, int F) {
          + n * sizeof(int) * 4 + 4096;
 }
 
+/* out[s] = sum_k val[s][k] * ctb[s][k], in rank order */
+static inline void xf_rank_sum(float *out, const float *ctb, const int *idx, const float *val,
+                               const XfExpert *const *experts, int s, int K, int H) {
+    float *os = out + (size_t)s * H;
+    memset(os, 0, (size_t)H * sizeof(float));
+    for (int k = 0; k < K; k++) {
+        int i = s * K + k; if (idx[i] < 0 || !experts[i]) continue;
+        float w = val[i]; const float *c = ctb + (size_t)i * H;
+        for (int d = 0; d < H; d++) os[d] += w * c[d];
+    }
+}
+
 static inline void xf_moe_run(float *out, const float *x, int S, int K, int H, int F,
                               const int *idx, const float *val, const XfExpert *const *experts,
                               int mode, void *scratch) {
@@ -381,12 +393,18 @@ static inline void xf_moe_run(float *out, const float *x, int S, int K, int H, i
             xf_gate_up_rows(g + (size_t)i * F, u + (size_t)i * F, experts[i], &a, H, r0, r1, mode);
         }
     }
-    /* hidden rows (cheap, per pair) */
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < (int)n; i++) {
-        if (idx[i] < 0 || !experts[i]) continue;
-        xf_swiglu(h + (size_t)i * F, g + (size_t)i * F, u + (size_t)i * F, F);
-        if (mode) hsx[i] = xf_act_i8(h + (size_t)i * F, F, hq + (size_t)i * F, hsum + (size_t)i * (F / XF_BLOCK));
+    /* hidden rows (cheap, per pair); a single pair runs without an OpenMP
+     * region -- a real branch, not an if() clause */
+    if (n > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < (int)n; i++) {
+            if (idx[i] < 0 || !experts[i]) continue;
+            xf_swiglu(h + (size_t)i * F, g + (size_t)i * F, u + (size_t)i * F, F);
+            if (mode) hsx[i] = xf_act_i8(h + (size_t)i * F, F, hq + (size_t)i * F, hsum + (size_t)i * (F / XF_BLOCK));
+        }
+    } else if (n == 1 && idx[0] >= 0 && experts[0]) {
+        xf_swiglu(h, g, u, F);
+        if (mode) hsx[0] = xf_act_i8(h, F, hq, hsum);
     }
     /* phase 2: down for every (expert, chunk) */
     #pragma omp parallel for schedule(dynamic, 1)
@@ -399,16 +417,11 @@ static inline void xf_moe_run(float *out, const float *x, int S, int K, int H, i
         }
     }
     /* rank-order sum per token: out[s] = sum_k val[s][k] * ctb[s][k] */
-    #pragma omp parallel for schedule(static)
-    for (int s = 0; s < S; s++) {
-        float *os = out + (size_t)s * H;
-        memset(os, 0, (size_t)H * sizeof(float));
-        for (int k = 0; k < K; k++) {
-            int i = s * K + k; if (idx[i] < 0 || !experts[i]) continue;
-            float w = val[i]; const float *c = ctb + (size_t)i * H;
-            for (int d = 0; d < H; d++) os[d] += w * c[d];
-        }
-    }
+    /* (one token -- decode -- runs it without an OpenMP region) */
+    if (S > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++) xf_rank_sum(out, ctb, idx, val, experts, s, K, H);
+    } else if (S == 1) xf_rank_sum(out, ctb, idx, val, experts, 0, K, H);
 }
 
 #endif /* COLI_EXPERT_FFN_H */
