@@ -963,6 +963,13 @@ int qt_expert_post_done(void){
     return 0;
 #endif
 }
+void qt_arena_cpu_wrote(const void *p){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    if(coli_vk_available()) coli_vk_arena_cpu_wrote(p);
+#else
+    (void)p;
+#endif
+}
 int qt_dn_ba_ready(void){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     return coli_vk_available() && coli_vk_dn_ba_ready();

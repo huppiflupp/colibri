@@ -495,6 +495,13 @@ static void ts_report(void) {
  * write-combined staging type cost ~250 ns each. */
 #define ARENA_N 4
 static Scratch g_arena[ARENA_N];
+/* who wrote a slot last: 1 = the GPU (resid_norm), 0 = maybe the CPU. GPU reads of
+ * HOST_CACHED rows the CPU just wrote snoop the CPU caches: the DeltaNet projection
+ * (x re-read once per output block) ran 104 -> 209 ms on CPU-written rows */
+static int g_arena_gpu[ARENA_N];
+void coli_vk_arena_cpu_wrote(const void *p) { for (int i = 0; i < ARENA_N; i++) if (g_arena[i].ptr == p) g_arena_gpu[i] = 0; }
+static int arena_gpu_written(const void *p) { for (int i = 0; i < ARENA_N; i++) if (g_arena[i].ptr == p) return g_arena_gpu[i]; return 0; }
+static void arena_mark_gpu(VkBuffer b) { for (int i = 0; i < ARENA_N; i++) if (g_arena[i].buf == b) g_arena_gpu[i] = 1; }
 float *coli_vk_host_arena(int slot, size_t bytes) {
     if (!G.ready || slot < 0 || slot >= ARENA_N || !scratch_reserve_mt(&g_arena[slot], bytes, G.memtype_cached)) return NULL;
     return (float *)g_arena[slot].ptr;
@@ -1569,6 +1576,7 @@ static int rn_record(VkCommandBuffer cb, VkBuffer xb, VkBuffer ybuf, VkBuffer nb
     struct PCRN pc = {S, D, eps};
     vkCmdPushConstants(cb, G.plyt_rn, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cb, (uint32_t)S, 1, 1);
+    arena_mark_gpu(nb); arena_mark_gpu(xb);
     return 1;
 }
 /* Tail of the next expert prefill group (one-shot): x += group output; n = RMSNorm(x)
@@ -1623,9 +1631,9 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
         !scratch_reserve(&G.dr_o, nov) || !scratch_reserve(&G.db_nw, nnw) || !scratch_reserve(&G.db_or, nov) ||
         !scratch_reserve_mt(&G.db_y, nx, G.memtype_cached) ||
         (!ba && !scratch_reserve(&G.db_w, (size_t)2 * vh * H * f))) return 0;
-    /* the input stays a copy: bound from the (host-cached) arena, the projection
-     * re-reading x once per output block ran 121 -> 209 ms (30 layers, 1011 tokens) */
-    VkBuffer xa = getenv("COLI_VK_DN_ARENA_X") ? arena_buf(x, nx) : VK_NULL_HANDLE, ya = arena_buf(y, nx);
+    /* input bound from the arena only when the GPU wrote it (the block tails):
+     * rows the CPU wrote are copied (see g_arena_gpu) */
+    VkBuffer xa = arena_gpu_written(x) ? arena_buf(x, nx) : VK_NULL_HANDLE, ya = arena_buf(y, nx);
     if (!xa) memcpy(G.db_x.ptr, x, nx);
     if (ba) memcpy(G.db_ba.ptr, ba, nba);
     else { memcpy(G.db_w.ptr, wb, (size_t)vh * H * f); memcpy((char *)G.db_w.ptr + (size_t)vh * H * f, wa, (size_t)vh * H * f); } memcpy(G.db_par.ptr, par, npar);

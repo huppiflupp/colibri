@@ -3489,6 +3489,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         else if (S > 1) {
             #pragma omp parallel for schedule(static)
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+            if (arena) qt_arena_cpu_wrote(nrm);
         } else {
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         }
@@ -3514,6 +3515,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
                 for (int d = 0; d < D; d++) xs[d] += ts[d];
                 rmsnorm_row(nrm + (int64_t)s*D, xs, l->post_ln, D, c->eps);
             }
+            if (arena) qt_arena_cpu_wrote(nrm);
             goto mixer_done;
         }
         /* parallel only for a block: a real branch instead of an if() clause, so
@@ -3552,6 +3554,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
                 if (nw) rmsnorm_row(nrm + (int64_t)s*D, xs, nw, D, c->eps);
             }
             normed = nw != NULL;
+            if (arena) qt_arena_cpu_wrote(nrm);
             continue;
         }
         /* parallel only for a block: a real branch instead of an if() clause, so

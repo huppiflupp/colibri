@@ -68,6 +68,7 @@ float *coli_vk_host_arena(int slot, size_t bytes);
 void coli_vk_block_post(float *x, float *n, const float *w, float eps, ColiVkTensor *router, float *logits, int E);
 int coli_vk_block_post_done(void);
 int coli_vk_dn_ba_ready(void);
+void coli_vk_arena_cpu_wrote(const void *p);   /* the CPU (re)wrote this arena slot */
 void coli_vk_expert_post(float *x, float *n, const float *w, float eps);   /* one-shot group tail */
 int coli_vk_expert_post_done(void);   /* coli_vk_dn_block takes ba == NULL + wb/wa */
 int  coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn,
