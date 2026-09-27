@@ -1265,7 +1265,9 @@ static int stage_copy(ColiVkTensor *t, const void *weights, const float *scales,
 
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
                          int fmt, int I, int O, int gs) {
-    if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
+    /* cached: same shape; the format must match unless the caller brings no weights
+     * (the tier drives its resident trunk by handle -- int8 or the int4 upload) */
+    if (*out) return ((*out)->fmt == fmt || !weights) && (*out)->I == I && (*out)->O == O;
     if (fmt != 1 && fmt != 2 && fmt != 5 &&              /* fmt=4/7: word-aligned groups only */
         !((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));
@@ -1348,6 +1350,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                    int fmt, int S, int I, int O, int gs) {
     if (!G.ready || S < 1 || !upload_tensor(tensor, weights, scales, fmt, I, O, gs)) return 0;
     ColiVkTensor *t = *tensor;
+    fmt = t->fmt; gs = t->gs;   /* a cached tensor keeps the format it was uploaded with (int4 trunk) */
     /* VK_PROF=1: phase split of the dense per-call cost, printed every 8192 calls —
      * separates our code (memcpy/desc/record) from the driver (submit) and the GPU
      * (fence wait) to localize the tier-size-linear tax. */
@@ -2393,7 +2396,9 @@ static int arena_suballoc_d2(size_t bytes, VkBuffer *buf, void **ptr) {
 }
 static int upload_tensor_d2(ColiVkTensor **out, const void *weights, const float *scales,
                             int fmt, int I, int O, int gs) {
-    if (*out) return (*out)->fmt == fmt && (*out)->I == I && (*out)->O == O;
+    /* cached: same shape; the format must match unless the caller brings no weights
+     * (the tier drives its resident trunk by handle -- int8 or the int4 upload) */
+    if (*out) return ((*out)->fmt == fmt || !weights) && (*out)->I == I && (*out)->O == O;
     if (fmt != 1 && fmt != 2 && fmt != 5 &&
         !(fmt == 4 && gs >= 8 && gs % 8 == 0)) return 0;
     ColiVkTensor *t = calloc(1, sizeof(*t));

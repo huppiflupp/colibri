@@ -1176,6 +1176,90 @@ static int dense_bits(void){ static int v=-1; if(v<0){ const char *e=getenv("COL
  * K1b planar layout (unsigned nibbles v+8, block b: lo nibbles = elements
  * b*64..b*64+31, hi = b*64+32..b*64+63). The quantizer is the symmetric
  * absmax/7 the expert containers use. */
+/* ---- imatrix (llama.cpp GGUF, e.g. unsloth's): mean squared activation per input
+ * channel of every trunk matrix, weighting the int4 scale search (COLI_IMATRIX=file).
+ * Only what this needs of GGUF v3: KV section skipped, f32 tensors "<name>.in_sum2"
+ * [I] and "<name>.counts" [1]; v = in_sum2 / counts. */
+typedef struct { char name[112]; int n; float *v; } ImxEnt;
+static ImxEnt *g_imx; static int g_imx_n = -1;
+static int gguf_skip_val(FILE *f, uint32_t t) {
+    static const int sz[13] = {1,1,2,2,4,4,4,1,0,0,8,8,8};
+    if (t == 8) { uint64_t n; if (fread(&n, 8, 1, f) != 1) return 0; return fseek(f, (long)n, SEEK_CUR) == 0; }
+    if (t == 9) { uint32_t et; uint64_t n; if (fread(&et, 4, 1, f) != 1 || fread(&n, 8, 1, f) != 1) return 0;
+                  for (uint64_t i = 0; i < n; i++) if (!gguf_skip_val(f, et)) return 0; return 1; }
+    if (t > 12) return 0;
+    return fseek(f, sz[t], SEEK_CUR) == 0;
+}
+static void imx_load(void) {
+    if (g_imx_n >= 0) return;
+    g_imx_n = 0;
+    const char *path = getenv("COLI_IMATRIX");
+    if (!path || !*path) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[imatrix] %s: cannot open\n", path); return; }
+    uint32_t magic, ver; uint64_t nt, nkv; uint32_t align = 32;
+    if (fread(&magic, 4, 1, f) != 1 || magic != 0x46554747u || fread(&ver, 4, 1, f) != 1 ||
+        fread(&nt, 8, 1, f) != 1 || fread(&nkv, 8, 1, f) != 1) { fclose(f); return; }
+    for (uint64_t i = 0; i < nkv; i++) {
+        uint64_t kl; char key[256]; uint32_t t;
+        if (fread(&kl, 8, 1, f) != 1 || kl >= sizeof key || fread(key, 1, kl, f) != kl) { fclose(f); return; }
+        key[kl] = 0;
+        if (fread(&t, 4, 1, f) != 1) { fclose(f); return; }
+        if (!strcmp(key, "general.alignment") && t == 4) { if (fread(&align, 4, 1, f) != 1) { fclose(f); return; } }
+        else if (!gguf_skip_val(f, t)) { fclose(f); return; }
+    }
+    typedef struct { char name[112]; uint64_t n, off; uint32_t type; } TI;
+    TI *ti = calloc(nt, sizeof(TI));
+    for (uint64_t i = 0; ti && i < nt; i++) {
+        uint64_t nl; uint32_t nd, ty; uint64_t d, n = 1, off;
+        if (fread(&nl, 8, 1, f) != 1 || nl >= sizeof ti[i].name || fread(ti[i].name, 1, nl, f) != nl) { free(ti); ti = NULL; break; }
+        ti[i].name[nl] = 0;
+        if (fread(&nd, 4, 1, f) != 1) { free(ti); ti = NULL; break; }
+        for (uint32_t k = 0; k < nd; k++) { if (fread(&d, 8, 1, f) != 1) { nd = 0; break; } n *= d; }
+        if (fread(&ty, 4, 1, f) != 1 || fread(&off, 8, 1, f) != 1) { free(ti); ti = NULL; break; }
+        ti[i].n = n; ti[i].off = off; ti[i].type = ty;
+    }
+    if (!ti) { fclose(f); return; }
+    long pos = ftell(f); uint64_t base = ((uint64_t)pos + align - 1) / align * align;
+    g_imx = calloc(nt, sizeof(ImxEnt));
+    for (uint64_t i = 0; g_imx && i < nt; i++) {
+        size_t L = strlen(ti[i].name);
+        if (L < 8 || strcmp(ti[i].name + L - 8, ".in_sum2") || ti[i].type != 0) continue;
+        char cn[128]; snprintf(cn, sizeof cn, "%.*s.counts", (int)(L - 8), ti[i].name);
+        float cnt = 1.f;
+        for (uint64_t j = 0; j < nt; j++) if (!strcmp(ti[j].name, cn) && ti[j].type == 0) {
+            fseek(f, (long)(base + ti[j].off), SEEK_SET); if (fread(&cnt, 4, 1, f) != 1) cnt = 1.f; break; }
+        float *v = malloc(ti[i].n * sizeof(float));
+        fseek(f, (long)(base + ti[i].off), SEEK_SET);
+        if (!v || fread(v, sizeof(float), ti[i].n, f) != ti[i].n) { free(v); continue; }
+        if (cnt < 1.f) cnt = 1.f;
+        for (uint64_t k = 0; k < ti[i].n; k++) v[k] /= cnt;
+        ImxEnt *e = &g_imx[g_imx_n++];
+        snprintf(e->name, sizeof e->name, "%.*s", (int)(L - 8), ti[i].name); e->n = (int)ti[i].n; e->v = v;
+    }
+    free(ti); fclose(f);
+    fprintf(stderr, "[imatrix] %s: %d activation vectors\n", path, g_imx_n);
+}
+/* HF trunk name -> the llama.cpp imatrix entry (NULL: none, e.g. lm_head) */
+static const float *imx_for(const char *hf, int I) {
+    imx_load();
+    int L; char rest[128];
+    if (g_imx_n <= 0 || sscanf(hf, "model.layers.%d.%127s", &L, rest) != 2) return NULL;
+    static const char *tab[][2] = {
+        {"linear_attn.in_proj_qkv.weight", "attn_qkv.weight"}, {"linear_attn.in_proj_z.weight", "attn_gate.weight"},
+        {"linear_attn.out_proj.weight", "ssm_out.weight"}, {"self_attn.q_proj.weight", "attn_q.weight"},
+        {"self_attn.k_proj.weight", "attn_k.weight"}, {"self_attn.v_proj.weight", "attn_v.weight"},
+        {"self_attn.o_proj.weight", "attn_output.weight"}, {"mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight"},
+        {"mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight"}, {"mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight"},
+        {"mlp.gate.weight", "ffn_gate_inp.weight"}};
+    for (unsigned t = 0; t < sizeof tab / sizeof tab[0]; t++) if (!strcmp(rest, tab[t][0])) {
+        char gn[128]; snprintf(gn, sizeof gn, "blk.%d.%s", L, tab[t][1]);
+        for (int i = 0; i < g_imx_n; i++) if (!strcmp(g_imx[i].name, gn) && g_imx[i].n == I) return g_imx[i].v;
+    }
+    return NULL;
+}
+static const float *g_qw_imx;   /* imatrix of the matrix qw_quantize is packing (or NULL) */
+static int q4_search(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_Q4_SEARCH"); v=!(e&&*e=='0'); } return v; }
 static int q4_signed_start(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_Q4_SIGNED"); v=e&&*e=='1'; } return v; }
 static void pack_int4_g64_planar(const float *w, uint8_t *q4, float *sg, int O, int I){
     int rb = I / 2, ng = I / 64;
@@ -1193,6 +1277,35 @@ static void pack_int4_g64_planar(const float *w, uint8_t *q4, float *sg, int O, 
              * the candidate with the smallest squared error wins. Three
              * rounds: measured on the 35B this recovers a third of the
              * perplexity absmax alone loses at 4 bits. */
+            if (q4_search()) {
+                /* llama.cpp make_qx_quants (nmax 8, weights imatrix * sqrt(sigma2 + x^2),
+                 * or 1 + that without an imatrix): 19 start scales around the signed
+                 * extreme mapped to -8, each followed by its weighted least-squares scale */
+                const float *im = g_qw_imx ? g_qw_imx + g * 64 : NULL;
+                double s2 = 0; for (int k = 0; k < 64; k++) s2 += (double)blk[k] * blk[k];
+                float sigma2 = (float)(2.0 * s2 / 64), wk[64], smax = 0.f;
+                for (int k = 0; k < 64; k++) {
+                    wk[k] = im ? im[k] * sqrtf(sigma2 + blk[k] * blk[k]) : sigma2 + blk[k] * blk[k];
+                    if (fabsf(blk[k]) > fabsf(smax)) smax = blk[k];
+                }
+                int bq[64]; float bsc = 0.f; double bbest = -1.0;
+                if (fabsf(smax) < 1e-12f) { for (int k = 0; k < 64; k++) bq[k] = 0; bsc = 1e-8f; }
+                else for (int is = -9; is <= 9; is++) {
+                    float iscale = -(8.f + 0.1f * (float)is) / smax;
+                    int q[64]; double sumlx = 0, suml2 = 0;
+                    for (int k = 0; k < 64; k++) {
+                        int v = (int)lrintf(iscale * blk[k]); if (v > 7) v = 7; if (v < -8) v = -8;
+                        q[k] = v; sumlx += (double)wk[k] * blk[k] * v; suml2 += (double)wk[k] * v * v;
+                    }
+                    if (suml2 > 0 && sumlx * sumlx > bbest * suml2) {
+                        bbest = sumlx * sumlx / suml2; bsc = (float)(sumlx / suml2); memcpy(bq, q, sizeof q);
+                    }
+                }
+                sr[g] = bsc;
+                uint8_t *dst = row + g * 32;
+                for (int k = 0; k < 32; k++) dst[k] = (uint8_t)((bq[k] + 8) | ((bq[k + 32] + 8) << 4));
+                continue;
+            }
             float best_s = amax / 7.f; if (best_s < 1e-8f) best_s = 1e-8f;
             /* COLI_DENSE_Q4_SIGNED=1: start from the SIGNED extreme mapped to -8, so the
              * one extra negative code is used (int4 is asymmetric: -8..7); the scale may
@@ -1293,6 +1406,23 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
             int8_t *xq = malloc((size_t)S * I);
             float *sx = malloc((size_t)S * sizeof(float));
             int32_t *xsg = w->q4 ? malloc((size_t)S * ng * sizeof(int32_t)) : NULL;
+            /* int4: activations to int8 per 64-group (one scale each) rather than per
+             * row -- with the row scale the decode's CPU int4 matrices cost token-wise
+             * PPL 7.64 -> 7.94 against the same weights on the GPU (f32 inputs).
+             * COLI_DENSE_ACT_G64=0: per row as before. */
+            static int act_g = -1;
+            if (act_g < 0) { const char *e = getenv("COLI_DENSE_ACT_G64"); act_g = !(e && *e == '0'); }
+            float *sxg = w->q4 && act_g && I % 64 == 0 ? malloc((size_t)S * ng * sizeof(float)) : NULL;
+            if (sxg && xq && xsg) {
+                for (int s = 0; s < S; s++)
+                    for (int g = 0; g < ng; g++)
+                        sxg[(int64_t)s * ng + g] = dense_act_i8(x + (int64_t)s * I + g * 64, 64,
+                                                                xq + (int64_t)s * I + g * 64, xsg + (int64_t)s * ng + g);
+                matmul_i4p_grouped_idot_gx(y, xq, sxg, xsg, w->q4, w->sg, S, I, O, 64);
+                free(xq); free(sx); free(xsg); free(sxg);
+                return;
+            }
+            free(sxg);
             if (xq && sx && (!w->q4 || xsg)) {
                 for (int s = 0; s < S; s++)
                     sx[s] = dense_act_i8(x + (int64_t)s * I, I, xq + (int64_t)s * I, xsg ? xsg + (int64_t)s * ng : NULL);
@@ -1326,8 +1456,39 @@ static size_t qdw_bytes(const QW *w){
     return w->q ? (size_t)w->I * w->O + (size_t)w->O * sizeof(float) : 0;
 }
 /* Upload w's dense-i8 copy to `dev`; handle+1, or 0 when it stays on the CPU. */
+/* int4 trunk on the GPU too (COLI_DENSE_BITS=4 made a q4 copy; COLI_DENSE_GPU4=0
+ * uploads the int8 rows as before). The CPU's planar group layout (byte k of a
+ * 64-group = codes k | k+32 << 4) becomes the GPU's sequential nibbles (value j
+ * at bit 4j of its word), both with value = code - 8; the f32 scales per 64 match. */
+static int dense_gpu4(const QW *w){
+    static int v = -1; if (v < 0) { const char *e = getenv("COLI_DENSE_GPU4"); v = !(e && *e == '0'); }
+    return v && w->q4 && w->sg && w->ng == w->I / 64 && w->I % 64 == 0;
+}
+static uint8_t *q4_to_gpu(const QW *w){
+    int I = w->I, O = w->O, ng = I / 64;
+    uint8_t *out = malloc((size_t)O * (I / 2));
+    if (!out) return NULL;
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *src = w->q4 + (size_t)o * (I / 2);
+        uint8_t *dst = out + (size_t)o * (I / 2);
+        for (int g = 0; g < ng; g++)
+            for (int p = 0; p < 64; p += 2) {
+                int a = p < 32 ? (src[g * 32 + p] & 15) : (src[g * 32 + p - 32] >> 4);
+                int b = p + 1 < 32 ? (src[g * 32 + p + 1] & 15) : (src[g * 32 + p + 1 - 32] >> 4);
+                dst[g * 32 + p / 2] = (uint8_t)(a | (b << 4));
+            }
+    }
+    return out;
+}
 static int qdw_place(const QW *w, int dev){
     if (dev == QT_PLACE_CPU || !w->q) return 0;
+    if (dense_gpu4(w)) {
+        uint8_t *g4 = q4_to_gpu(w);
+        int h4 = g4 ? qt_dense_init4(g4, w->sg, w->I, w->O, dev) : -1;
+        free(g4);
+        if (h4 >= 0) return h4 + 1;
+    }
     int h = qt_dense_init(w->q, w->sc, w->I, w->O, dev);
     return h >= 0 ? h + 1 : 0;
 }
@@ -1565,7 +1726,9 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
     out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
     out->q4 = NULL; out->sg = NULL; out->ng = 0;
     if (!quantize || !dense_i8_on()) return;
+    g_qw_imx = imx_for(name, I);
     qw_quantize(p, I, O, tag, out);
+    g_qw_imx = NULL;
     if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
 }
 
@@ -4776,8 +4939,15 @@ int main(int argc, char **argv) {
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
          * QW struct on m.lm_head holds the int8 rows + per-row scales the
          * CPU path uses; the GPU applies the identical semantics. */
-        if (m.lm_head.q)
-            qt_lmhead_init(m.lm_head.q, m.lm_head.sc, m.lm_head.I, m.lm_head.O);
+        if (m.lm_head.q) {
+            int ok4 = 0;
+            if (dense_gpu4(&m.lm_head)) {
+                uint8_t *g4 = q4_to_gpu(&m.lm_head);
+                ok4 = g4 && qt_lmhead_init4(g4, m.lm_head.sg, m.lm_head.I, m.lm_head.O);
+                free(g4);
+            }
+            if (!ok4) qt_lmhead_init(m.lm_head.q, m.lm_head.sc, m.lm_head.I, m.lm_head.O);
+        }
         /* R4 step 2: DeltaNet input projections, per layer, wherever
          * COLI_PLACE puts them. qkv and z are both [O_x, hidden] int8 with
          * per-row scales, so fusing them is a concatenation along O -- two
@@ -4791,6 +4961,20 @@ int main(int argc, char **argv) {
                 if (m.c.is_attn[i]) continue;
                 int dev = qt_place_of("dnproj", i);
                 if (dev == QT_PLACE_CPU) continue;
+                if (dense_gpu4(&m.L[i].dn_qkv) && dense_gpu4(&m.L[i].dn_z)) {
+                    /* int4: the two projections' nibble rows back to back (rows are independent) */
+                    uint8_t *g1 = q4_to_gpu(&m.L[i].dn_qkv), *g2 = q4_to_gpu(&m.L[i].dn_z);
+                    uint8_t *gf = malloc((size_t)Of * (Hd / 2)); float *sf4 = malloc((size_t)Of * (Hd / 64) * sizeof(float));
+                    int ok4 = g1 && g2 && gf && sf4;
+                    if (ok4) {
+                        memcpy(gf, g1, (size_t)O_qkv * (Hd / 2)); memcpy(gf + (size_t)O_qkv * (Hd / 2), g2, (size_t)O_z * (Hd / 2));
+                        memcpy(sf4, m.L[i].dn_qkv.sg, (size_t)O_qkv * (Hd / 64) * sizeof(float));
+                        memcpy(sf4 + (size_t)O_qkv * (Hd / 64), m.L[i].dn_z.sg, (size_t)O_z * (Hd / 64) * sizeof(float));
+                        ok4 = qt_dnproj_init4(i, gf, sf4, Hd, Of, dev);
+                    }
+                    free(g1); free(g2); free(gf); free(sf4);
+                    if (ok4) { placed++; vram += (double)Of * Hd / 2; continue; }
+                }
                 const int8_t *q1 = m.L[i].dn_qkv.q, *q2 = m.L[i].dn_z.q;
                 const float *s1 = m.L[i].dn_qkv.sc, *s2 = m.L[i].dn_z.sc;
                 if (!q1 || !q2) continue;      /* dense-i8 off: CPU path stands */

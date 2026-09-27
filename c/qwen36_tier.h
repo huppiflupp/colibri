@@ -38,6 +38,7 @@
  * per-layer latency chain — so a slower second card can host it without
  * pacing the expert stream. qt_init places no experts on that device. */
 int  qt_lmhead_init(const int8_t *q, const float *sc, int I, int O);
+int  qt_lmhead_init4(const uint8_t *q4, const float *sg, int I, int O);
 int  qt_lmhead_matmul(float *y, const float *x, int I, int O);
 
 /* ---- placement table (R4) ------------------------------------------------
@@ -90,6 +91,8 @@ int  qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, i
  * qt_place_of(name, layer) after it, then hand the quantized bytes here.
  * Returns the handle (>= 0) or -1 (stays on the CPU). */
 int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
+int  qt_dense_init4(const uint8_t *q4, const float *sg, int I, int O, int device);
+int  qt_dnproj_init4(int layer, const uint8_t *q4, const float *sg, int I, int O, int device);
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 /* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
 int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
@@ -188,6 +191,7 @@ void qt_stats(void);
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static inline int  qt_lmhead_init4(const uint8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 #define QT_PLACE_CPU (-1)
 static inline int  qt_place_of(const char*a,int b){(void)a;(void)b;return QT_PLACE_CPU;}
@@ -199,6 +203,8 @@ static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(vo
 static inline int  qt_dnproj_ready(int a){(void)a;return 0;}
 static inline int  qt_dnproj_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
+static inline int  qt_dense_init4(const uint8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
+static inline int  qt_dnproj_init4(int a,const uint8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_count(void){return 0;}

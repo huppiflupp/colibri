@@ -782,10 +782,12 @@ static void matmul_i4p_gidot_amx(float *y, const int8_t *xq, const float *sx,
  * brought to the grouped family — the prefill batch-union and the serve mux
  * deliver exactly these multi-row calls). Integer group dots in any lane
  * order are exact, and each row keeps its own ascending-g fmaf chain. */
+/* sxg != NULL: activations quantised per gs-group (scale sxg[s*ng+g]) instead of
+ * per row (sx[s]); the group term then carries its own activation scale. */
 static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                            const int32_t *xsg, const uint8_t *q4,
                            const float *scale, int S, int I, int O, int gs,
-                           int o0, int o1){
+                           int o0, int o1, const float *sxg){
     int rb=(I+1)/2, ng=(I+gs-1)/gs, bpg=gs/64;   /* blocchi-piano per gruppo */
     #pragma omp parallel for schedule(static)
     for(int o=o0;o<o1;o++){
@@ -865,10 +867,10 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                     }
                 }
 #endif
-                a0=fmaf((float)(d0-8*g0[g]),scl[g],a0);
-                a1=fmaf((float)(d1-8*g1[g]),scl[g],a1);
-                a2=fmaf((float)(d2-8*g2[g]),scl[g],a2);
-                a3=fmaf((float)(d3-8*g3[g]),scl[g],a3);
+                a0=fmaf((float)(d0-8*g0[g]),sxg?scl[g]*sxg[(int64_t)(s+0)*ng+g]:scl[g],a0);
+                a1=fmaf((float)(d1-8*g1[g]),sxg?scl[g]*sxg[(int64_t)(s+1)*ng+g]:scl[g],a1);
+                a2=fmaf((float)(d2-8*g2[g]),sxg?scl[g]*sxg[(int64_t)(s+2)*ng+g]:scl[g],a2);
+                a3=fmaf((float)(d3-8*g3[g]),sxg?scl[g]*sxg[(int64_t)(s+3)*ng+g]:scl[g],a3);
             }
             if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
                 int32_t d0=0,d1=0,d2=0,d3=0;
@@ -877,15 +879,15 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                     int32_t u=(int32_t)((i&1)?(byte>>4):(byte&0xF));
                     d0+=u*x0[i]; d1+=u*x1[i]; d2+=u*x2[i]; d3+=u*x3[i];
                 }
-                a0=fmaf((float)(d0-8*g0[g]),scl[g],a0);
-                a1=fmaf((float)(d1-8*g1[g]),scl[g],a1);
-                a2=fmaf((float)(d2-8*g2[g]),scl[g],a2);
-                a3=fmaf((float)(d3-8*g3[g]),scl[g],a3);
+                a0=fmaf((float)(d0-8*g0[g]),sxg?scl[g]*sxg[(int64_t)(s+0)*ng+g]:scl[g],a0);
+                a1=fmaf((float)(d1-8*g1[g]),sxg?scl[g]*sxg[(int64_t)(s+1)*ng+g]:scl[g],a1);
+                a2=fmaf((float)(d2-8*g2[g]),sxg?scl[g]*sxg[(int64_t)(s+2)*ng+g]:scl[g],a2);
+                a3=fmaf((float)(d3-8*g3[g]),sxg?scl[g]*sxg[(int64_t)(s+3)*ng+g]:scl[g],a3);
             }
-            y[(int64_t)s*O+o]    =a0*sx[s];
-            y[(int64_t)(s+1)*O+o]=a1*sx[s+1];
-            y[(int64_t)(s+2)*O+o]=a2*sx[s+2];
-            y[(int64_t)(s+3)*O+o]=a3*sx[s+3];
+            y[(int64_t)s*O+o]    =sxg?a0:a0*sx[s];
+            y[(int64_t)(s+1)*O+o]=sxg?a1:a1*sx[s+1];
+            y[(int64_t)(s+2)*O+o]=sxg?a2:a2*sx[s+2];
+            y[(int64_t)(s+3)*O+o]=sxg?a3:a3*sx[s+3];
         }
         for(; s<S; s++){
             const int8_t *xr=xq+(int64_t)s*I;
@@ -931,7 +933,7 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
 #endif
                 }
 #endif
-                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+                a=fmaf((float)(d-8*xg[g]),sxg?scl[g]*sxg[(int64_t)s*ng+g]:scl[g],a);
             }
             if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
                 int32_t d=0;
@@ -939,9 +941,9 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                     uint8_t byte=w[i>>1];
                     d+=(int32_t)((i&1)?(byte>>4):(byte&0xF))*xr[i];
                 }
-                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+                a=fmaf((float)(d-8*xg[g]),sxg?scl[g]*sxg[(int64_t)s*ng+g]:scl[g],a);
             }
-            y[(int64_t)s*O+o]=a*sx[s];
+            y[(int64_t)s*O+o]=sxg?a:a*sx[s];
         }
     }
 }
@@ -957,11 +959,17 @@ static void matmul_i4p_grouped_idot(float *y, const int8_t *xq, const float *sx,
     if(coli_amx_ok() && S>=coli_amx_s_min && gs%64==0 && gs<=256 && I%gs==0 && O>=16){
         int O16=O&~15;
         matmul_i4p_gidot_amx(y,xq,sx,q4,scale,S,I,O16,O,gs);
-        if(O16<O) i4p_gidot_rows(y,xq,sx,xsg,q4,scale,S,I,O,gs,O16,O);
+        if(O16<O) i4p_gidot_rows(y,xq,sx,xsg,q4,scale,S,I,O,gs,O16,O,NULL);
         return;
     }
 #endif
-    i4p_gidot_rows(y,xq,sx,xsg,q4,scale,S,I,O,gs,0,O);
+    i4p_gidot_rows(y,xq,sx,xsg,q4,scale,S,I,O,gs,0,O,NULL);
+}
+/* the same with activations quantised per gs-group (sxg: [S][ng] scales) */
+static void matmul_i4p_grouped_idot_gx(float *y, const int8_t *xq, const float *sxg,
+                                       const int32_t *xsg, const uint8_t *q4,
+                                       const float *scale, int S, int I, int O, int gs){
+    i4p_gidot_rows(y,xq,NULL,xsg,q4,scale,S,I,O,gs,0,O,sxg);
 }
 
 /* matmul IDOT planare (fmt=2): y = (dot_u - 8*xsum[s]) * scale[o] * sx[s].

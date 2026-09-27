@@ -41,6 +41,8 @@ static int  be_fp8_set_lut(const float *lut){ return coli_cuda_fp8_set_lut(lut);
 /* resident trunk pieces (lm_head, DeltaNet projections): one int8 per-row tensor each */
 static int  be_trunk_upload(QtTensor **t,const int8_t *q,const float *sc,int I,int O,int dev){
     return coli_cuda_tensor_upload(t,q,sc,1,I,O,dev); }
+static int  be_trunk_upload4(QtTensor **t,const uint8_t *q4,const float *sg,int I,int O,int dev){
+    (void)t;(void)q4;(void)sg;(void)I;(void)O;(void)dev; return 0; }
 static int  be_trunk_matmul(QtTensor **t,float *y,const float *x,int S,int I,int O,int dev){
     return coli_cuda_matmul(t,y,x,NULL,NULL,1,S,I,O,dev,0); }
 #elif defined(COLI_VULKAN)
@@ -83,6 +85,9 @@ static int  be_fp8_set_lut(const float *lut){ (void)lut; return 0; }
  * S >= the backend's tile threshold that is the cooperative-matrix path. */
 static int  be_trunk_upload(QtTensor **t,const int8_t *q,const float *sc,int I,int O,int dev){
     (void)dev; return coli_vk_tensor_ensure(t,(const uint8_t *)q,sc,1,I,O,0); }
+/* int4 trunk (COLI_DENSE_BITS=4): nibble rows, value = n - 8, one f32 scale per 64 */
+static int  be_trunk_upload4(QtTensor **t,const uint8_t *q4,const float *sg,int I,int O,int dev){
+    (void)dev; return coli_vk_tensor_ensure(t,q4,sg,4,I,O,64); }
 static int  be_trunk_matmul(QtTensor **t,float *y,const float *x,int S,int I,int O,int dev){
     (void)dev; return coli_vk_matmul(t,y,x,NULL,NULL,1,S,I,O,0); }
 #endif
@@ -871,6 +876,13 @@ fail_storage:
 int qt_ready(void){ return G.on; }
 const char *qt_backend_name(void){ return QT_BACKEND; }
 
+int qt_lmhead_init4(const uint8_t *q4, const float *sg, int I, int O){
+    if(!G_lmh.dev_ok||!G.on||!q4||!sg||I % 64) return 0;
+    if(!be_trunk_upload4(&G_lmh.t,q4,sg,I,O,G_lmh.dev)) return 0;
+    G_lmh.on=1;
+    fprintf(stderr,"[lmh] lm_head [%d x %d] int4 resident on dev %d (%.2f GB)\n", O,I,G_lmh.dev,(double)O*I/2/1073741824.0);
+    return 1;
+}
 int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){
     if(!G_lmh.dev_ok||!G.on||!q||!sc) return 0;
     int dev=G_lmh.dev;
@@ -884,6 +896,12 @@ int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){
     return 1;
 }
 
+int qt_dnproj_init4(int layer, const uint8_t *q4, const float *sg, int I, int O, int device){
+    if(layer < 0 || layer >= QT_DN_MAX_LAYERS || device == QT_PLACE_CPU || !q4 || !sg || I % 64) return 0;
+    if(!be_trunk_upload4(&G_dnp[layer].t, q4, sg, I, O, device)) return 0;
+    G_dnp[layer].dev = device; G_dnp[layer].on = 1;
+    return 1;
+}
 int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
                    int I, int O, int device){
     if(layer < 0 || layer >= QT_DN_MAX_LAYERS) return 0;
@@ -907,6 +925,16 @@ int qt_dnproj_init(int layer, const int8_t *q, const float *sc,
 #define QT_DENSE_MAX 1024
 static struct { QtTensor *t; int dev, on; size_t bytes; } G_dense[QT_DENSE_MAX];
 static int G_dense_n;
+/* int4 variant of qt_dense_init: q4 = GPU nibble rows (I/2 bytes), sg = [O][I/64] */
+int qt_dense_init4(const uint8_t *q4, const float *sg, int I, int O, int device){
+    if(device == QT_PLACE_CPU || !q4 || !sg || I <= 0 || O <= 0 || I % 64) return -1;
+    if(G_dense_n >= QT_DENSE_MAX) return -1;
+    int h = G_dense_n;
+    if(!be_trunk_upload4(&G_dense[h].t, q4, sg, I, O, device)) return -1;
+    G_dense[h].dev = device; G_dense[h].on = 1; G_dense[h].bytes = (size_t)I*O/2 + (size_t)O*(I/64)*sizeof(float);
+    G_dense_n++;
+    return h;
+}
 int qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device){
     if(device == QT_PLACE_CPU || !q || !sc || I <= 0 || O <= 0) return -1;
     if(G_dense_n >= QT_DENSE_MAX) return -1;
