@@ -213,7 +213,7 @@ struct PCDP { int S, conv_dim, vk, vh, kdim; float scale; };    /* dn_prep.comp 
 struct PCDG { int S, vh, vdim, pstride, zoff; float eps; };     /* dn_gnorm.comp */
 struct PCAB { int S, H, KV, hd, qdim, gate_dim, rotary, pos_base, nt, has_qn, has_kn, q_off, k_off, v_off; float eps, theta; };  /* attn_prep.comp */
 struct PCAG { int n, has_gate; };                               /* attn_gate.comp */
-struct PCGRP { int I, O; float limit; };                        /* qmatmul_grp.comp */
+struct PCGRP { int I, O; float limit; int kgat; };                        /* qmatmul_grp.comp */
 
 static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -433,22 +433,28 @@ static void ts_read(int slot, int label, double host_ms) {
 }
 /* stage stamps inside one block (queries 4..19): ts_stage(cb, i) after stage i,
  * ts_stage_read(block, n) attributes the gaps to the stages of that block */
-enum { TSB_DN, TSB_ATTN, TSB_N };
+enum { TSB_DN, TSB_ATTN, TSB_EG, TSB_N };
 static const char *tsb_name[TSB_N][8] = {{"dn:proj", "dn:conv", "dn:prep", "dn:recur", "dn:gnorm", "dn:outproj"},
-                                          {"at:qkv", "at:prep", "at:core", "at:gate", "at:oproj"}};
+                                          {"at:qkv", "at:prep", "at:core", "at:gate", "at:oproj"},
+                                          {"eg:gather", "eg:gate_up", "eg:down", "eg:reduce"}};
 static double g_tsb[TSB_N][8];
-static void ts_stage0(VkCommandBuffer cb) {
+/* queries 4..11 for the G.cmd blocks (dn, attn), 12..19 for the expert group
+ * (own command buffer, may be in flight at the same time) */
+static uint32_t tsb_base(int b) { return b == TSB_EG ? 12u : 4u; }
+static void ts_stage0b(VkCommandBuffer cb, int b) {
     if (!G.ts_on) return;
-    vkCmdResetQueryPool(cb, G.tsq, 4, 16);
-    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, G.tsq, 4);
+    vkCmdResetQueryPool(cb, G.tsq, tsb_base(b), 8);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, G.tsq, tsb_base(b));
 }
-static void ts_stage(VkCommandBuffer cb, int i) {
-    if (G.ts_on) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, G.tsq, 5u + i);
+static void ts_stageb(VkCommandBuffer cb, int b, int i) {
+    if (G.ts_on) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, G.tsq, tsb_base(b) + 1u + i);
 }
+#define ts_stage0(cb) ts_stage0b(cb, TSB_DN)
+#define ts_stage(cb, i) ts_stageb(cb, TSB_DN, i)
 static void ts_stage_read(int b, int n) {
     if (!G.ts_on) return;
     uint64_t v[16] = {0};
-    if (vkGetQueryPoolResults(G.dev, G.tsq, 4, n + 1, sizeof v, v, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+    if (vkGetQueryPoolResults(G.dev, G.tsq, tsb_base(b), n + 1, sizeof v, v, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
     for (int i = 0; i < n; i++) g_tsb[b][i] += (double)(v[i + 1] - v[i]) * G.ts_period * 1e-6;
 }
 static void ts_report(void) {
@@ -835,7 +841,7 @@ int coli_vk_init(const char *spv_path) {
                 G.shader_grp[v] = load_spv(G.dev, pp);
                 VkPipeline tmp = VK_NULL_HANDLE;
                 ok = G.shader_grp[v] &&
-                     build_pipeline(G.dev, 4, sizeof(struct PCGRP), G.shader_grp[v], &G.dsl_grp[v], &G.plyt_grp[v], &tmp, &G.dpool_grp[v], &G.dset_grp[v]) &&
+                     build_pipeline(G.dev, v ? 5 : 4, sizeof(struct PCGRP), G.shader_grp[v], &G.dsl_grp[v], &G.plyt_grp[v], &tmp, &G.dpool_grp[v], &G.dset_grp[v]) &&
                      build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_grp[v], G.grp_tt, &G.pipe_grp[v]);
                 if (tmp) vkDestroyPipeline(G.dev, tmp, NULL);
             }
@@ -1883,16 +1889,8 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VKCHECK(vkResetCommandBuffer(G.eg_cmd, 0), "eg resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.eg_cmd, &begin), "eg beginCmd");
-    ts_begin(G.eg_cmd, TS_SLOT_EG);
+    ts_begin(G.eg_cmd, TS_SLOT_EG); ts_stage0b(G.eg_cmd, TSB_EG);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
-    if (ep) {
-        struct PCEP pc = {ep->S, D, ep->K, total};
-        vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.ep_pipe[0]);
-        vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.ep_layout[0], 0, 1, &G.ep_set[0], 0, NULL);
-        vkCmdPushConstants(G.eg_cmd, G.ep_layout[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.eg_cmd, (D+255)/256, total, 1);
-        vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    }
     /* Grouped: every expert of the prefill batch in ONE dispatch per phase (expert
      * table with device addresses + item list), when all of them take the tiles. */
     int grp = ep && G.coop && G.pipe_grp[0] && G.pipe_grp[1] && I % 128 == 0 && D % 128 == 0 && D % 64 == 0 && I % 64 == 0;
@@ -1901,6 +1899,18 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         if (!(gf == 1 || gf == 2 || gf == 4) || !(df == 1 || df == 2 || df == 4) ||
             (gf == 4 && (gates[c]->gs < 8 || gates[c]->gs % 8)) || (df == 4 && (downs[c]->gs < 8 || downs[c]->gs % 8))) grp = 0;
     }
+    /* grouped gate_up reads the token rows through the order list itself
+     * (COLI_VK_GRP_GATHER=1: separate gather pass as before) */
+    int ggat = grp && !(getenv("COLI_VK_GRP_GATHER") && getenv("COLI_VK_GRP_GATHER")[0] == '1');
+    if (ep && !ggat) {
+        struct PCEP pc = {ep->S, D, ep->K, total};
+        vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.ep_pipe[0]);
+        vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.ep_layout[0], 0, 1, &G.ep_set[0], 0, NULL);
+        vkCmdPushConstants(G.eg_cmd, G.ep_layout[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.eg_cmd, (D+255)/256, total, 1);
+        vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    }
+    ts_stageb(G.eg_cmd, TSB_EG, 0);
     if (grp) {
         int tm = 16 * G.grp_tt, nit[2] = {0, 0};
         for (int c = 0; c < count; c++) { int nt = (rows[c] + tm - 1) / tm; nit[1] += nt * (I / 128); nit[0] += nt * (D / 128); }
@@ -1922,20 +1932,22 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         }
     }
     if (grp) {
-        VkBuffer xin[2] = {G.eg_h.buf, G.eg_x.buf}, yout[2] = {G.eg_y.buf, G.eg_h.buf};
+        VkBuffer xin[2] = {G.eg_h.buf, ggat ? G.ep_x.buf : G.eg_x.buf}, yout[2] = {G.eg_y.buf, G.eg_h.buf};
         int nit[2] = {0, 0}, tm = 16 * G.grp_tt;
         for (int c = 0; c < count; c++) { int nt = (rows[c] + tm - 1) / tm; nit[1] += nt * (I / 128); nit[0] += nt * (D / 128); }
         for (int step = 0; step < 2; step++) {
             int v = step == 0 ? 1 : 0;       /* gate_up first, then down */
-            VkDescriptorBufferInfo bi[4] = {{xin[v], 0, VK_WHOLE_SIZE}, {G.grp_it[v].buf, 0, VK_WHOLE_SIZE},
-                                            {G.grp_et[v].buf, 0, VK_WHOLE_SIZE}, {yout[v], 0, VK_WHOLE_SIZE}};
-            wr_desc(G.dset_grp[v], 4, bi);
+            VkDescriptorBufferInfo bi[5] = {{xin[v], 0, VK_WHOLE_SIZE}, {G.grp_it[v].buf, 0, VK_WHOLE_SIZE},
+                                            {G.grp_et[v].buf, 0, VK_WHOLE_SIZE}, {yout[v], 0, VK_WHOLE_SIZE},
+                                            {G.ep_order.buf, 0, VK_WHOLE_SIZE}};
+            wr_desc(G.dset_grp[v], v ? 5 : 4, bi);
             vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_grp[v]);
             vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_grp[v], 0, 1, &G.dset_grp[v], 0, NULL);
-            struct PCGRP pc = {v ? D : I, v ? I : D, g_swiglu_limit};
+            struct PCGRP pc = {v ? D : I, v ? I : D, g_swiglu_limit, v && ggat ? ep->K : 0};
             vkCmdPushConstants(G.eg_cmd, G.plyt_grp[v], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
             vkCmdDispatch(G.eg_cmd, (uint32_t)nit[v], 1, 1);
             if (step == 0) vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            ts_stageb(G.eg_cmd, TSB_EG, 1 + step);
         }
     } else {
     /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
@@ -1978,6 +1990,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         vkCmdPushConstants(G.eg_cmd, G.ep_layout[1], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.eg_cmd, (D+255)/256, ep->S, 1);
     }
+    ts_stageb(G.eg_cmd, TSB_EG, 3);
     host_read_barrier(G.eg_cmd);
     ts_end(G.eg_cmd, TS_SLOT_EG);
     VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
@@ -2022,6 +2035,7 @@ int coli_vk_expert_group_take(float *y) {
         G.ready = 0; return 0;
     }
     ts_read(TS_SLOT_EG, TS_EG, vk_now() - G.eg_th0);
+    if (G.eg_reduced) ts_stage_read(TSB_EG, 4);
     double t4 = G.eg_prof ? vk_now() : 0;
     memcpy(y, G.eg_reduced ? G.ep_y.ptr : G.eg_y.ptr, G.eg_pending_yb);
     if (G.eg_prof) {
