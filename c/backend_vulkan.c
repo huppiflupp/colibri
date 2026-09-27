@@ -130,6 +130,8 @@ static struct {
     /* grouped expert shaders (qmatmul_grp / qmatmul_gate_up_grp): [0] down, [1] gate_up */
     VkShaderModule shader_grp[2]; VkDescriptorSetLayout dsl_grp[2]; VkPipelineLayout plyt_grp[2];
     VkPipeline pipe_grp[2]; VkDescriptorPool dpool_grp[2]; VkDescriptorSet dset_grp[2]; int grp_tt;
+    VkPipeline pipe_grp_s[2];   /* TT = 2 twin for the last (<= 32-row) tile of an expert */
+    int grp_n[2], grp_ns[2], grp_mix[2];   /* full / small items per phase of the recorded group */
     Scratch grp_it[2], grp_et[2];
     /* COLI_VK_TS=1: GPU timestamps around every command buffer of the prefill
      * paths; per label the GPU time and the host wall time submit -> fence done */
@@ -213,7 +215,7 @@ struct PCDP { int S, conv_dim, vk, vh, kdim; float scale; };    /* dn_prep.comp 
 struct PCDG { int S, vh, vdim, pstride, zoff; float eps; };     /* dn_gnorm.comp */
 struct PCAB { int S, H, KV, hd, qdim, gate_dim, rotary, pos_base, nt, has_qn, has_kn, q_off, k_off, v_off; float eps, theta; };  /* attn_prep.comp */
 struct PCAG { int n, has_gate; };                               /* attn_gate.comp */
-struct PCGRP { int I, O; float limit; int kgat; };                        /* qmatmul_grp.comp */
+struct PCGRP { int I, O; float limit; int kgat; int ibase; };                        /* qmatmul_grp.comp */
 
 static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -843,9 +845,18 @@ int coli_vk_init(const char *spv_path) {
                 ok = G.shader_grp[v] &&
                      build_pipeline(G.dev, v ? 5 : 4, sizeof(struct PCGRP), G.shader_grp[v], &G.dsl_grp[v], &G.plyt_grp[v], &tmp, &G.dpool_grp[v], &G.dset_grp[v]) &&
                      build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_grp[v], G.grp_tt, &G.pipe_grp[v]);
+                /* mixed tiles: full 16*TT-row tiles while more than 32 rows remain,
+                 * the rest on a 32-row twin (COLI_VK_GRP_MIX=0: all full tiles) */
+                const char *mx = getenv("COLI_VK_GRP_MIX");
+                if (ok && G.grp_tt > 2 && !(mx && *mx == '0') &&
+                    !build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_grp[v], 2, &G.pipe_grp_s[v])) G.pipe_grp_s[v] = VK_NULL_HANDLE;
                 if (tmp) vkDestroyPipeline(G.dev, tmp, NULL);
             }
             if (!ok) G.pipe_grp[0] = G.pipe_grp[1] = VK_NULL_HANDLE;
+            if (!G.pipe_grp_s[0] || !G.pipe_grp_s[1]) {
+                for (int v = 0; v < 2; v++) if (G.pipe_grp_s[v]) vkDestroyPipeline(G.dev, G.pipe_grp_s[v], NULL);
+                G.pipe_grp_s[0] = G.pipe_grp_s[1] = VK_NULL_HANDLE;
+            }
         }
     }
 
@@ -1926,12 +1937,27 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     }
     ts_stageb(G.eg_cmd, TSB_EG, 0);
     if (grp) {
-        int tm = 16 * G.grp_tt, nit[2] = {0, 0};
-        for (int c = 0; c < count; c++) { int nt = (rows[c] + tm - 1) / tm; nit[1] += nt * (I / 128); nit[0] += nt * (D / 128); }
-        for (int v = 0; v < 2 && grp; v++)
-            grp = scratch_reserve(&G.grp_it[v], (size_t)nit[v] * 16) && scratch_reserve(&G.grp_et[v], (size_t)count * 64);
+        /* tiles per expert: full ones (16*TT rows) while more than 32 rows remain,
+         * the rest (<= 32 rows) on the TT = 2 twin when it exists -- an expert gets
+         * ~32 rows on average, a 64-row tile alone ran half empty */
+        /* measured (1011 tokens): down 124 -> 109 ms with the twin, gate_up 248 -> 298
+         * (its tile dequantises two matrices, a 32-row tile does not pay for that)
+         * -> COLI_VK_GRP_MIX: 1 = down only (default), 2 = both, 0 = off */
+        static int mixm = -1;
+        if (mixm < 0) { const char *e = getenv("COLI_VK_GRP_MIX"); mixm = e ? atoi(e) : 1; }
+        int tm = 16 * G.grp_tt, nbig[2], nsm[2];
+        for (int v = 0; v < 2; v++) {          /* v 0: down (out D), v 1: gate_up (out I) */
+            int mix = G.pipe_grp_s[v] != VK_NULL_HANDLE && (mixm == 2 || (mixm == 1 && v == 0)), nb = 0, ns = 0, O = v ? I : D;
+            for (int c = 0; c < count; c++) {
+                int r = rows[c];
+                while (r > (mix ? 32 : 0)) { nb++; r -= tm; }
+                if (r > 0) ns++;
+            }
+            nbig[v] = nb * (O / 128); nsm[v] = ns * (O / 128); G.grp_mix[v] = mix;
+            grp = grp && scratch_reserve(&G.grp_it[v], (size_t)(nbig[v] + nsm[v]) * 16) && scratch_reserve(&G.grp_et[v], (size_t)count * 64);
+        }
         for (int v = 0; v < 2 && grp; v++) {   /* v 1: gate_up (out I), v 0: down (out D) */
-            uint32_t *et = G.grp_et[v].ptr, *it = G.grp_it[v].ptr; int n = 0, O = v ? I : D;
+            uint32_t *et = G.grp_et[v].ptr, *it = G.grp_it[v].ptr; int n = 0, m = nbig[v], O = v ? I : D, mix = G.grp_mix[v];
             for (int c = 0; c < count; c++) {
                 ColiVkTensor *a = v ? gates[c] : downs[c], *b = v ? ups[c] : NULL;
                 uint64_t wa = vk_addr(a->wbuf), sa = vk_addr(a->sbuf), wb = b ? vk_addr(b->wbuf) : 0, sb = b ? vk_addr(b->sbuf) : 0;
@@ -1939,27 +1965,38 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
                 e[0] = (uint32_t)wa; e[1] = (uint32_t)(wa >> 32); e[2] = (uint32_t)sa; e[3] = (uint32_t)(sa >> 32);
                 e[4] = (uint32_t)wb; e[5] = (uint32_t)(wb >> 32); e[6] = (uint32_t)sb; e[7] = (uint32_t)(sb >> 32);
                 e[8] = (uint32_t)rows[c]; e[9] = (uint32_t)off[c]; e[10] = (uint32_t)a->fmt; e[11] = (uint32_t)a->rowWords; e[12] = (uint32_t)a->gs;
-                /* A-major: token tiles of one (expert, output block) adjacent */
-                for (int ob = 0; ob < O / 128; ob++)
-                    for (int t0 = 0; t0 < rows[c]; t0 += tm) { uint32_t *q = it + (size_t)n * 4; q[0] = c; q[1] = t0; q[2] = ob; q[3] = 0; n++; }
+                /* A-major: token tiles of one (expert, output block) adjacent; full
+                 * tiles in [0, nbig), the small last tiles after them */
+                for (int ob = 0; ob < O / 128; ob++) {
+                    int t0 = 0;
+                    for (; rows[c] - t0 > (mix ? 32 : 0); t0 += tm) { uint32_t *q = it + (size_t)n * 4; q[0] = c; q[1] = t0; q[2] = ob; q[3] = 0; n++; }
+                    if (rows[c] - t0 > 0) { uint32_t *q = it + (size_t)m * 4; q[0] = c; q[1] = t0; q[2] = ob; q[3] = 0; m++; }
+                }
             }
         }
+        G.grp_n[0] = nbig[0]; G.grp_n[1] = nbig[1]; G.grp_ns[0] = nsm[0]; G.grp_ns[1] = nsm[1];
     }
     if (grp) {
         VkBuffer xin[2] = {G.eg_h.buf, ggat ? G.ep_x.buf : G.eg_x.buf}, yout[2] = {G.eg_y.buf, G.eg_h.buf};
-        int nit[2] = {0, 0}, tm = 16 * G.grp_tt;
-        for (int c = 0; c < count; c++) { int nt = (rows[c] + tm - 1) / tm; nit[1] += nt * (I / 128); nit[0] += nt * (D / 128); }
         for (int step = 0; step < 2; step++) {
             int v = step == 0 ? 1 : 0;       /* gate_up first, then down */
             VkDescriptorBufferInfo bi[5] = {{xin[v], 0, VK_WHOLE_SIZE}, {G.grp_it[v].buf, 0, VK_WHOLE_SIZE},
                                             {G.grp_et[v].buf, 0, VK_WHOLE_SIZE}, {yout[v], 0, VK_WHOLE_SIZE},
                                             {G.ep_order.buf, 0, VK_WHOLE_SIZE}};
             wr_desc(G.dset_grp[v], v ? 5 : 4, bi);
-            vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_grp[v]);
+            struct PCGRP pc = {v ? D : I, v ? I : D, g_swiglu_limit, v && ggat ? ep->K : 0, 0};
             vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_grp[v], 0, 1, &G.dset_grp[v], 0, NULL);
-            struct PCGRP pc = {v ? D : I, v ? I : D, g_swiglu_limit, v && ggat ? ep->K : 0};
-            vkCmdPushConstants(G.eg_cmd, G.plyt_grp[v], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-            vkCmdDispatch(G.eg_cmd, (uint32_t)nit[v], 1, 1);
+            if (G.grp_n[v]) {
+                vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_grp[v]);
+                vkCmdPushConstants(G.eg_cmd, G.plyt_grp[v], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                vkCmdDispatch(G.eg_cmd, (uint32_t)G.grp_n[v], 1, 1);
+            }
+            if (G.grp_ns[v]) {               /* disjoint rows: no barrier in between */
+                pc.ibase = G.grp_n[v];
+                vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_grp_s[v]);
+                vkCmdPushConstants(G.eg_cmd, G.plyt_grp[v], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                vkCmdDispatch(G.eg_cmd, (uint32_t)G.grp_ns[v], 1, 1);
+            }
             if (step == 0) vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
             ts_stageb(G.eg_cmd, TSB_EG, 1 + step);
         }

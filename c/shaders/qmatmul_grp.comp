@@ -44,7 +44,7 @@ layout(std430, binding = 4) readonly buffer OR { int order[]; };
 #endif
 // expert entry: [0..1] gate/W address, [2..3] its scales, [4..7] up + scales (GATE_UP),
 //               [8] rows, [9] first packed row, [10] fmt, [11] rowWords, [12] gs
-layout(push_constant) uniform P { int I, O; float limit; int kgat; } p;
+layout(push_constant) uniform P { int I, O; float limit; int kgat; int ibase; } p;
 WRef wgr; SRef gsr;
 #ifdef GATE_UP
 WRef wur; SRef usr;
@@ -167,7 +167,7 @@ void store_raw(uint tid) {
 #define MAXQ 2u
 
 void main() {
-    uvec4 it = items[gl_WorkGroupID.x];
+    uvec4 it = items[uint(p.ibase) + gl_WorkGroupID.x];
     uint eb = it.x * 16u;
     wgr = WRef(packUint2x32(uvec2(etab[eb + 0u], etab[eb + 1u])));
     gsr = SRef(packUint2x32(uvec2(etab[eb + 2u], etab[eb + 3u])));
