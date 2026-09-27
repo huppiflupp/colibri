@@ -13,8 +13,10 @@
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : require
 layout(local_size_x = 64) in;
+#ifndef LPC
 #define LPC 16u                        // lanes per value column
-#define MAXR 16u                       // kdim / LPC <= 16 (kdim <= 256)
+#endif
+#define MAXR (256u / LPC)              // kdim / LPC (kdim <= 256)
 
 layout(std430, binding = 0) readonly buffer QN { float qn[]; };     // [S][vk][kdim]
 layout(std430, binding = 1) readonly buffer KN { float kn[]; };     // [S][vk][kdim]
@@ -31,7 +33,7 @@ void main() {
     // 64 invocations = 4 columns of 16 lanes; clusters of 16 consecutive
     // invocations stay inside one subgroup for wave32 and wave64 alike
     uint li = gl_LocalInvocationID.x % LPC;
-    uint col = gl_WorkGroupID.y * 4u + gl_LocalInvocationID.x / LPC;
+    uint col = gl_WorkGroupID.y * (64u / LPC) + gl_LocalInvocationID.x / LPC;
     uint kd = uint(p.kdim), vd = uint(p.vdim);
     uint R = kd / LPC;
     bool live = col < vd;
