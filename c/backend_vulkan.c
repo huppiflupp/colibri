@@ -123,6 +123,9 @@ static struct {
     VkDescriptorSet dset_dc, dset_dp, dset_dg, db_mm[2];
     Scratch db_x, db_qz, db_ba, db_par, db_cw, db_ring, db_conv, db_bg, db_nw, db_or, db_y;
     int sgsize;
+    /* COLI_VK_TS=1: GPU timestamps around every command buffer of the prefill
+     * paths; per label the GPU time and the host wall time submit -> fence done */
+    int ts_on; VkQueryPool tsq; double ts_period; double eg_th0;
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
     VkCommandPool cpool;
@@ -382,6 +385,39 @@ static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModul
         .descriptorPool = *dpool, .descriptorSetCount = 1, .pSetLayouts = dsl};
     VKCHECK(vkAllocateDescriptorSets(dev, &dsa, dset), "allocDescSet");
     return 1;
+}
+
+enum { TS_MATMUL, TS_GATEUP, TS_DNREC, TS_DNBLOCK, TS_ATTN, TS_EG, TS_N };
+static const char *ts_name[TS_N] = {"matmul", "gate_up", "dn_recur", "dn_block", "attn_prefill", "expert_group"};
+static struct { double gpu, host; long n; } g_ts[TS_N];
+enum { TS_SLOT_CMD = 0, TS_SLOT_EG = 1 };
+static void ts_begin(VkCommandBuffer cb, int slot) {
+    if (!G.ts_on) return;
+    vkCmdResetQueryPool(cb, G.tsq, 2u * slot, 2);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, G.tsq, 2u * slot);
+}
+static void ts_end(VkCommandBuffer cb, int slot) {
+    if (!G.ts_on) return;
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, G.tsq, 2u * slot + 1);
+}
+static double vk_now(void);
+static void ts_read(int slot, int label, double host_ms) {
+    if (!G.ts_on) return;
+    uint64_t v[2] = {0, 0};
+    if (vkGetQueryPoolResults(G.dev, G.tsq, 2u * slot, 2, sizeof v, v, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+    g_ts[label].gpu += (double)(v[1] - v[0]) * G.ts_period * 1e-6;
+    g_ts[label].host += host_ms; g_ts[label].n++;
+}
+static void ts_report(void) {
+    if (!G.ts_on) return;
+    double tg = 0, th = 0;
+    fprintf(stderr, "[VK_TS] %-13s %7s %10s %10s %8s\n", "label", "calls", "gpu ms", "host ms", "gpu/host");
+    for (int i = 0; i < TS_N; i++) if (g_ts[i].n) {
+        fprintf(stderr, "[VK_TS] %-13s %7ld %10.1f %10.1f %7.0f%%\n", ts_name[i], g_ts[i].n, g_ts[i].gpu, g_ts[i].host,
+                g_ts[i].host > 0 ? 100.0 * g_ts[i].gpu / g_ts[i].host : 0.0);
+        tg += g_ts[i].gpu; th += g_ts[i].host;
+    }
+    fprintf(stderr, "[VK_TS] %-13s %7s %10.1f %10.1f %7.0f%%\n", "total", "", tg, th, th > 0 ? 100.0 * tg / th : 0.0);
 }
 
 /* Make compute-shader writes visible to the host before the fence the CPU waits
@@ -835,6 +871,11 @@ int coli_vk_init(const char *spv_path) {
 
     G.ready = 1;
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
+    if (getenv("COLI_VK_TS") && getenv("COLI_VK_TS")[0] == '1' && p.limits.timestampComputeAndGraphics) {
+        VkQueryPoolCreateInfo qpi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 4};
+        if (vkCreateQueryPool(G.dev, &qpi, NULL, &G.tsq) == VK_SUCCESS) { G.ts_on = 1; G.ts_period = p.limits.timestampPeriod; }
+    }
     fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s%s, weights %s\n", p.deviceName, G.qfam, G.memtype,
             G.shader_gu ? ", fused gate+up" : "", G.shader_att ? ", absorb attention" : "",
             G.coop2 ? ", coopmat tiles (gen 2)" : G.coop ? ", coopmat tiles" : "", G.staged ? "staged" : "mapped");
@@ -1164,6 +1205,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+        ts_begin(G.cmd, TS_SLOT_CMD);
         int co = coop_use(fmt, S, I, O, t->gs, 0), mr = !co && mr_use(fmt, S, I, O);
         uint32_t cgx = 0, cgy = 0;
         VkPipeline cpl = co ? coop_pick(0, S, O, &cgx, &cgy) : VK_NULL_HANDLE;
@@ -1177,6 +1219,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         if (co) vkCmdDispatch(G.cmd, cgx, cgy, 1);
         else vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
         host_read_barrier(G.cmd);
+        ts_end(G.cmd, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
         G.cmd_ready = 1; G.bound_S = S; G.bound_I = I; G.bound_O = O;
     }
@@ -1185,6 +1228,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    double th0 = vk_now();
     VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { tA = vk_now(); p_sub += tA - t0; g_vsub_ms += tA - t0; t0 = tA; }
     // Bounded wait: a GPU hang/TDR must never wedge the process. 10s is orders of
@@ -1196,6 +1240,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         G.ready = 0;
         return 0;
     }
+    ts_read(TS_SLOT_CMD, TS_MATMUL, vk_now() - th0);
     if (G.eg_prof) { tA = vk_now(); p_wait += tA - t0; g_vwait_ms += tA - t0; t0 = tA; vkprof_tick(); }
     memcpy(y, G.y.ptr, yb);
     if (G.eg_prof) {
@@ -1234,6 +1279,7 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    ts_begin(G.cmd, TS_SLOT_CMD);
     int co = coop_use(fmt, S, D, I, tg->gs, 0), mr = !co && mr_use(fmt, S, D, I);
     uint32_t cgx = 0, cgy = 0;
     VkPipeline cpl = co ? coop_pick(1, S, I, &cgx, &cgy) : VK_NULL_HANDLE;
@@ -1244,14 +1290,17 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
     if (co) vkCmdDispatch(G.cmd, cgx, cgy, 1);
     else vkCmdDispatch(G.cmd, (uint32_t)((I + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
     host_read_barrier(G.cmd);
+    ts_end(G.cmd, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     double vp0 = G.eg_prof ? vk_now() : 0;
+    double th0 = vk_now();
     VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (G.eg_prof) { double vp1 = vk_now(); g_vsub_ms += vp1 - vp0; vp0 = vp1; }
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    ts_read(TS_SLOT_CMD, TS_GATEUP, vk_now() - th0);
     if (G.eg_prof) { g_vwait_ms += vk_now() - vp0; vkprof_tick(); }
     memcpy(hidden, G.h.ptr, hb);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
@@ -1297,17 +1346,21 @@ int coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    ts_begin(G.cmd, TS_SLOT_CMD);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dr);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dr, 0, 1, &G.dset_dr, 0, NULL);
     struct PCDR pc = {S, vh, vk, kdim, vdim, vstride, voff};
     vkCmdPushConstants(G.cmd, G.plyt_dr, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd, (uint32_t)vh, (uint32_t)((vdim + 3) / 4), 1);
     host_read_barrier(G.cmd);
+    ts_end(G.cmd, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    double th0 = vk_now();
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    ts_read(TS_SLOT_CMD, TS_DNREC, vk_now() - th0);
     double dp2 = vk_now();
     memcpy(outv, G.dr_o.ptr, ob); memcpy(state, G.dr_s.ptr, sb);
     if (getenv("VK_PROF")) fprintf(stderr, "[VK_PROF] dn_recur upload %.2f | gpu %.2f | readback %.2f ms\n", dp1 - dp0, dp2 - dp1, vk_now() - dp2);
@@ -1368,6 +1421,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     VKCHECK(vkResetCommandBuffer(cb, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(cb, &begin), "beginCmd");
+    ts_begin(cb, TS_SLOT_CMD);
     /* 1. qkv|z = x Wp^T */
     rec_mm(cb, G.db_mm[0], proj, G.db_x.buf, G.db_qz.buf, S);
     cc_barrier(cb);
@@ -1417,11 +1471,14 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     /* 6. out_proj */
     rec_mm(cb, G.db_mm[1], outp, G.db_or.buf, G.db_y.buf, S);
     host_read_barrier(cb);
+    ts_end(cb, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(cb), "endCmd");
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    double th0 = vk_now();
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    ts_read(TS_SLOT_CMD, TS_DNBLOCK, vk_now() - th0);
     memcpy(y, G.db_y.ptr, nx);
     memcpy(state, G.dr_s.ptr, nst);
     /* new ring: the last convk-1 unconvolved qkv inputs (older ones from the old ring) */
@@ -1462,17 +1519,21 @@ int coli_vk_attn_prefill(float *ctx, const float *q, const float *K, const float
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
+    ts_begin(G.cmd, TS_SLOT_CMD);
     vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_ap);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_ap, 0, 1, &G.dset_ap, 0, NULL);
     struct PCAP pc = {S, H, KV, hd, pos_base, nt, scale};
     vkCmdPushConstants(G.cmd, G.plyt_ap, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd, (uint32_t)S, (uint32_t)H, 1);
     host_read_barrier(G.cmd);
+    ts_end(G.cmd, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    double th0 = vk_now();
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    ts_read(TS_SLOT_CMD, TS_ATTN, vk_now() - th0);
     memcpy(ctx, G.ap_o.ptr, qb);
     G.cmd_ready = 0; G.bound_tensor = NULL;   /* the shared command buffer/binding was clobbered */
     return 1;
@@ -1599,6 +1660,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VKCHECK(vkResetCommandBuffer(G.eg_cmd, 0), "eg resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.eg_cmd, &begin), "eg beginCmd");
+    ts_begin(G.eg_cmd, TS_SLOT_EG);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     if (ep) {
         struct PCEP pc = {ep->S, D, ep->K, total};
@@ -1648,12 +1710,14 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         vkCmdDispatch(G.eg_cmd, (D+255)/256, ep->S, 1);
     }
     host_read_barrier(G.eg_cmd);
+    ts_end(G.eg_cmd, TS_SLOT_EG);
     VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
     if (G.eg_prof) G.eg_t3 = vk_now();
 
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.eg_cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.eg_fence), "eg resetFence");
     { double vp0 = G.eg_prof ? vk_now() : 0;
+      G.eg_th0 = vk_now();
       VKCHECK(vk_submit(G.queue, &si, G.eg_fence), "eg queueSubmit");
       if (G.eg_prof) g_vsub_ms += vk_now() - vp0; }
     G.eg_pending_yb = ep ? (size_t)ep->S*D*4 : yb; G.eg_reduced = ep != NULL; G.eg_inflight = 1;
@@ -1688,6 +1752,7 @@ int coli_vk_expert_group_take(float *y) {
         fprintf(stderr, "[VK] expert-group fence wait failed — disabling GPU offload\n");
         G.ready = 0; return 0;
     }
+    ts_read(TS_SLOT_EG, TS_EG, vk_now() - G.eg_th0);
     double t4 = G.eg_prof ? vk_now() : 0;
     memcpy(y, G.eg_reduced ? G.ep_y.ptr : G.eg_y.ptr, G.eg_pending_yb);
     if (G.eg_prof) {
@@ -2424,6 +2489,8 @@ int coli_vk_device_integrated(void) {
 }
 
 void coli_vk_shutdown(void) {
+    ts_report();
+    if (G.tsq) { vkDestroyQueryPool(G.dev, G.tsq, NULL); G.tsq = VK_NULL_HANDLE; G.ts_on = 0; }
     if (!G.ready) return;
     vkDeviceWaitIdle(G.dev);
     if (G.x.buf) { vkDestroyBuffer(G.dev, G.x.buf, NULL); vkFreeMemory(G.dev, G.x.mem, NULL); }
