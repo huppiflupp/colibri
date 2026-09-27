@@ -923,6 +923,20 @@ static void tm_report(void){
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
 /* y[S,O] = x[S,I] @ W^T,  W is [O,I] row-major */
+/* f32 matmul with a vectorised reduction (omp simd over the input dimension):
+ * NOT bit-identical to matmul() -- for paths that already are not (the GPU
+ * DeltaNet block). Parallel over (output, token). */
+static void matmul_vec(float *y, const float *x, const float *W, int S, int I, int O) {
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int o = 0; o < O; o++)
+        for (int s = 0; s < S; s++) {
+            const float *w = W + (int64_t)o * I, *xs = x + (int64_t)s * I;
+            float acc = 0.f;
+            #pragma omp simd reduction(+:acc)
+            for (int i = 0; i < I; i++) acc += xs[i] * w[i];
+            y[(int64_t)s * O + o] = acc;
+        }
+}
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
@@ -2797,8 +2811,10 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
         !(getenv("QWEN_DN_BLOCK") && getenv("QWEN_DN_BLOCK")[0] == '0')) {
         float *bb = falloc((int64_t)S * vh), *aa = falloc((int64_t)S * vh);
         float *ba = falloc((int64_t)S * 2 * vh), *par = falloc(2 * vh);
-        matmul(bb, x, l->dn_b, S, H, vh);
-        matmul(aa, x, l->dn_a, S, H, vh);
+        double _tb = tm_now();
+        matmul_vec(bb, x, l->dn_b, S, H, vh);
+        matmul_vec(aa, x, l->dn_a, S, H, vh);
+        if (tm_on()) g_dn_pf[1] += tm_now() - _tb;   /* dn block: small b/a projections on the CPU */
         for (int s = 0; s < S; s++) {
             memcpy(ba + (int64_t)s * 2 * vh, bb + (int64_t)s * vh, (size_t)vh * sizeof(float));
             memcpy(ba + (int64_t)s * 2 * vh + vh, aa + (int64_t)s * vh, (size_t)vh * sizeof(float));
