@@ -2155,32 +2155,71 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* split q into query (first hd) and gate (next gate_dim), both per head */
     float *query = falloc((int64_t)S*H*hd);
     float *gate  = falloc((int64_t)S*H*gate_dim);
-    #pragma omp parallel for schedule(static) if(S > 1)
-    for (int s = 0; s < S; s++) {
-        for (int hh = 0; hh < H; hh++) {
-            const float *qs = q + (int64_t)s*q_out + hh*qdim;
-            memcpy(query + ((int64_t)s*H + hh)*hd, qs, hd*sizeof(float));
-            if (gate_dim) memcpy(gate + ((int64_t)s*H + hh)*gate_dim, qs + hd, gate_dim*sizeof(float));
+    /* parallel only for a block: an OpenMP region with if(false) still
+     * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+    if (S > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++) {
+            for (int hh = 0; hh < H; hh++) {
+                const float *qs = q + (int64_t)s*q_out + hh*qdim;
+                memcpy(query + ((int64_t)s*H + hh)*hd, qs, hd*sizeof(float));
+                if (gate_dim) memcpy(gate + ((int64_t)s*H + hh)*gate_dim, qs + hd, gate_dim*sizeof(float));
+            }
+        }
+    } else {
+        for (int s = 0; s < S; s++) {
+            for (int hh = 0; hh < H; hh++) {
+                const float *qs = q + (int64_t)s*q_out + hh*qdim;
+                memcpy(query + ((int64_t)s*H + hh)*hd, qs, hd*sizeof(float));
+                if (gate_dim) memcpy(gate + ((int64_t)s*H + hh)*gate_dim, qs + hd, gate_dim*sizeof(float));
+            }
         }
     }
-    #pragma omp parallel for schedule(static) if(S > 1)
-    for (int s = 0; s < S; s++) {
-        for (int hh = 0; hh < H; hh++) {
-            float *qh = query + ((int64_t)s*H + hh)*hd;
-            if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
-            rope_head_partial(qh, pos_base + s, rotary, hd, c->theta);
+    /* parallel only for a block: an OpenMP region with if(false) still
+     * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+    if (S > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++) {
+            for (int hh = 0; hh < H; hh++) {
+                float *qh = query + ((int64_t)s*H + hh)*hd;
+                if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
+                rope_head_partial(qh, pos_base + s, rotary, hd, c->theta);
+            }
+            for (int kvh = 0; kvh < KV; kvh++) {
+                float *kh = k + (int64_t)s*KV*kvd + kvh*kvd;
+                if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps);
+                rope_head_partial(kh, pos_base + s, rotary, kvd, c->theta);
+            }
         }
-        for (int kvh = 0; kvh < KV; kvh++) {
-            float *kh = k + (int64_t)s*KV*kvd + kvh*kvd;
-            if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps);
-            rope_head_partial(kh, pos_base + s, rotary, kvd, c->theta);
+    } else {
+        for (int s = 0; s < S; s++) {
+            for (int hh = 0; hh < H; hh++) {
+                float *qh = query + ((int64_t)s*H + hh)*hd;
+                if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
+                rope_head_partial(qh, pos_base + s, rotary, hd, c->theta);
+            }
+            for (int kvh = 0; kvh < KV; kvh++) {
+                float *kh = k + (int64_t)s*KV*kvd + kvh*kvd;
+                if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps);
+                rope_head_partial(kh, pos_base + s, rotary, kvd, c->theta);
+            }
         }
     }
-    #pragma omp parallel for schedule(static) if(S > 1)
-    for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
-        int t = pos_base + s;
-        memcpy(m->K[layer] + ((int64_t)kvh*m->max_t + t)*kvd, k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
-        memcpy(m->V[layer] + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+    /* parallel only for a block: an OpenMP region with if(false) still
+     * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+    if (S > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
+            int t = pos_base + s;
+            memcpy(m->K[layer] + ((int64_t)kvh*m->max_t + t)*kvd, k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+            memcpy(m->V[layer] + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+        }
+    } else {
+        for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
+            int t = pos_base + s;
+            memcpy(m->K[layer] + ((int64_t)kvh*m->max_t + t)*kvd, k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+            memcpy(m->V[layer] + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
+        }
     }
     if (tm_on() && S > 1) { double t = tm_now(); g_at_pf[0] += t - _a0; _a0 = t; }
     float scale = 1.f / sqrtf((float)hd);
@@ -2218,11 +2257,21 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     if (tm_on() && S > 1) { double t = tm_now(); g_at_pf[1] += t - _a0; _a0 = t; }
     /* apply attn_output_gate: attn_out *= sigmoid(gate) */
     float *ag = falloc((int64_t)S*H*hd);
-    #pragma omp parallel for schedule(static) if(S > 1)
-    for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
-        int o = ((int64_t)s*H + hh)*hd + dd;
-        float g = gate_dim ? gate[o] : 0.f;
-        ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
+    /* parallel only for a block: an OpenMP region with if(false) still
+     * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+    if (S > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
+            int o = ((int64_t)s*H + hh)*hd + dd;
+            float g = gate_dim ? gate[o] : 0.f;
+            ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
+        }
+    } else {
+        for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
+            int o = ((int64_t)s*H + hh)*hd + dd;
+            float g = gate_dim ? gate[o] : 0.f;
+            ag[o] = ctx[o] * (1.f / (1.f + expf(-g)));
+        }
     }
     if (!qtd_batch(l->qth_o, out, ag, S, H*hd, D)) matmul_d(out, ag, &l->o, S, H*hd, D);
     if (tm_on() && S > 1) g_at_pf[2] += tm_now() - _a0;
@@ -2748,21 +2797,43 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
          * GPU took every pair and the shared expert came batched. */
         int any_miss = 0;
         for (int i = 0; i < S * K && !any_miss; i++) any_miss = !done[i];
-        #pragma omp parallel for schedule(static) if(!any_miss && (shb || folded))
-        for (int s = 0; s < S; s++) {
-            const float *xs = x + (int64_t)s*D; float *os = out + (int64_t)s*D;
-            for (int kk = 0; kk < K; kk++)
-                if (!done[s*K+kk]) qt_cpu_expert(m, layer, bidx[s*K+kk], bval[s*K+kk], xs, os, g, u, hh);
-            if (folded) { /* shared expert already inside res */ }
-            else if (shb) { const float *sr = shb + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += sgb[s] * sr[d]; }
-            else qt_shared_token(c, l, xs, os, sh, shu, shd, S);
-            if (reduce && batch_ok) {
-                const float *row = res + (int64_t)s*D;
-                for (int d = 0; d < D; d++) os[d] += row[d];
+        /* A real branch, not an if() clause: an inactive OpenMP region still makes
+         * every region nested inside it (qt_shared_token's matmuls, the CPU-miss
+         * experts) single-threaded -- measured 1 s on a 32-token prompt. */
+        if (!any_miss && (shb || folded)) {
+            #pragma omp parallel for schedule(static)
+            for (int s = 0; s < S; s++) {
+                const float *xs = x + (int64_t)s*D; float *os = out + (int64_t)s*D;
+                for (int kk = 0; kk < K; kk++)
+                    if (!done[s*K+kk]) qt_cpu_expert(m, layer, bidx[s*K+kk], bval[s*K+kk], xs, os, g, u, hh);
+                if (folded) { /* shared expert already inside res */ }
+                else if (shb) { const float *sr = shb + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += sgb[s] * sr[d]; }
+                else qt_shared_token(c, l, xs, os, sh, shu, shd, S);
+                if (reduce && batch_ok) {
+                    const float *row = res + (int64_t)s*D;
+                    for (int d = 0; d < D; d++) os[d] += row[d];
+                }
+                for (int kk = 0; !reduce && kk < K; kk++) if (done[s*K+kk]) {
+                    float w = bval[s*K+kk]; const float *row = res + ((int64_t)s*K + kk) * D;
+                    for (int d = 0; d < D; d++) os[d] += w * row[d];
+                }
             }
-            for (int kk = 0; !reduce && kk < K; kk++) if (done[s*K+kk]) {
-                float w = bval[s*K+kk]; const float *row = res + ((int64_t)s*K + kk) * D;
-                for (int d = 0; d < D; d++) os[d] += w * row[d];
+        } else {
+            for (int s = 0; s < S; s++) {
+                const float *xs = x + (int64_t)s*D; float *os = out + (int64_t)s*D;
+                for (int kk = 0; kk < K; kk++)
+                    if (!done[s*K+kk]) qt_cpu_expert(m, layer, bidx[s*K+kk], bval[s*K+kk], xs, os, g, u, hh);
+                if (folded) { /* shared expert already inside res */ }
+                else if (shb) { const float *sr = shb + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += sgb[s] * sr[d]; }
+                else qt_shared_token(c, l, xs, os, sh, shu, shd, S);
+                if (reduce && batch_ok) {
+                    const float *row = res + (int64_t)s*D;
+                    for (int d = 0; d < D; d++) os[d] += row[d];
+                }
+                for (int kk = 0; !reduce && kk < K; kk++) if (done[s*K+kk]) {
+                    float w = bval[s*K+kk]; const float *row = res + ((int64_t)s*K + kk) * D;
+                    for (int d = 0; d < D; d++) os[d] += w * row[d];
+                }
             }
         }
         if (tm_on()) { g_moe_pf[3] += tm_now() - _m0; }
@@ -3316,8 +3387,14 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         Layer *l = &m->L[i];
         /* rows are independent: a prefill block normalises them in parallel,
          * each row exactly as before (decode, S=1, stays serial) */
-        #pragma omp parallel for schedule(static) if(S > 1)
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        /* parallel only for a block: an OpenMP region with if(false) still
+         * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+        if (S > 1) {
+            #pragma omp parallel for schedule(static)
+            for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        } else {
+            for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        }
         double _t0 = tm_now();
         if (c->is_attn[i]) {
             attention(m, l, i, nrm, S, pos_base, tmp);
@@ -3327,18 +3404,36 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
             tm_add(S, 0, tm_now()-_t0);
         }
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
-        #pragma omp parallel for schedule(static) if(S > 1)
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        /* parallel only for a block: an OpenMP region with if(false) still
+         * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+        if (S > 1) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        } else {
+            for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        }
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* post-deltanet residual */
         if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
             pilot_prefetch(m, i + 1, x, S);
-        #pragma omp parallel for schedule(static) if(S > 1)
-        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        /* parallel only for a block: an OpenMP region with if(false) still
+         * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+        if (S > 1) {
+            #pragma omp parallel for schedule(static)
+            for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        } else {
+            for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        }
         _t0 = tm_now();
         moe(m, l, i, nrm, S, tmp);
         tm_add(S, 2, tm_now()-_t0);
-        #pragma omp parallel for schedule(static) if(S > 1)
-        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        /* parallel only for a block: an OpenMP region with if(false) still
+         * re-forms libgomp's team, measured -12 % decode tok/s at ~200 per token */
+        if (S > 1) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        } else {
+            for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        }
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);
         if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
             pilot_prefetch(m, i + 2, x, S);
