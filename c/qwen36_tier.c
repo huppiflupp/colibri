@@ -974,6 +974,22 @@ int qt_dn_block(int layer, int hout, const float *x, const float *ba, const floa
     return 0;
 #endif
 }
+/* A whole gated-attention layer of a prefill block on the GPU (Vulkan only): the
+ * dense handles of q, k, v, o must all be GPU-placed. 0 -> the engine's path. */
+int qt_attn_block(int hq, int hk, int hv, int ho, const float *x, const float *qn, const float *kn,
+                  float *Kc, float *Vc, int ldt, int S, int D, int H, int KV, int hd, int qdim,
+                  int rotary, int pos_base, float eps, float theta, float scale, float *out){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    int h[4] = {hq, hk, hv, ho};
+    for(int i = 0; i < 4; i++) if(h[i] < 0 || h[i] >= G_dense_n || !G_dense[h[i]].on) return 0;
+    return coli_vk_attn_block(G_dense[hq].t, G_dense[hk].t, G_dense[hv].t, G_dense[ho].t, x, qn, kn, Kc, Vc, ldt,
+                              S, D, H, KV, hd, qdim, rotary, pos_base, eps, theta, scale, out);
+#else
+    (void)hq;(void)hk;(void)hv;(void)ho;(void)x;(void)qn;(void)kn;(void)Kc;(void)Vc;(void)ldt;(void)S;(void)D;
+    (void)H;(void)KV;(void)hd;(void)qdim;(void)rotary;(void)pos_base;(void)eps;(void)theta;(void)scale;(void)out;
+    return 0;
+#endif
+}
 int qt_trunk_min_s(void){
     static int v = -1;
     if(v < 0){

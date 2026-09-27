@@ -2133,6 +2133,17 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     int gate_dim = (qdim > hd) ? (qdim - hd) : 0;
     extern double g_at_pf[3];
     double _a0 = tm_now();
+    /* The whole layer on the GPU in one submit when q/k/v/o are placed there;
+     * the new K/V rows land in the host caches (decode reads them). QWEN_ATTN_BLOCK=0
+     * keeps the steps below. */
+    if (l->qth_q && l->qth_k && l->qth_v && l->qth_o && kvd == hd && S > 1 && S >= qt_trunk_min_s() &&
+        !(getenv("QWEN_ATTN_BLOCK") && getenv("QWEN_ATTN_BLOCK")[0] == '0') &&
+        qt_attn_block(l->qth_q - 1, l->qth_k - 1, l->qth_v - 1, l->qth_o - 1, x, l->qn, l->kn,
+                      m->K[layer], m->V[layer], m->max_t, S, D, H, KV, hd, qdim, rotary, pos_base,
+                      c->eps, c->theta, 1.f / sqrtf((float)hd), out)) {
+        if (tm_on()) g_at_pf[1] += tm_now() - _a0;
+        return;
+    }
     float *q = falloc((int64_t)S*q_out);
     float *k = falloc((int64_t)S*kv_out);
     float *vv= falloc((int64_t)S*kv_out);

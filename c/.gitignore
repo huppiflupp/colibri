@@ -70,3 +70,5 @@ shaders/dn_recur.spv
 shaders/dn_conv.spv
 shaders/dn_prep.spv
 shaders/dn_gnorm.spv
+shaders/attn_prep.spv
+shaders/attn_gate.spv

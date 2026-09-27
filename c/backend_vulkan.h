@@ -47,6 +47,11 @@ const char *coli_vk_default_spv(char *buf, size_t n);
  * fmt matches QT in glm.c: 1=int8, 2=int4. (0=f32,3=int2 fall back to CPU.)
  * First call uploads W+scales; later calls reuse the resident copy.
  * Returns 1 on success, 0 if unavailable / unsupported fmt. */
+/* A whole gated-attention layer of a prefill block in one submit (see backend_vulkan.c). */
+int  coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, ColiVkTensor *to,
+                        const float *x, const float *qn, const float *kn, float *Kc, float *Vc, int ldt,
+                        int S, int D, int H, int KV, int hd, int qdim, int rotary, int pos_base,
+                        float eps, float theta, float scale, float *out);
 /* A whole DeltaNet layer of a prefill block in one submit (see backend_vulkan.c). */
 int  coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, const float *ba,
                       const float *convw, const float *par, const float *normw, float *ring, float *state,
