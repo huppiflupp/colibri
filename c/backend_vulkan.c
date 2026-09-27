@@ -154,7 +154,7 @@ static struct {
      * never collides with the main cmd/fence (dense matmuls, absorb) — issue() returns
      * immediately, the CPU computes its share, take() joins. */
     VkCommandBuffer eg_cmd; VkFence eg_fence; int eg_inflight; size_t eg_pending_yb;
-    double eg_t0, eg_t1, eg_t2, eg_t3; int eg_prof;
+    double eg_t0, eg_t1, eg_t2, eg_t3, eg_tin; int eg_prof;
     /* Prefill gather/reduce shares the expert command buffer, with persistent
      * metadata and token-sized host I/O. Packed x/h/y never leave the GPU. */
     Scratch ep_x, ep_order, ep_inverse, ep_weights, ep_y;
@@ -1591,16 +1591,19 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     memcpy(y, G.db_y.ptr, nx);
     memcpy(state, G.dr_s.ptr, nst);
     /* new ring: the last convk-1 unconvolved qkv inputs (older ones from the old ring) */
-    { const float *qz = (const float *)G.db_qz.ptr; int km = convk - 1;
-      float *old = malloc(nring);
-      if (!old) return 0;
+    /* (the last km rows of db_qz are copied out in one piece first: scattered
+     * reads from that mapped, uncached scratch cost ~250 ns each) */
+    { int km = convk - 1, r0 = S - km > 0 ? S - km : 0, nr = S - r0;
+      float *old = malloc(nring), *qz = malloc((size_t)nr * pd * f);
+      if (!old || !qz) { free(old); free(qz); return 0; }
       memcpy(old, ring, nring);
+      memcpy(qz, (const float *)G.db_qz.ptr + (size_t)r0 * pd, (size_t)nr * pd * f);
       for (int cc = 0; cc < conv_dim; cc++)
           for (int kk = 0; kk < km; kk++) {
               int src = S - km + kk;
-              ring[cc * km + kk] = src >= 0 ? qz[(size_t)src * pd + cc] : old[cc * km + src + km];
+              ring[cc * km + kk] = src >= 0 ? qz[(size_t)(src - r0) * pd + cc] : old[cc * km + src + km];
           }
-      free(old); }
+      free(old); free(qz); }
     G.cmd_ready = 0; G.bound_tensor = NULL;
     return 1;
 }
@@ -1790,6 +1793,7 @@ static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi
 static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                              ColiVkTensor *const *downs, const int *rows, int count,
                              const float *x, const ExpertPrefill *ep) {
+    double t_in = vk_now();
     if (!G.ready || !G.shader_gu || count < 1 || count > (ep ? EG_MAX_EXPERTS : 64)) return 0;
     ColiVkTensor *g0 = gates[0]; if (!g0) return 0;
     int D = g0->I, I = g0->O, total = 0, off[EG_MAX_EXPERTS];
@@ -1829,19 +1833,25 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
             !scratch_reserve(&G.ep_order, (size_t)total*4) ||
             !scratch_reserve(&G.ep_inverse, pb) || !scratch_reserve(&G.ep_weights, pb) ||
             !scratch_reserve_mt(&G.ep_y, (size_t)ep->S*D*4, G.memtype_cached)) return 0;
-        int *inv = G.ep_inverse.ptr;
+        /* built in ordinary memory and copied once: the check reads inv[p] back,
+         * and reads from the mapped (write-combined) scratch cost ~250 ns each --
+         * 2.3 ms per layer at 9099 pairs */
+        int *inv = malloc(pb);
+        if (!inv) return 0;
         for (int p = 0; p < ep->S*ep->K; p++) inv[p] = -1;
         for (int r = 0; r < total; r++) {
             int p = ep->order[r];
-            if (p < 0 || p >= ep->S*ep->K || inv[p] != -1) return 0;
+            if (p < 0 || p >= ep->S*ep->K || inv[p] != -1) { free(inv); return 0; }
             inv[p] = r;
         }
+        memcpy(G.ep_inverse.ptr, inv, pb);
+        free(inv);
     }
     size_t xb = (size_t)total*D*4, hb = (size_t)total*I*4, yb = (size_t)total*D*4;
     if (!scratch_reserve(&G.eg_x, xb) || !scratch_reserve(&G.eg_h, hb) ||
         !scratch_reserve_mt(&G.eg_y, yb, G.memtype_cached)) return 0;   /* eg_y is read back -> cached */
     G.eg_prof = getenv("VK_PROF") != NULL;
-    if (G.eg_prof) G.eg_t0 = vk_now();
+    if (G.eg_prof) { G.eg_t0 = vk_now(); G.eg_tin = t_in; }
     if (ep) {
         memcpy(G.ep_x.ptr, x, (size_t)ep->S*D*4);
         memcpy(G.ep_order.ptr, ep->order, (size_t)total*4);
@@ -2040,8 +2050,8 @@ int coli_vk_expert_group_take(float *y) {
     memcpy(y, G.eg_reduced ? G.ep_y.ptr : G.eg_y.ptr, G.eg_pending_yb);
     if (G.eg_prof) {
         double t5 = vk_now();
-        fprintf(stderr, "[VK_PROF] memcpy_x %.3f | desc %.3f | record %.3f | issue->take %.3f | memcpy_y %.3f ms\n",
-                G.eg_t1-G.eg_t0, G.eg_t2-G.eg_t1, G.eg_t3-G.eg_t2, t4-G.eg_t3, t5-t4);
+        fprintf(stderr, "[VK_PROF] pre %.3f | memcpy_x %.3f | desc %.3f | record %.3f | issue->take %.3f | memcpy_y %.3f ms\n",
+                G.eg_t0-G.eg_tin, G.eg_t1-G.eg_t0, G.eg_t2-G.eg_t1, G.eg_t3-G.eg_t2, t4-G.eg_t3, t5-t4);
     }
     return 1;
 }
