@@ -1936,6 +1936,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
     ts_stageb(G.eg_cmd, TSB_EG, 0);
+    if (grp && getenv("VK_DBG_FMT")) { static int once; if (!once++) fprintf(stderr, "[dbg] experts: count %d total %d gate fmt %d gs %d down fmt %d gs %d | last fmt %d\n", count, total, gates[0]->fmt, gates[0]->gs, downs[0]->fmt, downs[0]->gs, gates[count-1]->fmt); }
     if (grp) {
         /* tiles per expert: full ones (16*TT rows) while more than 32 rows remain,
          * the rest (<= 32 rows) on the TT = 2 twin when it exists -- an expert gets
@@ -3698,6 +3699,48 @@ static int run_expert_prefill(int D, int I, int E, int maxrows, float limit) {
     return bad;
 }
 
+/* VK_EG_BENCH=1 (with COLI_VK_TS=1): one Qwen3.6 prefill MoE layer through the
+ * grouped path -- S tokens, top-K of E experts, random routing, fmt 4 g64 -- timed
+ * per stage by the GPU timestamps, no reference. For kernel experiments. */
+static int run_expert_prefill_bench(int S, int K, int E, int D, int I, int iters) {
+    int fmt = 4, pairs = S * K, bad = 0;
+    int *rows = calloc(E, sizeof(int)), *pe = malloc(pairs * sizeof(int)), *order = malloc(pairs * sizeof(int));
+    float *w = malloc(pairs * 4), *x = malloc((size_t)S * D * 4), *y = malloc((size_t)S * D * 4);
+    for (int s = 0; s < S; s++)
+        for (int k = 0; k < K; k++) {
+            int e, dup;
+            do { e = rand() % E; dup = 0; for (int j = 0; j < k; j++) dup |= pe[s * K + j] == e; } while (dup);
+            pe[s * K + k] = e; rows[e]++; w[s * K + k] = 0.1f;
+        }
+    int *first = calloc(E, sizeof(int)), *fill = calloc(E, sizeof(int)), nex = 0, *ex = malloc(E * sizeof(int)), *rr = malloc(E * sizeof(int));
+    for (int e = 0, o = 0; e < E; e++) { first[e] = o; o += rows[e]; }
+    for (int p = 0; p < pairs; p++) { int e = pe[p]; order[first[e] + fill[e]++] = p; }
+    for (int e = 0; e < E; e++) if (rows[e]) { ex[nex] = e; rr[nex++] = rows[e]; }
+    for (size_t j = 0; j < (size_t)S * D; j++) x[j] = (rand() % 200 - 100) / 100.f;
+    size_t rb = ref_rowbytes(fmt, D), drb = ref_rowbytes(fmt, I), ns = ref_scales(fmt, D, I), nds = ref_scales(fmt, I, D);
+    uint8_t *gw = malloc(rb * I), *dw = malloc(drb * D); float *gs = malloc(ns * 4), *ds = malloc(nds * 4);
+    for (size_t j = 0; j < rb * I; j++) gw[j] = rand() & 255;
+    for (size_t j = 0; j < drb * D; j++) dw[j] = rand() & 255;
+    for (size_t j = 0; j < ns; j++) gs[j] = .01f;
+    for (size_t j = 0; j < nds; j++) ds[j] = .01f;
+    ColiVkTensor **tg = calloc(nex, sizeof(*tg)), **tu = calloc(nex, sizeof(*tu)), **td = calloc(nex, sizeof(*td));
+    for (int c = 0; c < nex; c++)
+        if (!coli_vk_tensor_ensure(&tg[c], gw, gs, fmt, D, I, 64) || !coli_vk_tensor_ensure(&tu[c], gw, gs, fmt, D, I, 64) ||
+            !coli_vk_tensor_ensure(&td[c], dw, ds, fmt, I, D, 64)) { bad = 1; goto out; }
+    /* order must be grouped by expert in the ex[] order: it already is (ascending e) */
+    coli_vk_expert_prefill(tg, tu, td, rr, nex, order, w, S, K, x, y);   /* warm-up */
+    memset(g_tsb, 0, sizeof g_tsb);
+    for (int i = 0; i < iters; i++)
+        if (!coli_vk_expert_prefill(tg, tu, td, rr, nex, order, w, S, K, x, y)) { bad = 1; goto out; }
+    printf("EG_BENCH S=%d K=%d E=%d (%d used) D=%d I=%d | per layer: gate_up %.3f  down %.3f  reduce %.3f ms\n",
+           S, K, E, nex, D, I, g_tsb[TSB_EG][1] / iters, g_tsb[TSB_EG][2] / iters, g_tsb[TSB_EG][3] / iters);
+ out:
+    for (int c = 0; c < nex; c++) { coli_vk_tensor_free(tg[c]); coli_vk_tensor_free(tu[c]); coli_vk_tensor_free(td[c]); }
+    free(rows); free(pe); free(order); free(w); free(x); free(y); free(first); free(fill); free(ex); free(rr);
+    free(gw); free(dw); free(gs); free(ds); free(tg); free(tu); free(td);
+    return bad;
+}
+
 static int run_expert_prefill_tests(void) {
     g_ref_gs = 64;
     int bad = 0, co = G.coop, any = g_mr_any;
@@ -4056,6 +4099,11 @@ int main(int argc, char **argv) {
         printf(bad ? "FAIL\n" : "PASS\n");
         coli_vk_shutdown();
         return bad;
+    }
+    if (getenv("VK_EG_BENCH")) {
+        if (!G.ts_on) printf("VK_EG_BENCH needs COLI_VK_TS=1\n");
+        bad = run_expert_prefill_bench(1011, 8, 256, 2048, 512, 20);
+        coli_vk_shutdown(); return bad;
     }
     if (getenv("VK_ATTN_TEST")) {   /* attention cores only (attn_flash / attn_prefill + whole layer) */
         if (G.pipe_ap) {
