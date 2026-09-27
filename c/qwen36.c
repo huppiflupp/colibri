@@ -2664,15 +2664,38 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         float *res = malloc(sizeof(float) * (size_t)S * (reduce ? 1 : K) * D);
         uint8_t *done = calloc((size_t)S * K, 1);
         if (!done) { fprintf(stderr, "qwen36: out of memory in the prefill batch\n"); exit(1); }
-        int batch_ok = res && (reduce ? qt_issue_batch_reduce(layer, bidx, S, K, x, bval, res, done)
-                                     : qt_issue_batch(layer, bidx, S, K, x, res, done));
+        /* Shared expert folded into the same GPU submit as the routed experts
+         * (pair K of every token, weight = its sigmoid gate) when it is GPU-placed:
+         * no separate shared-expert round trips. QWEN_SHEXP_FOLD=0 keeps it apart. */
+        int fold = reduce && l->qth_shg && l->qth_shu && l->qth_shd && S >= qt_trunk_min_s() &&
+                   !(getenv("QWEN_SHEXP_FOLD") && getenv("QWEN_SHEXP_FOLD")[0] == '0');
+        int batch_ok = 0, folded = 0;
+        if (fold && res) {
+            float *sg_all = falloc(S);
+            #pragma omp parallel for schedule(static)
+            for (int s = 0; s < S; s++) {
+                float sgate = 1.f;
+                if (l->sh_gate) {
+                    float sg = 0.f; const float *wg = l->sh_gate, *xs = x + (int64_t)s*D;
+                    for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
+                    sgate = 1.f / (1.f + expf(-sg));
+                }
+                sg_all[s] = sgate;
+            }
+            batch_ok = folded = qt_issue_batch_reduce_sh(layer, bidx, S, K, x, bval, l->qth_shg - 1,
+                                                         l->qth_shu - 1, l->qth_shd - 1, sg_all, res, done);
+            free(sg_all);
+        }
+        if (!folded)
+            batch_ok = res && (reduce ? qt_issue_batch_reduce(layer, bidx, S, K, x, bval, res, done)
+                                      : qt_issue_batch(layer, bidx, S, K, x, res, done));
         if (!batch_ok) memset(done, 0, (size_t)S * K);
         if (tm_on()) { double t = tm_now(); g_moe_pf[1] += t - _m0; _m0 = t; }
         /* Shared expert of all S tokens in three batched matmuls when it is GPU-
          * placed (a prefill block); the sum per token keeps its old place below. */
         int Ish = c->shared_inter;
         float *shb = NULL, *sgb = NULL;
-        if (l->qth_shg && l->qth_shu && l->qth_shd && S >= qt_trunk_min_s()) {
+        if (!folded && l->qth_shg && l->qth_shu && l->qth_shd && S >= qt_trunk_min_s()) {
             float *hg = falloc((int64_t)S * Ish), *hu = falloc((int64_t)S * Ish);
             shb = falloc((int64_t)S * D); sgb = falloc(S);
             double _ts2 = tm_now();
@@ -2700,12 +2723,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
          * GPU took every pair and the shared expert came batched. */
         int any_miss = 0;
         for (int i = 0; i < S * K && !any_miss; i++) any_miss = !done[i];
-        #pragma omp parallel for schedule(static) if(!any_miss && shb)
+        #pragma omp parallel for schedule(static) if(!any_miss && (shb || folded))
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s*D; float *os = out + (int64_t)s*D;
             for (int kk = 0; kk < K; kk++)
                 if (!done[s*K+kk]) qt_cpu_expert(m, layer, bidx[s*K+kk], bval[s*K+kk], xs, os, g, u, hh);
-            if (shb) { const float *sr = shb + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += sgb[s] * sr[d]; }
+            if (folded) { /* shared expert already inside res */ }
+            else if (shb) { const float *sr = shb + (int64_t)s*D; for (int d = 0; d < D; d++) os[d] += sgb[s] * sr[d]; }
             else qt_shared_token(c, l, xs, os, sh, shu, shd, S);
             if (reduce && batch_ok) {
                 const float *row = res + (int64_t)s*D;

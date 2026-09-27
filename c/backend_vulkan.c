@@ -1497,19 +1497,21 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
                              const float *x, const ExpertPrefill *ep) {
     if (!G.ready || !G.shader_gu || count < 1 || count > (ep ? EG_MAX_EXPERTS : 64)) return 0;
     ColiVkTensor *g0 = gates[0]; if (!g0) return 0;
-    int D = g0->I, I = g0->O, fmt = g0->fmt, total = 0, off[EG_MAX_EXPERTS];
+    int D = g0->I, I = g0->O, total = 0, off[EG_MAX_EXPERTS];
     if (D > 6144) return 0;   /* gate_up shader stages x in xsh[6144] */
     if (!downs[0]) return 0;
-    int dfmt = downs[0]->fmt;   /* down may be a different quant than gate/up (per-projection
-                                 * containers, e.g. --up-bits 3); gate/up must MATCH — the
-                                 * fused gate_up shader decodes both with one fmt. */
+    /* down may be a different quant than gate/up (per-projection containers, e.g.
+     * --up-bits 3); see the per-expert check below */
     for (int c = 0; c < count; c++) {
         if (!gates[c] || !ups[c] || !downs[c] || rows[c] < 1 || rows[c] > INT_MAX-total ||
             gates[c]->dev || ups[c]->dev || downs[c]->dev) return 0;
         off[c] = total; total += rows[c];
-        if (rows[c] < 1 || gates[c]->I != D || gates[c]->O != I || gates[c]->fmt != fmt ||
-            ups[c]->I != D || ups[c]->O != I || ups[c]->fmt != fmt ||
-            downs[c]->I != I || downs[c]->O != D || downs[c]->fmt != dfmt) return 0;
+        /* formats per expert (the prefill batch mixes the int4 routed experts with the
+         * int8 shared expert); gate and up of ONE expert must match, the fused
+         * gate_up shader decodes both with one fmt */
+        if (rows[c] < 1 || gates[c]->I != D || gates[c]->O != I ||
+            ups[c]->I != D || ups[c]->O != I || ups[c]->fmt != gates[c]->fmt || ups[c]->gs != gates[c]->gs ||
+            downs[c]->I != I || downs[c]->O != D) return 0;
     }
     if (ep) {
         if (!G.ep_pipe[0] || !G.ep_pipe[1] || ep->S < 2 || ep->K < 1 ||
@@ -1606,11 +1608,12 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
      * one-row shader; order within a phase is free (the dispatches are independent). */
     VkPipeline bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
-        int co = coop_use(fmt, rows[c], D, I, gates[c]->gs, 1), mr = !co && mr_use(fmt, rows[c], D, I);
+        int gf = gates[c]->fmt;
+        int co = coop_use(gf, rows[c], D, I, gates[c]->gs, 1), mr = !co && mr_use(gf, rows[c], D, I);
         uint32_t cgx = 0, cgy = 0;
         VkPipeline want = co ? coop_pick(1, rows[c], I, &cgx, &cgy) : mr ? G.pipe_gu_mr : G.pipe_gu;
         if (want != bound) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); bound = want; }
-        struct PCGU pc = pcgu(fmt, rows[c], D, I, gates[c]->rowWords, gates[c]->gs);
+        struct PCGU pc = pcgu(gf, rows[c], D, I, gates[c]->rowWords, gates[c]->gs);
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_gu, 0, 1, &G.eg_gu[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         if (co) vkCmdDispatch(G.eg_cmd, cgx, cgy, 1);
@@ -1620,11 +1623,12 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     /* phase 2: down projection hidden -> y */
     bound = VK_NULL_HANDLE;
     for (int c = 0; c < count; c++) {
-        int co = coop_use(dfmt, rows[c], I, D, downs[c]->gs, 1), mr = !co && mr_use(dfmt, rows[c], I, D);
+        int df = downs[c]->fmt;
+        int co = coop_use(df, rows[c], I, D, downs[c]->gs, 1), mr = !co && mr_use(df, rows[c], I, D);
         uint32_t cgx = 0, cgy = 0;
         VkPipeline want = co ? coop_pick(0, rows[c], D, &cgx, &cgy) : mr ? G.pipe_mr : G.pipe;
         if (want != bound) { vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); bound = want; }
-        struct PC pc = {dfmt, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
+        struct PC pc = {df, rows[c], I, D, downs[c]->rowWords, downs[c]->gs};
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.eg_dn[c], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         if (co) vkCmdDispatch(G.eg_cmd, cgx, cgy, 1);

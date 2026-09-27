@@ -1381,9 +1381,12 @@ int qt_batch_gpu_reduce(void){
     return qt_batch_ok() && !(e && *e=='0');  /* checked: PPL 7.71 vs 7.66 (1024 wikitext tokens) */
 }
 static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float *x,
-                               const float *weights,float *res,uint8_t *done){
+                               const float *weights,float *res,uint8_t *done,
+                               QtTensor *xg,QtTensor *xu,QtTensor *xd){
     if(!qt_batch_ok() || S<2 || K<1 || S>INT_MAX/K || layer<0 || layer>=G.nl) return 0;
-    int E=G.ne, D=G.D;
+    /* xg/xu/xd: an extra always-resident pseudo expert with id G.ne (the shared
+     * expert, from the dense trunk) that the caller routes as pair k = K-1 */
+    int E=G.ne + (xg?1:0), D=G.D, NE=G.ne;
     size_t pairs=(size_t)S*K;
     int *cnt=calloc((size_t)E,sizeof(int)), *first=malloc((size_t)E*sizeof(int));
     int *order=malloc(pairs*sizeof(int));          /* pair ids grouped by expert */
@@ -1399,6 +1402,7 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
     for(size_t pi=0;pi<pairs;pi++){
         int e=eids[pi];
         if(e<0||e>=E){ continue; }
+        if(e==NE){ if(!cnt[e]++) ex[nex++]=e; continue; }         /* pseudo expert: always resident */
         if(qs(layer,e)->resident){ if(!cnt[e]++) ex[nex++]=e; G.hits[0]++; }
         else G.miss++;
     }
@@ -1407,7 +1411,7 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
     int *fill=calloc((size_t)E,sizeof(int)); if(!fill){ G.issue_open=0; pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx); free(cnt); free(first); free(order); free(ex); return 0; }
     for(size_t pi=0;pi<pairs;pi++){
         int e=eids[pi];
-        if(e>=0&&e<E&&cnt[e]&&qs(layer,e)->resident) order[first[e]+fill[e]++]=(int)pi;
+        if(e>=0&&e<E&&cnt[e]&&(e==NE||qs(layer,e)->resident)) order[first[e]+fill[e]++]=(int)pi;
     }
     QtTensor *tg[QT_BATCH_GROUP],*tu[QT_BATCH_GROUP],*td[QT_BATCH_GROUP];
     QtTensor **pg=malloc((size_t)(nex?nex:1)*3*sizeof(QtTensor*));
@@ -1415,11 +1419,15 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
     size_t total=0; for(int j=0;j<nex;j++) total+=(size_t)cnt[ex[j]];
     float *xb=total&&!weights?malloc(total*(size_t)D*sizeof(float)):NULL;
     float *yb=total&&!weights?malloc(total*(size_t)D*sizeof(float)):NULL;
-    int *allrows=weights&&nex?malloc((size_t)nex*sizeof(int)):NULL;
+    int *allrows=weights&&nex>0?malloc((size_t)(unsigned)nex*sizeof(int)):NULL;
     if(total && (weights ? !allrows : (!xb||!yb))) ok=0;
     /* the group runs while the tier lock is released, as qt_issue does; issue_open
      * keeps the uploader from swapping a resident expert out underneath it */
-    if(ok) for(int j=0;j<nex;j++){ QSlot *q=qs(layer,ex[j]); pg[j]=q->tg; pg[nex+j]=q->tu; pg[2*nex+j]=q->td; if(allrows) allrows[j]=cnt[ex[j]]; }
+    if(ok) for(int j=0;j<nex;j++){
+        if(ex[j]==NE){ pg[j]=xg; pg[nex+j]=xu; pg[2*nex+j]=xd; }
+        else { QSlot *q=qs(layer,ex[j]); pg[j]=q->tg; pg[nex+j]=q->tu; pg[2*nex+j]=q->td; }
+        if(allrows) allrows[j]=cnt[ex[j]];
+    }
     pthread_mutex_unlock(&G.mx);
 
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
@@ -1456,12 +1464,40 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
 }
 
 int qt_issue_batch(int layer,const int *eids,int S,int K,const float *x,float *res,uint8_t *done){
-    return qt_issue_batch_impl(layer,eids,S,K,x,NULL,res,done);
+    return qt_issue_batch_impl(layer,eids,S,K,x,NULL,res,done,NULL,NULL,NULL);
+}
+/* Prefill batch with the shared expert folded in as pair K of every token (dense
+ * trunk handles hg/hu/hd, weight sgate[s]); res = [S][D] of the resident routed
+ * experts plus the shared expert, done[S*K] as for qt_issue_batch_reduce.
+ * Returns 0 (nothing computed) when unavailable. */
+int qt_issue_batch_reduce_sh(int layer,const int *eids,int S,int K,const float *x,
+                             const float *weights,int hg,int hu,int hd,const float *sgate,
+                             float *res,uint8_t *done){
+    if(!weights || !sgate || hg<0 || hu<0 || hd<0 || hg>=G_dense_n || hu>=G_dense_n || hd>=G_dense_n ||
+       !G_dense[hg].on || !G_dense[hu].on || !G_dense[hd].on) return 0;
+    int K2=K+1;
+    int *e2=malloc((size_t)S*K2*sizeof(int)); float *w2=malloc((size_t)S*K2*sizeof(float));
+    uint8_t *d2=malloc((size_t)S*K2);
+    int ok=e2&&w2&&d2;
+    if(ok){
+        for(int s=0;s<S;s++){
+            memcpy(e2+(size_t)s*K2, eids+(size_t)s*K, (size_t)K*sizeof(int));
+            memcpy(w2+(size_t)s*K2, weights+(size_t)s*K, (size_t)K*sizeof(float));
+            e2[(size_t)s*K2+K]=G.ne; w2[(size_t)s*K2+K]=sgate[s];
+        }
+        ok=qt_issue_batch_impl(layer,e2,S,K2,x,w2,res,d2,G_dense[hg].t,G_dense[hu].t,G_dense[hd].t);
+        if(ok) for(int s=0;s<S;s++){
+            memcpy(done+(size_t)s*K, d2+(size_t)s*K2, (size_t)K);
+            if(!d2[(size_t)s*K2+K]) ok=0;           /* shared expert must be in */
+        }
+    }
+    free(e2); free(w2); free(d2);
+    return ok;
 }
 int qt_issue_batch_reduce(int layer,const int *eids,int S,int K,const float *x,
                           const float *weights,float *res,uint8_t *done){
     if(!weights) return 0;
-    return qt_issue_batch_impl(layer,eids,S,K,x,weights,res,done);
+    return qt_issue_batch_impl(layer,eids,S,K,x,weights,res,done,NULL,NULL,NULL);
 }
 
 void qt_stats(void){
