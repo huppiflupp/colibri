@@ -4307,19 +4307,25 @@ static int run_expert_prefill_bench(int S, int K, int E, int D, int I, int iters
     for (size_t j = 0; j < drb * D; j++) dw[j] = rand() & 255;
     for (size_t j = 0; j < ns; j++) gs[j] = .01f;
     for (size_t j = 0; j < nds; j++) ds[j] = .01f;
-    ColiVkTensor **tg = calloc(nex, sizeof(*tg)), **tu = calloc(nex, sizeof(*tu)), **td = calloc(nex, sizeof(*td));
-    for (int c = 0; c < nex; c++)
+    /* VK_EG_BENCH_ROT=n: n weight sets in turn (decode: 9 x 1.5 MB fit the 32 MB MALL otherwise) */
+    int nrot = getenv("VK_EG_BENCH_ROT") ? atoi(getenv("VK_EG_BENCH_ROT")) : 1; if (nrot < 1) nrot = 1;
+    ColiVkTensor **tg = calloc((size_t)nex * nrot, sizeof(*tg)), **tu = calloc((size_t)nex * nrot, sizeof(*tu)), **td = calloc((size_t)nex * nrot, sizeof(*td));
+    for (int c = 0; c < nex * nrot; c++)
         if (!coli_vk_tensor_ensure(&tg[c], gw, gs, fmt, D, I, 64) || !coli_vk_tensor_ensure(&tu[c], gw, gs, fmt, D, I, 64) ||
             !coli_vk_tensor_ensure(&td[c], dw, ds, fmt, I, D, 64)) { bad = 1; goto out; }
     /* order must be grouped by expert in the ex[] order: it already is (ascending e) */
     coli_vk_expert_prefill(tg, tu, td, rr, nex, order, w, S, K, x, y);   /* warm-up */
     memset(g_tsb, 0, sizeof g_tsb);
-    for (int i = 0; i < iters; i++)
-        if (!coli_vk_expert_prefill(tg, tu, td, rr, nex, order, w, S, K, x, y)) { bad = 1; goto out; }
-    printf("EG_BENCH S=%d K=%d E=%d (%d used) D=%d I=%d | per layer: gate_up %.3f  down %.3f  reduce %.3f ms\n",
-           S, K, E, nex, D, I, g_tsb[TSB_EG][1] / iters, g_tsb[TSB_EG][2] / iters, g_tsb[TSB_EG][3] / iters);
+    double eg0 = g_ts[TS_EG].gpu;
+    for (int i = 0; i < iters; i++) {
+        size_t o = (size_t)(i % nrot) * nex;
+        if (!coli_vk_expert_prefill(tg + o, tu + o, td + o, rr, nex, order, w, S, K, x, y)) { bad = 1; goto out; }
+    }
+    double mb = nex * (2.0 * (rb * I + ns * 4) + drb * D + nds * 4) / 1e6, us = (g_ts[TS_EG].gpu - eg0) * 1e3 / iters;
+    printf("EG_BENCH S=%d K=%d E=%d (%d used) D=%d I=%d x%d | per layer: gate_up %.3f  down %.3f  reduce %.3f ms | %.1f MB in %.1f us GPU = %.0f GB/s\n",
+           S, K, E, nex, D, I, nrot, g_tsb[TSB_EG][1] / iters, g_tsb[TSB_EG][2] / iters, g_tsb[TSB_EG][3] / iters, mb, us, us > 0 ? mb * 1e3 / us : 0);
  out:
-    for (int c = 0; c < nex; c++) { coli_vk_tensor_free(tg[c]); coli_vk_tensor_free(tu[c]); coli_vk_tensor_free(td[c]); }
+    for (int c = 0; c < nex * nrot; c++) { coli_vk_tensor_free(tg[c]); coli_vk_tensor_free(tu[c]); coli_vk_tensor_free(td[c]); }
     free(rows); free(pe); free(order); free(w); free(x); free(y); free(first); free(fill); free(ex); free(rr);
     free(gw); free(dw); free(gs); free(ds); free(tg); free(tu); free(td);
     return bad;
@@ -4713,7 +4719,7 @@ int main(int argc, char **argv) {
     }
     if (getenv("VK_EG_BENCH")) {
         if (!G.ts_on) printf("VK_EG_BENCH needs COLI_VK_TS=1\n");
-        bad = run_expert_prefill_bench(getenv("VK_EG_BENCH_S") ? atoi(getenv("VK_EG_BENCH_S")) : 1011, 8, 256, 2048, 512, 20);
+        bad = run_expert_prefill_bench(getenv("VK_EG_BENCH_S") ? atoi(getenv("VK_EG_BENCH_S")) : 1011, getenv("VK_EG_BENCH_K") ? atoi(getenv("VK_EG_BENCH_K")) : 8, 256, 2048, 512, getenv("VK_EG_BENCH_N") ? atoi(getenv("VK_EG_BENCH_N")) : 20);
         coli_vk_shutdown(); return bad;
     }
     if (getenv("VK_ATTN_TEST")) {   /* attention cores only (attn_flash / attn_prefill + whole layer) */

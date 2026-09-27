@@ -393,18 +393,22 @@ static inline void xf_moe_run(float *out, const float *x, int S, int K, int H, i
             xf_gate_up_rows(g + (size_t)i * F, u + (size_t)i * F, experts[i], &a, H, r0, r1, mode);
         }
     }
-    /* hidden rows (cheap, per pair); a single pair runs without an OpenMP
-     * region -- a real branch, not an if() clause */
-    if (n > 1) {
+    /* Hidden rows are cheap for one decode token (e.g. 8 x 512 elements).
+     * Keep the same per-pair functions and order, without entering a region;
+     * larger work and multi-token batches still run in parallel. */
+    if (n > 1 && (S > 1 || n * (size_t)F > 4096)) {
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < (int)n; i++) {
             if (idx[i] < 0 || !experts[i]) continue;
             xf_swiglu(h + (size_t)i * F, g + (size_t)i * F, u + (size_t)i * F, F);
             if (mode) hsx[i] = xf_act_i8(h + (size_t)i * F, F, hq + (size_t)i * F, hsum + (size_t)i * (F / XF_BLOCK));
         }
-    } else if (n == 1 && idx[0] >= 0 && experts[0]) {
-        xf_swiglu(h, g, u, F);
-        if (mode) hsx[0] = xf_act_i8(h, F, hq, hsum);
+    } else {
+        for (int i = 0; i < (int)n; i++) {
+            if (idx[i] < 0 || !experts[i]) continue;
+            xf_swiglu(h + (size_t)i * F, g + (size_t)i * F, u + (size_t)i * F, F);
+            if (mode) hsx[i] = xf_act_i8(h + (size_t)i * F, F, hq + (size_t)i * F, hsum + (size_t)i * (F / XF_BLOCK));
+        }
     }
     /* phase 2: down for every (expert, chunk) */
     #pragma omp parallel for schedule(dynamic, 1)

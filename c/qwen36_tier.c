@@ -145,10 +145,28 @@ static struct {
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
+    int frozen;                           /* atomic publication: all tensors immutable until shutdown */
     pthread_cond_t cv_take;               /* signals qt_take done + queue space */
     uint64_t tick, swaps, pf_hits, pf_notes;
     uint32_t *heat0;                      /* heat table loaded from HEAT_FILE */
 } G;
+
+/* The tier has one inference caller. Batch and folded-input buffers must be
+ * separate because the latter stay live throughout qt_issue_batch_impl. */
+typedef struct { void *p; size_t bytes; } QtScratch;
+static QtScratch G_batch_buf[9], G_fold_buf[3];
+static void *qt_scratch(QtScratch *b, int S, size_t bytes){
+    if(!bytes) bytes=1;
+    if(S>4) return malloc(bytes);
+    if(bytes>b->bytes){
+        void *p=realloc(b->p,bytes);
+        if(!p) return NULL;
+        b->p=p; b->bytes=bytes;
+    }
+    return b->p;
+}
+static void qt_scratch_release(int S,void *p){ if(S>4) free(p); }
+static int qt_frozen(void){ return __atomic_load_n(&G.frozen,__ATOMIC_ACQUIRE); }
 
 /* Count parked callers so shutdown can reclaim their shared storage safely. */
 static void wait_take_locked(void){
@@ -1193,6 +1211,7 @@ int qt_lmhead_matmul(float *y, const float *x, int I, int O){
 /* Is (layer,eid) currently VRAM-resident? (used to free RAM-side int8 copies) */
 int qt_is_resident(int layer,int eid){
     if(!G.on) return 0;
+    if(qt_frozen()) return 1;
     pthread_mutex_lock(&G.mx);
     int r = qs(layer,eid)->resident;
     pthread_mutex_unlock(&G.mx);
@@ -1258,7 +1277,7 @@ static void stream_promote_locked(int layer,int eid){
 void qt_note(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4) return;
+    if(!G.on || !g4 || qt_frozen()) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
     if(G_fp8_stream){
@@ -1281,7 +1300,7 @@ void qt_note(int layer,int eid,
 void qt_note_n(int layer,int eid,
                const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
                const float *gs,const float *us,const float *ds,uint32_t n){
-    if(!G.on || !g4 || !n) return;
+    if(!G.on || !g4 || !n || qt_frozen()) return;
     if(G_fp8_stream){ for(uint32_t i=0;i<n;i++) qt_note(layer,eid,g4,u4,d4,gs,us,ds); return; }
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
@@ -1413,6 +1432,17 @@ void qt_fill_wait(void){
     if(!G.on) return;
     pthread_mutex_lock(&G.mx);
     while(G.inflight>0 && !G.th_stop) wait_take_locked();
+    /* Publish only after the uploader has finished (qn==0 alone is not
+     * sufficient). No missing expert means neither enqueue nor LFRU can ever
+     * choose a replacement: the uploader remains asleep until shutdown.
+     * Preserve heat collection/decay when HEAT_FILE was requested, and leave
+     * streaming FP8 on its original synchronization path. */
+    if(!qt_frozen() && !G.th_stop && !G.inflight && !G.issue_open && !G_fp8_stream && !getenv("HEAT_FILE")){
+        int full=1;
+        for(size_t i=0;i<(size_t)G.nl*G.ne;i++)
+            if(!G.slot[i].resident || G.slot[i].queued || G.slot[i].planned){ full=0; break; }
+        if(full) __atomic_store_n(&G.frozen,1,__ATOMIC_RELEASE);
+    }
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -1453,17 +1483,20 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     if(!rows[0]) for(int i=0;i<QT_MAX_ROWS;i++) rows[i]=1;
     for(int i=0;i<G.ndev;i++) G.is_cnt[i]=0;
 
-    pthread_mutex_lock(&G.mx);
-    /* QT_UPLOAD_SYNC=1: everything enqueued so far is resident before this
-     * group is formed. Costs the upload/compute overlap, so it is for tests
-     * and diagnostics: the fake-backend engine test asserts on residency and
-     * hits after eight tokens, and on a two-vCPU runner the uploader thread
-     * did not get scheduled once before the run was over (0 uploads, 0 hits,
-     * six entries still queued). No group is open here, so the wait cannot
-     * meet a swap parked on issue_open. */
-    if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
-    if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
-    if(layer==0) qt_lfru_tick_locked();
+    int frozen=qt_frozen();
+    if(!frozen){
+        pthread_mutex_lock(&G.mx);
+        /* QT_UPLOAD_SYNC=1: everything enqueued so far is resident before this
+         * group is formed. Costs the upload/compute overlap, so it is for tests
+         * and diagnostics: the fake-backend engine test asserts on residency and
+         * hits after eight tokens, and on a two-vCPU runner the uploader thread
+         * did not get scheduled once before the run was over (0 uploads, 0 hits,
+         * six entries still queued). No group is open here, so the wait cannot
+         * meet a swap parked on issue_open. */
+        if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
+        if(G.th_stop){ pthread_mutex_unlock(&G.mx); return 0; }
+        if(layer==0) qt_lfru_tick_locked();
+    }
     G.issue_open=1;
     for(int k=0;k<K;k++){
         QSlot *s=qs(layer,eids[k]);
@@ -1474,7 +1507,7 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
             mask|=1u<<k; G.hits[di]++;
         } else G.miss++;
     }
-    pthread_mutex_unlock(&G.mx);
+    if(!frozen) pthread_mutex_unlock(&G.mx);
 
     for(int di=0;di<G.ndev;di++){
         int c=G.is_cnt[di];
@@ -1513,10 +1546,13 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
         }
         G.is_cnt[di]=0;
     }
-    pthread_mutex_lock(&G.mx);
+    int frozen=qt_frozen();
+    if(!frozen) pthread_mutex_lock(&G.mx);
     G.issue_open=0;
-    pthread_cond_broadcast(&G.cv_take);
-    pthread_mutex_unlock(&G.mx);
+    if(!frozen){
+        pthread_cond_broadcast(&G.cv_take);
+        pthread_mutex_unlock(&G.mx);
+    }
     return ok;
 }
 
@@ -1551,18 +1587,35 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
     /* xg/xu/xd: an extra always-resident pseudo expert with id G.ne (the shared
      * expert, from the dense trunk) that the caller routes as pair k = K-1 */
     int E=G.ne + (xg?1:0), D=G.D, NE=G.ne;
-    static double t_pre, t_gpu, t_post; static long t_n; double t0 = qt_now_ms();
+    static double t_pre, t_gpu, t_post; static long t_n;
+    static int prof=-1;
+    if(prof<0) prof=getenv("QT_BATCH_PROF")!=NULL;
+    double t0 = prof ? qt_now_ms() : 0;
     size_t pairs=(size_t)S*K;
-    int *cnt=calloc((size_t)E,sizeof(int)), *first=malloc((size_t)E*sizeof(int));
-    int *order=malloc(pairs*sizeof(int));          /* pair ids grouped by expert */
-    int *ex=malloc((size_t)E*sizeof(int)), nex=0;  /* distinct resident experts, first-seen order */
-    if(!cnt||!first||!order||!ex){ free(cnt); free(first); free(order); free(ex); return 0; }
+    int *cnt=qt_scratch(&G_batch_buf[0],S,(size_t)E*sizeof(int));
+    int *first=qt_scratch(&G_batch_buf[1],S,(size_t)E*sizeof(int));
+    int *order=qt_scratch(&G_batch_buf[2],S,pairs*sizeof(int)); /* pair ids grouped by expert */
+    int *ex=qt_scratch(&G_batch_buf[3],S,(size_t)E*sizeof(int)), nex=0; /* first-seen order */
+    int *fill=qt_scratch(&G_batch_buf[4],S,(size_t)E*sizeof(int));
+    if(!cnt||!first||!order||!ex||!fill){
+        qt_scratch_release(S,cnt); qt_scratch_release(S,first); qt_scratch_release(S,order);
+        qt_scratch_release(S,ex); qt_scratch_release(S,fill); return 0;
+    }
+    memset(cnt,0,(size_t)E*sizeof(int));
+    memset(fill,0,(size_t)E*sizeof(int));
     memset(done,0,pairs);
 
-    pthread_mutex_lock(&G.mx);
-    if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
-    if(G.th_stop){ pthread_mutex_unlock(&G.mx); free(cnt); free(first); free(order); free(ex); return 0; }
-    if(layer==0) for(int s=0;s<S;s++) qt_lfru_tick_locked();   /* one tick per token, as qt_issue */
+    int frozen=qt_frozen();
+    if(!frozen){
+        pthread_mutex_lock(&G.mx);
+        if(G_upload_sync) while(G.inflight>0 && !G.th_stop) wait_take_locked();
+        if(G.th_stop){
+            pthread_mutex_unlock(&G.mx);
+            qt_scratch_release(S,cnt); qt_scratch_release(S,first); qt_scratch_release(S,order);
+            qt_scratch_release(S,ex); qt_scratch_release(S,fill); return 0;
+        }
+        if(layer==0) for(int s=0;s<S;s++) qt_lfru_tick_locked();   /* one tick per token, as qt_issue */
+    }
     G.issue_open=1;
     for(size_t pi=0;pi<pairs;pi++){
         int e=eids[pi];
@@ -1573,18 +1626,17 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
     }
     /* counting sort of the resident pairs by expert, expert order = first seen */
     for(int j=0,o=0;j<nex;j++){ first[ex[j]]=o; o+=cnt[ex[j]]; }
-    int *fill=calloc((size_t)E,sizeof(int)); if(!fill){ G.issue_open=0; pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx); free(cnt); free(first); free(order); free(ex); return 0; }
     for(size_t pi=0;pi<pairs;pi++){
         int e=eids[pi];
         if(e>=0&&e<E&&cnt[e]&&(e==NE||qs(layer,e)->resident)) order[first[e]+fill[e]++]=(int)pi;
     }
     QtTensor *tg[QT_BATCH_GROUP],*tu[QT_BATCH_GROUP],*td[QT_BATCH_GROUP];
-    QtTensor **pg=malloc((size_t)(nex?nex:1)*3*sizeof(QtTensor*));
+    QtTensor **pg=qt_scratch(&G_batch_buf[5],S,(size_t)(nex?nex:1)*3*sizeof(QtTensor*));
     int ok=pg!=NULL;
     size_t total=0; for(int j=0;j<nex;j++) total+=(size_t)cnt[ex[j]];
-    float *xb=total&&!weights?malloc(total*(size_t)D*sizeof(float)):NULL;
-    float *yb=total&&!weights?malloc(total*(size_t)D*sizeof(float)):NULL;
-    int *allrows=weights&&nex>0?malloc((size_t)(unsigned)nex*sizeof(int)):NULL;
+    float *xb=total&&!weights?qt_scratch(&G_batch_buf[6],S,total*(size_t)D*sizeof(float)):NULL;
+    float *yb=total&&!weights?qt_scratch(&G_batch_buf[7],S,total*(size_t)D*sizeof(float)):NULL;
+    int *allrows=weights&&nex>0?qt_scratch(&G_batch_buf[8],S,(size_t)(unsigned)nex*sizeof(int)):NULL;
     if(total && (weights ? !allrows : (!xb||!yb))) ok=0;
     /* the group runs while the tier lock is released, as qt_issue does; issue_open
      * keeps the uploader from swapping a resident expert out underneath it */
@@ -1593,16 +1645,16 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
         else { QSlot *q=qs(layer,ex[j]); pg[j]=q->tg; pg[nex+j]=q->tu; pg[2*nex+j]=q->td; }
         if(allrows) allrows[j]=cnt[ex[j]];
     }
-    pthread_mutex_unlock(&G.mx);
+    if(!frozen) pthread_mutex_unlock(&G.mx);
 
-    double t1 = qt_now_ms();
+    double t1 = prof ? qt_now_ms() : 0;
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     if(ok && weights){
         if(nex) ok=coli_vk_expert_prefill(pg,pg+nex,pg+2*nex,allrows,nex,order,weights,S,K,x,res);
         else memset(res,0,(size_t)S*D*sizeof(float));
     }
 #endif
-    double t2 = qt_now_ms();
+    double t2 = prof ? qt_now_ms() : 0;
     for(int j0=0;ok&&!weights&&j0<nex;j0+=QT_BATCH_GROUP){
         int c=nex-j0<QT_BATCH_GROUP?nex-j0:QT_BATCH_GROUP, rows[QT_BATCH_GROUP];
         size_t r0=(size_t)first[ex[j0]], nr=0;
@@ -1621,15 +1673,21 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
         if(!weights) memcpy(res+(size_t)pi*D, yb+r*D, (size_t)D*sizeof(float));
         done[pi]=1;
     }
-    pthread_mutex_lock(&G.mx);
+    if(!frozen) pthread_mutex_lock(&G.mx);
     G.issue_open=0;
-    pthread_cond_broadcast(&G.cv_take);
-    pthread_mutex_unlock(&G.mx);
-    free(cnt); free(first); free(order); free(ex); free(fill); free(xb); free(yb); free(pg); free(allrows);
+    if(!frozen){
+        pthread_cond_broadcast(&G.cv_take);
+        pthread_mutex_unlock(&G.mx);
+    }
+    qt_scratch_release(S,cnt); qt_scratch_release(S,first); qt_scratch_release(S,order);
+    qt_scratch_release(S,ex); qt_scratch_release(S,fill); qt_scratch_release(S,xb);
+    qt_scratch_release(S,yb); qt_scratch_release(S,pg); qt_scratch_release(S,allrows);
     if(!ok){ memset(done,0,pairs); fprintf(stderr,"[qtier] prefill batch failed at layer %d\n",layer); }
-    t_pre += t1 - t0; t_gpu += t2 - t1; t_post += qt_now_ms() - t2;
-    if(getenv("QT_BATCH_PROF") && ++t_n % 40 == 0)
-        fprintf(stderr,"[qtier] batch prof (40 layers): prep %.1f | backend %.1f | post %.1f ms\n", t_pre, t_gpu, t_post);
+    if(prof){
+        t_pre += t1 - t0; t_gpu += t2 - t1; t_post += qt_now_ms() - t2;
+        if(++t_n % 40 == 0)
+            fprintf(stderr,"[qtier] batch prof (40 layers): prep %.1f | backend %.1f | post %.1f ms\n", t_pre, t_gpu, t_post);
+    }
     return ok;
 }
 
@@ -1646,8 +1704,9 @@ int qt_issue_batch_reduce_sh(int layer,const int *eids,int S,int K,const float *
     if(!weights || !sgate || hg<0 || hu<0 || hd<0 || hg>=G_dense_n || hu>=G_dense_n || hd>=G_dense_n ||
        !G_dense[hg].on || !G_dense[hu].on || !G_dense[hd].on) return 0;
     int K2=K+1;
-    int *e2=malloc((size_t)S*K2*sizeof(int)); float *w2=malloc((size_t)S*K2*sizeof(float));
-    uint8_t *d2=malloc((size_t)S*K2);
+    int *e2=qt_scratch(&G_fold_buf[0],S,(size_t)S*K2*sizeof(int));
+    float *w2=qt_scratch(&G_fold_buf[1],S,(size_t)S*K2*sizeof(float));
+    uint8_t *d2=qt_scratch(&G_fold_buf[2],S,(size_t)S*K2);
     int ok=e2&&w2&&d2;
     if(ok){
         for(int s=0;s<S;s++){
@@ -1661,7 +1720,7 @@ int qt_issue_batch_reduce_sh(int layer,const int *eids,int S,int K,const float *
             if(!d2[(size_t)s*K2+K]) ok=0;           /* shared expert must be in */
         }
     }
-    free(e2); free(w2); free(d2);
+    qt_scratch_release(S,e2); qt_scratch_release(S,w2); qt_scratch_release(S,d2);
     return ok;
 }
 /* Chained decode layer (Vulkan): the DeltaNet block's submit is held back and goes
@@ -1761,6 +1820,8 @@ static void dense_free_all(void){
 void qt_shutdown(void){
     dense_free_all();
     if(!G.on) return;
+    /* As before, shutdown requires the inference caller to be quiescent;
+     * qt_take may have been omitted, in which case is_cnt is drained below. */
     const char *hf=getenv("HEAT_FILE");
     if(hf){
         FILE *f=fopen(hf,"wb");
@@ -1775,7 +1836,11 @@ void qt_shutdown(void){
     /* Wake cv_take too: the uploader's LFRU victim wait (and qt_note_block /
      * qt_note_planned / qt_fill_wait, all waiting on the same condvar) would
      * otherwise never notice th_stop and pthread_join below would hang (#1340). */
-    pthread_mutex_lock(&G.mx); G.th_stop=1; pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take); pthread_mutex_unlock(&G.mx);
+    pthread_mutex_lock(&G.mx);
+    G.th_stop=1;
+    __atomic_store_n(&G.frozen,0,__ATOMIC_RELEASE);
+    pthread_cond_signal(&G.cv); pthread_cond_broadcast(&G.cv_take);
+    pthread_mutex_unlock(&G.mx);
     pthread_join(G.th,NULL);
     pthread_mutex_lock(&G.mx);
     while(G.waiters) pthread_cond_wait(&G.cv_take,&G.mx);
@@ -1794,6 +1859,10 @@ void qt_shutdown(void){
     free(G.ybuf); G.ybuf=NULL;
     free(G.fill_order); G.fill_order=NULL;
     free(G.heat0); G.heat0=NULL;
+    for(size_t i=0;i<sizeof G_batch_buf/sizeof G_batch_buf[0];i++) free(G_batch_buf[i].p);
+    for(size_t i=0;i<sizeof G_fold_buf/sizeof G_fold_buf[0];i++) free(G_fold_buf[i].p);
+    memset(G_batch_buf,0,sizeof G_batch_buf);
+    memset(G_fold_buf,0,sizeof G_fold_buf);
     pthread_cond_destroy(&G.cv_take);
     pthread_cond_destroy(&G.cv);
     pthread_mutex_destroy(&G.mx);

@@ -868,8 +868,8 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 static int g_timers = -1;
 static double g_tm_dec[6], g_tm_pre[6];   /* 0=deltanet 1=attention 2=moe_total 3=shared 4=router 5=lm_head */
 static long g_tm_dec_tokens = 0, g_tm_pre_tokens = 0;
-static double tm_now(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1e3 + ts.tv_nsec/1e6; }
 static int tm_on(void){ if(g_timers<0){ const char *e=getenv("COLI_TIMERS"); g_timers = (e && *e=='1'); } return g_timers; }
+static double tm_now(void){ if(!tm_on()) return 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1e3 + ts.tv_nsec/1e6; }
 double g_qt_iss=0, g_qt_cpu=0, g_qt_tak=0;   /* QTIER-Phasen (Decode) */
 double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec+norm, out */
 double g_dn_pf[4];                            /* the same split over prefill blocks (S > 1) */
@@ -880,6 +880,7 @@ double g_tm_step=0;                           /* step() total (decode) */
 static double g_xf_load=0, g_xf_run=0;        /* expert_ffn path: expert fetch (misses) vs compute, decode */
 static double g_tm_win_moe=0; static int g_tm_win_n=0;
 static void tm_add(int S, int idx, double ms){
+    if(!tm_on()) return;
     if(S==1){
         g_tm_dec[idx]+=ms;
         if(idx==2) g_tm_win_moe+=ms;
@@ -924,6 +925,30 @@ static void tm_report(void){
             g_tm_pre[2] - g_tm_pre[4] - g_moe_route_pf - g_moe_pf[0] - g_moe_pf[1] - g_moe_pf[2] - g_moe_pf[3]);
 }
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
+
+/* Small-row scratch, retained for the lifetime of the inference thread. Each
+ * call site owns separate slots: step -> layers -> mixer/moe -> matmul can be
+ * live together. TLS also keeps the pilot's matmul scratch separate. Large
+ * prefill allocations remain temporary; growing one slot cannot move another.
+ * Like falloc, this does NOT clear memory. Callers must initialize accumulators
+ * and masks on every use. A failed grow leaves the old cache intact. */
+typedef struct { void *p; size_t bytes; } DecodeScratch;
+static void *decode_alloc(DecodeScratch *b, int S, size_t bytes) {
+    if (!bytes) bytes = 1;
+    if (S > 4) return malloc(bytes);
+    if (bytes > b->bytes) {
+        void *p = realloc(b->p, bytes);
+        if (!p) return NULL;
+        b->p = p; b->bytes = bytes;
+    }
+    return b->p;
+}
+static float *decode_falloc(DecodeScratch *b, int S, int64_t n) {
+    float *p = decode_alloc(b, S, (size_t)n * sizeof(float));
+    if (!p) { fprintf(stderr, "OOM decode scratch %ld\n", (long)n); exit(1); }
+    return p;
+}
+static void decode_free(int S, void *p) { if (S > 4) free(p); }
 
 /* y[S,O] = x[S,I] @ W^T,  W is [O,I] row-major */
 /* f32 matmul with a vectorised reduction (omp simd over the input dimension):
@@ -1395,6 +1420,7 @@ static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) 
     }
 }
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
+    static _Thread_local DecodeScratch scratch[4];
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
@@ -1403,35 +1429,35 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
             /* integer dot: the activation rows to int8 once, then the K1b
              * grouped kernel (int4 planar) or the per-row int8 kernel */
             int ng = I / 64;
-            int8_t *xq = malloc((size_t)S * I);
-            float *sx = malloc((size_t)S * sizeof(float));
-            int32_t *xsg = w->q4 ? malloc((size_t)S * ng * sizeof(int32_t)) : NULL;
+            int8_t *xq = decode_alloc(&scratch[0], S, (size_t)S * I);
+            float *sx = decode_alloc(&scratch[1], S, (size_t)S * sizeof(float));
+            int32_t *xsg = w->q4 ? decode_alloc(&scratch[2], S, (size_t)S * ng * sizeof(int32_t)) : NULL;
             /* int4: activations to int8 per 64-group (one scale each) rather than per
              * row -- with the row scale the decode's CPU int4 matrices cost token-wise
              * PPL 7.64 -> 7.94 against the same weights on the GPU (f32 inputs).
              * COLI_DENSE_ACT_G64=0: per row as before. */
             static int act_g = -1;
             if (act_g < 0) { const char *e = getenv("COLI_DENSE_ACT_G64"); act_g = !(e && *e == '0'); }
-            float *sxg = w->q4 && act_g && I % 64 == 0 ? malloc((size_t)S * ng * sizeof(float)) : NULL;
+            float *sxg = w->q4 && act_g && I % 64 == 0 ? decode_alloc(&scratch[3], S, (size_t)S * ng * sizeof(float)) : NULL;
             if (sxg && xq && xsg) {
                 for (int s = 0; s < S; s++)
                     for (int g = 0; g < ng; g++)
                         sxg[(int64_t)s * ng + g] = dense_act_i8(x + (int64_t)s * I + g * 64, 64,
                                                                 xq + (int64_t)s * I + g * 64, xsg + (int64_t)s * ng + g);
                 matmul_i4p_grouped_idot_gx(y, xq, sxg, xsg, w->q4, w->sg, S, I, O, 64);
-                free(xq); free(sx); free(xsg); free(sxg);
+                decode_free(S, xq); decode_free(S, sx); decode_free(S, xsg); decode_free(S, sxg);
                 return;
             }
-            free(sxg);
+            decode_free(S, sxg);
             if (xq && sx && (!w->q4 || xsg)) {
                 for (int s = 0; s < S; s++)
                     sx[s] = dense_act_i8(x + (int64_t)s * I, I, xq + (int64_t)s * I, xsg ? xsg + (int64_t)s * ng : NULL);
                 if (w->q4) matmul_i4p_grouped_idot(y, xq, sx, xsg, w->q4, w->sg, S, I, O, 64);
                 else       matmul_q_idot(y, xq, sx, w->q, w->sc, S, I, O);
-                free(xq); free(sx); free(xsg);
+                decode_free(S, xq); decode_free(S, sx); decode_free(S, xsg);
                 return;
             }
-            free(xq); free(sx); free(xsg);      /* out of memory: the f32 path below */
+            decode_free(S, xq); decode_free(S, sx); decode_free(S, xsg); /* OOM: f32 path below */
         }
         if (S > 1 && dense_batch_on())
             matmul_q_batch(y, x, w->q, w->sc, S, I, O);
@@ -2380,6 +2406,7 @@ static void attn_core_few(float *ctx, const float *query, const float *K, const 
 }
 
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
+    static _Thread_local DecodeScratch scratch[7];
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, D = c->hidden;
     int kvd = c->k_head_dim;
@@ -2409,17 +2436,17 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         return;
     }
     qt_kv_cut(layer, pos_base);   /* this path writes rows pos_base.. into the host caches */
-    float *q = falloc((int64_t)S*q_out);
-    float *k = falloc((int64_t)S*kv_out);
-    float *vv= falloc((int64_t)S*kv_out);
+    float *q = decode_falloc(&scratch[0], S, (int64_t)S*q_out);
+    float *k = decode_falloc(&scratch[1], S, (int64_t)S*kv_out);
+    float *vv= decode_falloc(&scratch[2], S, (int64_t)S*kv_out);
     /* The projections the tier placed answer from VRAM for the whole batch,
      * with one backend call per matrix; unavailable handles use CPU matmul. */
     if (!qtd_batch(l->qth_q, q, x, S, D, q_out))   matmul_d(q, x, &l->q, S, D, q_out);
     if (!qtd_batch(l->qth_k, k, x, S, D, kv_out))  matmul_d(k, x, &l->k, S, D, kv_out);
     if (!qtd_batch(l->qth_v, vv, x, S, D, kv_out)) matmul_d(vv, x, &l->v, S, D, kv_out);
     /* split q into query (first hd) and gate (next gate_dim), both per head */
-    float *query = falloc((int64_t)S*H*hd);
-    float *gate  = falloc((int64_t)S*H*gate_dim);
+    float *query = decode_falloc(&scratch[3], S, (int64_t)S*H*hd);
+    float *gate  = decode_falloc(&scratch[4], S, (int64_t)S*H*gate_dim);
     /* parallel only for a block: a real branch instead of an if() clause, so
      * decode (S = 1) never enters an OpenMP region here */
     if (S > 1) {
@@ -2488,7 +2515,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     }
     if (tm_on() && S > 1) { double t = tm_now(); g_at_pf[0] += t - _a0; _a0 = t; }
     float scale = 1.f / sqrtf((float)hd);
-    float *ctx = falloc((int64_t)S*H*hd);
+    float *ctx = decode_falloc(&scratch[5], S, (int64_t)S*H*hd);
     /* A prefill block's attention core on the GPU (K/V were just written to the
      * caches above, so the keys 0 .. pos_base+S-1 are complete). */
     int gpu_core = kvd == hd && S > 1 && use_qt_ready_attn() &&
@@ -2525,7 +2552,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     }
     if (tm_on() && S > 1) { double t = tm_now(); g_at_pf[1] += t - _a0; _a0 = t; }
     /* apply attn_output_gate: attn_out *= sigmoid(gate) */
-    float *ag = falloc((int64_t)S*H*hd);
+    float *ag = decode_falloc(&scratch[6], S, (int64_t)S*H*hd);
     /* parallel only for a block: a real branch instead of an if() clause, so
      * decode (S = 1) never enters an OpenMP region here */
     if (S > 1) {
@@ -2544,7 +2571,8 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     }
     if (!qtd_batch(l->qth_o, out, ag, S, H*hd, D)) matmul_d(out, ag, &l->o, S, H*hd, D);
     if (tm_on() && S > 1) g_at_pf[2] += tm_now() - _a0;
-    free(q); free(k); free(vv); free(query); free(gate); free(ctx); free(ag);
+    decode_free(S, q); decode_free(S, k); decode_free(S, vv);
+    decode_free(S, query); decode_free(S, gate); decode_free(S, ctx); decode_free(S, ag);
 }
 
 /* Batch the CPU shared expert across prompt rows.  The three resident matrices
@@ -2570,6 +2598,7 @@ static int qwen_shared_batch_rows(int S, int D, int I) {
 
 static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
                                     float *out, float *g, float *u, float *hh) {
+    static _Thread_local DecodeScratch scratch[2];
     Cfg *c=&m->c; int D=c->hidden, I=c->shared_inter;
     int B=qwen_shared_batch_rows(S,D,I);
     double _ts=tm_now();
@@ -2586,8 +2615,8 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
             for(int d=0;d<D;d++)os[d]+=sgate*hh[d];
         }
     } else {
-        float *bg=falloc((int64_t)2*B*I), *bu=bg+(int64_t)B*I;
-        float *bh=falloc((int64_t)B*D);
+        float *bg=decode_falloc(&scratch[0],S,(int64_t)2*B*I), *bu=bg+(int64_t)B*I;
+        float *bh=decode_falloc(&scratch[1],S,(int64_t)B*D);
         for(int base=0;base<S;base+=B){
             int rows=S-base<B?S-base:B;
             matmul_d(bg,x+(int64_t)base*D,&l->sh_g,rows,D,I);
@@ -2602,7 +2631,7 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
                 for(int d=0;d<D;d++)os[d]+=sgate*hs[d];
             }
         }
-        free(bg);free(bh);
+        decode_free(S,bg);decode_free(S,bh);
     }
     tm_add(S,3,tm_now()-_ts);
 }
@@ -2618,17 +2647,19 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
  * did: out starts at zero and the kernel's rank-order sum is one fma per
  * element, so the three cuts produce the same bits. */
 static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
+    static _Thread_local DecodeScratch buf[6];
     Cfg *c = &m->c; int D = c->hidden, K = c->topk, F = c->inter;
     int cap = m->cache[layer].cap;
     int64_t gp = (int64_t)F * D / 2;
     int per = cap >= S * K ? S : 1;           /* tokens per run */
     int kper = cap >= K ? K : 1;              /* experts per run */
     int n = per * kper;
-    XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
-    const XfExpert **exp = malloc(sizeof(XfExpert *) * (size_t)n);
-    int *ridx = malloc(sizeof(int) * (size_t)n); float *rval = falloc(n);
-    float *tmp = kper < K ? falloc(D) : NULL;
-    void *scratch = malloc(xf_moe_scratch_bytes(per, kper, D, F));
+    XfExpert *ex = decode_alloc(&buf[0], S, sizeof(XfExpert) * (size_t)n);
+    const XfExpert **exp = decode_alloc(&buf[1], S, sizeof(XfExpert *) * (size_t)n);
+    int *ridx = decode_alloc(&buf[2], S, sizeof(int) * (size_t)n);
+    float *rval = decode_falloc(&buf[3], S, n);
+    float *tmp = kper < K ? decode_falloc(&buf[4], S, D) : NULL;
+    void *scratch = decode_alloc(&buf[5], S, xf_moe_scratch_bytes(per, kper, D, F));
     if (!ex || !exp || !ridx || !scratch) { fprintf(stderr, "OOM moe_xf_run\n"); exit(1); }
     int timed = tm_on() && S == 1;
     for (int s0 = 0; s0 < S; s0 += per) {
@@ -2652,7 +2683,8 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
             if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }
         }
     }
-    free(ex); free(exp); free(ridx); free(rval); free(tmp); free(scratch);
+    decode_free(S, ex); decode_free(S, exp); decode_free(S, ridx);
+    decode_free(S, rval); decode_free(S, tmp); decode_free(S, scratch);
 }
 
 /* ---------- CACHE_ROUTE: residency-aware top-K fill (docs/CACHE_ROUTE.md) ----------
@@ -2805,13 +2837,14 @@ static int moe_chain(Model *m, Layer *l, int layer, float *x, float *logits, flo
 }
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    static _Thread_local DecodeScratch scratch[17];
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *pre = g_moe_pre_logits; g_moe_pre_logits = NULL;
     if (qt_deferred()) {
         if (S == 1 && moe_chain(m, l, layer, x, pre, out)) return;
         qt_flush_deferred();   /* the block alone: logits and x/nrm are there after it */
     }
-    float *logits = pre ? pre : falloc((int64_t)S*E);
+    float *logits = pre ? pre : decode_falloc(&scratch[0], S, (int64_t)S*E);
     double _tr = tm_now();
     if (!pre && !(S >= qt_trunk_min_s() && l->qth_gate && qtd_batch(l->qth_gate, logits, x, S, D, E)))
         matmul_d(logits, x, &l->gate, S, D, E);
@@ -2820,12 +2853,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         for (int s = 0; s < S; s++) { float *pr = logits + (int64_t)s*E; for (int e = 0; e < E; e++) pr[e] += l->gate_bias[e]; }
     }
     memset(out, 0, (int64_t)S*D*sizeof(float));
-    float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
-    float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
+    float *g = decode_falloc(&scratch[1], S, I), *u = decode_falloc(&scratch[2], S, I);
+    float *hh = decode_falloc(&scratch[3], S, D);
+    float *sh = decode_falloc(&scratch[4], S, I), *shu = decode_falloc(&scratch[5], S, I);
+    float *shd = decode_falloc(&scratch[6], S, D);  /* shared expert scratch */
     int use_qt = qt_ready();
     int use_xf = !use_qt && xf_mode(m);
-    int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
-    float *xval = use_xf ? falloc((int64_t)S * K) : NULL;
+    int *xidx = use_xf ? decode_alloc(&scratch[7], S, sizeof(int) * (size_t)S * K) : NULL;
+    float *xval = use_xf ? decode_falloc(&scratch[8], S, (int64_t)S * K) : NULL;
     /* Tier prefill batch: collect the routing of all S tokens first, then send
      * each resident expert ONE group row block with all of its tokens
      * (qt_issue_batch) instead of one submit per token. */
@@ -2836,9 +2871,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     static int dec_batch = -1;
     if (dec_batch < 0) dec_batch = !(getenv("QWEN_DECODE_BATCH") && getenv("QWEN_DECODE_BATCH")[0] == '0');
     int use_qtb = use_qt && (S > 1 || dec_batch) && qt_batch_ok();
-    int *bidx = use_qtb ? malloc(sizeof(int) * (size_t)S * K) : NULL;
-    float *bval = use_qtb ? malloc(sizeof(float) * (size_t)S * K) : NULL;
-    if (use_qtb && (!bidx || !bval)) { free(bidx); free(bval); bidx = NULL; bval = NULL; use_qtb = 0; }  /* token by token */
+    int *bidx = use_qtb ? decode_alloc(&scratch[7], S, sizeof(int) * (size_t)S * K) : NULL;
+    float *bval = use_qtb ? decode_alloc(&scratch[8], S, sizeof(float) * (size_t)S * K) : NULL;
+    if (use_qtb && (!bidx || !bval)) { decode_free(S, bidx); decode_free(S, bval); bidx = NULL; bval = NULL; use_qtb = 0; }  /* token by token */
     /* Batch routing in parallel: softmax, group-limited top-k and renormalisation
      * per token are independent, so a prefill block routes all tokens at once,
      * each exactly as the loop below would; the shared bookkeeping (collected
@@ -2847,7 +2882,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * (EMA of the raw router logits for the pilot, on by default: SMOOTH=0.3) do
      * cross tokens but never feed back into the routing -> updated serially
      * first, in token order and before softmax_row overwrites the logits. */
-    int par_route = use_qtb && !g_cache_route && !g_route_agree && E <= 1024;
+    /* Small S=1 routing uses the identical serial softmax/top-k/renorm below. */
+    int par_route = (S > 1 || (int64_t)E * (K + c->topk_group) >= 25000) &&
+                    use_qtb && !g_cache_route && !g_route_agree && E <= 1024;
     double _rt0 = tm_now();
     if (par_route && m->momentum_logits && m->pilot_smooth > 0.f) {
         float *ema = m->momentum_logits + (int64_t)layer * E;
@@ -3034,47 +3071,60 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         extern double g_moe_pf[4];
         double _m0 = tm_now();
         {
-            uint32_t *uses = calloc((size_t)E, sizeof(uint32_t));
+            uint32_t *uses = decode_alloc(&scratch[9], S, (size_t)E * sizeof(uint32_t));
             if (uses) {
+                memset(uses, 0, (size_t)E * sizeof(uint32_t));
                 for (int i = 0; i < S * K; i++) if (bidx[i] >= 0 && bidx[i] < E) uses[bidx[i]]++;
                 for (int e = 0; e < E; e++) if (uses[e]) {
                     Slot *sl; expert_get(m, layer, e, &sl);
                     if (uses[e] > 1) { pthread_mutex_lock(&g_pilot_mx); m->hits += uses[e] - 1; pthread_mutex_unlock(&g_pilot_mx); }
                     tier_offer_slot_n(layer, e, sl, uses[e]);
                 }
-                free(uses);
+                decode_free(S, uses);
             } else {
                 for (int i = 0; i < S * K; i++) { Slot *sl; expert_get(m, layer, bidx[i], &sl); tier_offer_slot(layer, bidx[i], sl); }
             }
         }
         if (tm_on()) { double t = tm_now(); g_moe_pf[0] += t - _m0; _m0 = t; }
         int reduce = qt_batch_gpu_reduce();
-        float *res = malloc(sizeof(float) * (size_t)S * (reduce ? 1 : K) * D);
-        uint8_t *done = calloc((size_t)S * K, 1);
+        float *res = decode_alloc(&scratch[10], S, sizeof(float) * (size_t)S * (reduce ? 1 : K) * D);
+        uint8_t *done = decode_alloc(&scratch[11], S, (size_t)S * K);
         if (!done) { fprintf(stderr, "qwen36: out of memory in the prefill batch\n"); exit(1); }
+        memset(done, 0, (size_t)S * K);
         /* Shared expert folded into the same GPU submit as the routed experts
          * (pair K of every token, weight = its sigmoid gate) when it is GPU-placed:
          * no separate shared-expert round trips. QWEN_SHEXP_FOLD=0 keeps it apart. */
-        int fold = reduce && l->qth_shg && l->qth_shu && l->qth_shd && (S >= qt_trunk_min_s() || S <= 4) &&
-                   !(getenv("QWEN_SHEXP_FOLD") && getenv("QWEN_SHEXP_FOLD")[0] == '0');
+        static int fold_on = -1;
+        if (fold_on < 0) { const char *e = getenv("QWEN_SHEXP_FOLD"); fold_on = !(e && *e == '0'); }
+        int fold = reduce && l->qth_shg && l->qth_shu && l->qth_shd && (S >= qt_trunk_min_s() || S <= 4) && fold_on;
         int batch_ok = 0, folded = 0, direct = 0;
         if (fold && res) {
-            float *sg_all = falloc(S);
-            #pragma omp parallel for schedule(static)
-            for (int s = 0; s < S; s++) {
+            float *sg_all = decode_falloc(&scratch[12], S, S);
+            if (S > 1 || D >= 25000) {
+                #pragma omp parallel for schedule(static)
+                for (int s = 0; s < S; s++) {
+                    float sgate = 1.f;
+                    if (l->sh_gate) {
+                        float sg = 0.f; const float *wg = l->sh_gate, *xs = x + (int64_t)s*D;
+                        for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
+                        sgate = 1.f / (1.f + expf(-sg));
+                    }
+                    sg_all[s] = sgate;
+                }
+            } else {
                 float sgate = 1.f;
                 if (l->sh_gate) {
-                    float sg = 0.f; const float *wg = l->sh_gate, *xs = x + (int64_t)s*D;
+                    float sg = 0.f; const float *wg = l->sh_gate, *xs = x;
                     for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
                     sgate = 1.f / (1.f + expf(-sg));
                 }
-                sg_all[s] = sgate;
+                sg_all[0] = sgate;
             }
             /* the folded GPU sum per token IS the layer output when no pair missed:
              * written straight into out (zeroed above: 0 + v == v), no accumulate */
             batch_ok = folded = qt_issue_batch_reduce_sh(layer, bidx, S, K, x, bval, l->qth_shg - 1,
                                                          l->qth_shu - 1, l->qth_shd - 1, sg_all, out, done);
-            free(sg_all);
+            decode_free(S, sg_all);
             if (folded) {
                 int miss = 0;
                 for (int i = 0; i < S * K && !miss; i++) miss = !done[i];
@@ -3094,26 +3144,42 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         int Ish = c->shared_inter;
         float *shb = NULL, *sgb = NULL;
         if (!folded && l->qth_shg && l->qth_shu && l->qth_shd && S >= qt_trunk_min_s()) {
-            float *hg = falloc((int64_t)S * Ish), *hu = falloc((int64_t)S * Ish);
-            shb = falloc((int64_t)S * D); sgb = falloc(S);
+            float *hg = decode_falloc(&scratch[13], S, (int64_t)S * Ish);
+            float *hu = decode_falloc(&scratch[14], S, (int64_t)S * Ish);
+            shb = decode_falloc(&scratch[15], S, (int64_t)S * D);
+            sgb = decode_falloc(&scratch[16], S, S);
             double _ts2 = tm_now();
             if (!qtd_batch(l->qth_shg, hg, x, S, D, Ish)) matmul_d(hg, x, &l->sh_g, S, D, Ish);
             if (!qtd_batch(l->qth_shu, hu, x, S, D, Ish)) matmul_d(hu, x, &l->sh_u, S, D, Ish);
-            #pragma omp parallel for schedule(static)
-            for (int64_t i = 0; i < (int64_t)S * Ish; i++) { float sv = hg[i]; hg[i] = (sv / (1.f + expf(-sv))) * hu[i]; }
+            if (S > 1 || Ish >= 8000) {
+                #pragma omp parallel for schedule(static)
+                for (int64_t i = 0; i < (int64_t)S * Ish; i++) { float sv = hg[i]; hg[i] = (sv / (1.f + expf(-sv))) * hu[i]; }
+            } else {
+                for (int64_t i = 0; i < (int64_t)S * Ish; i++) { float sv = hg[i]; hg[i] = (sv / (1.f + expf(-sv))) * hu[i]; }
+            }
             if (!qtd_batch(l->qth_shd, shb, hg, S, Ish, D)) matmul_d(shb, hg, &l->sh_d, S, Ish, D);
-            #pragma omp parallel for schedule(static)
-            for (int s = 0; s < S; s++) {
+            if (S > 1 || D >= 25000) {
+                #pragma omp parallel for schedule(static)
+                for (int s = 0; s < S; s++) {
+                    float sgate = 1.f;
+                    if (l->sh_gate) {
+                        float sg = 0.f; const float *wg = l->sh_gate, *xs = x + (int64_t)s*D;
+                        for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
+                        sgate = 1.f / (1.f + expf(-sg));
+                    }
+                    sgb[s] = sgate;
+                }
+            } else {
                 float sgate = 1.f;
                 if (l->sh_gate) {
-                    float sg = 0.f; const float *wg = l->sh_gate, *xs = x + (int64_t)s*D;
+                    float sg = 0.f; const float *wg = l->sh_gate, *xs = x;
                     for (int i = 0; i < D; i++) sg += xs[i] * wg[i];
                     sgate = 1.f / (1.f + expf(-sg));
                 }
-                sgb[s] = sgate;
+                sgb[0] = sgate;
             }
             tm_add(S, 3, tm_now()-_ts2);
-            free(hg); free(hu);
+            decode_free(S, hg); decode_free(S, hu);
         }
         if (tm_on()) { double t = tm_now(); g_moe_pf[2] += t - _m0; _m0 = t; }
         /* Per-token sums in their fixed order. Tokens are independent, but a CPU
@@ -3129,7 +3195,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
          * active levels only); lost worker reuse under the extra level is the
          * likelier cause. */
         if (direct) { /* out already holds every token's sum */ }
-        else if (!any_miss && (shb || folded)) {
+        else if ((S > 1 || ((int64_t)K + 2) * D >= 25000) && !any_miss && (shb || folded)) {
             #pragma omp parallel for schedule(static)
             for (int s = 0; s < S; s++) {
                 const float *xs = x + (int64_t)s*D; float *os = out + (int64_t)s*D;
@@ -3166,15 +3232,17 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
         if (tm_on()) { g_moe_pf[3] += tm_now() - _m0; }
-        free(res); free(done); free(bidx); free(bval); free(shb); free(sgb);
+        decode_free(S, res); decode_free(S, done); decode_free(S, bidx);
+        decode_free(S, bval); decode_free(S, shb); decode_free(S, sgb);
     }
-    if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
+    if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); decode_free(S, xidx); decode_free(S, xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
      * once per bounded chunk. */
     if (!use_qt) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
-    if (!pre) free(logits);
-    free(g); free(u); free(hh); free(sh); free(shu); free(shd);
+    if (!pre) decode_free(S, logits);
+    decode_free(S, g); decode_free(S, u); decode_free(S, hh);
+    decode_free(S, sh); decode_free(S, shu); decode_free(S, shd);
 }
 
 /* Gated DeltaNet (linear_attention) forward — recurrent gated-delta-rule.
@@ -3214,6 +3282,7 @@ static float *g_step_hid, *g_step_logits;
 static float **g_dn_cap_rec, **g_dn_cap_ring;
 static int g_dn_cap_after = -1, g_dn_cap_n;
 static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, float *out) {
+    static _Thread_local DecodeScratch scratch[10];
     Cfg *c = &m->c;
     int vh = c->dn_vheads, vk = c->dn_kheads, kdim = c->dn_kdim, vdim = c->dn_vdim;
     int convk = c->dn_convk, conv_dim = c->dn_conv_dim;
@@ -3230,7 +3299,8 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
      * state stays on the GPU between tokens (qt_dn_resident) */
     if (l->qth_dnout && qt_dnproj_ready(layer) && (S >= qt_trunk_min_s() || (S <= 4 && qt_dn_resident(-1))) &&
         !(getenv("QWEN_DN_BLOCK") && getenv("QWEN_DN_BLOCK")[0] == '0')) {
-        float *ba = falloc((int64_t)S * 2 * vh), *par = falloc(2 * vh);
+        float *ba = decode_falloc(&scratch[0], S, (int64_t)S * 2 * vh);
+        float *par = decode_falloc(&scratch[1], S, 2 * vh);
         double _tb = tm_now();
         /* b | a: on the GPU inside the block when it can (dn_ba.comp, f32 like
          * here; QWEN_DN_BA_GPU=0 keeps them on the CPU) */
@@ -3257,7 +3327,7 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
         int ok = qt_dn_block(layer, l->qth_dnout - 1, x, ba_gpu ? NULL : ba, l->dn_b, l->dn_a, l->dn_conv, par, l->dn_norm,
                              m->DN_conv[layer], m->DN_rec[layer], S, H, conv_dim, convk,
                              vh, vk, kdim, vdim, c->eps, scale, out, cap);
-        free(ba); free(par);
+        decode_free(S, ba); decode_free(S, par);
         if (ok) {
             if (cap >= 0) g_dn_cap_n++;
             if (tm_on()) { if (S <= 4) g_dn_sub[0] += tm_now() - _d0; else g_dn_pf[0] += tm_now() - _d0;   /* decode: whole block counted as "proj" */ }
@@ -3266,12 +3336,14 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
     }
     qt_dn_sync(layer);   /* the CPU phases below need the host copy of state and ring */
     /* 1. projections of every token */
-    float *qkv = falloc((int64_t)S * conv_dim), *z = falloc((int64_t)S * value_dim);
-    float *b = falloc((int64_t)S * vh), *a = falloc((int64_t)S * vh);
+    float *qkv = decode_falloc(&scratch[2], S, (int64_t)S * conv_dim);
+    float *z = decode_falloc(&scratch[3], S, (int64_t)S * value_dim);
+    float *b = decode_falloc(&scratch[4], S, (int64_t)S * vh);
+    float *a = decode_falloc(&scratch[5], S, (int64_t)S * vh);
     if (qt_dnproj_ready(layer)) {
         /* whole-prompt blocks (up to 2048 rows): the GPU only wins on large ones */
         int B = S < 2048 ? S : 2048;
-        float *qkvz = falloc((int64_t)B * proj_dim);
+        float *qkvz = decode_falloc(&scratch[6], S, (int64_t)B * proj_dim);
         for (int s0 = 0; s0 < S; s0 += B) {
             int rows = S - s0 < B ? S - s0 : B;
             if (qt_dnproj_matmul_batch(layer, qkvz, x + (int64_t)s0 * H, rows, H, proj_dim)) {
@@ -3284,7 +3356,7 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
                 matmul_d(z + (int64_t)s0 * value_dim, x + (int64_t)s0 * H, &l->dn_z, rows, H, value_dim);
             }
         }
-        free(qkvz);
+        decode_free(S, qkvz);
     } else {
         matmul_d(qkv, x, &l->dn_qkv, S, H, conv_dim);
         matmul_d(z, x, &l->dn_z, S, H, value_dim);
@@ -3297,7 +3369,7 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
      * input convk-1-kk tokens back -- so every token is independent and the rows
      * run in parallel, channels contiguous. Same sum order as the token loop:
      * ring slots oldest first, then the current input. */
-    float *conv = falloc((int64_t)S * conv_dim);
+    float *conv = decode_falloc(&scratch[7], S, (int64_t)S * conv_dim);
     float *ring = m->DN_conv[layer];    /* [conv_dim*(convk-1)] */
     #pragma omp parallel for schedule(static)
     for (int s = 0; s < S; s++) {
@@ -3342,7 +3414,7 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
     if (tm_on()) { double t = tm_now(); g_dn_pf[1] += t - _d0; _d0 = t; }
     /* 3. per value head over the block: l2norm of q/k (key head h/rep, as
      * repeat_interleave), then the gated delta rule on the carried state */
-    float *outv = falloc((int64_t)S * value_dim);
+    float *outv = decode_falloc(&scratch[8], S, (int64_t)S * value_dim);
     float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
     /* GPU: normalised q/k per key head, compact v, beta and exp(g) written in
      * place into the backend's staging buffers, then one dispatch over the block
@@ -3429,7 +3501,7 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
     }
     if (tm_on()) { double t = tm_now(); g_dn_pf[2] += t - _d0; _d0 = t; }
     /* 4. gated RMSNorm (silu(z) gate) of every row, then one out_proj */
-    float *outr = falloc((int64_t)S * value_dim);
+    float *outr = decode_falloc(&scratch[9], S, (int64_t)S * value_dim);
     #pragma omp parallel for schedule(static)
     for (int sh = 0; sh < S * vh; sh++) {
         int s = sh / vh, h = sh % vh;
@@ -3447,14 +3519,19 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
     if (!qtd_batch(l->qth_dnout, out, outr, S, value_dim, H))
         matmul_d(out, outr, &l->dn_out, S, value_dim, H);
     if (tm_on()) { g_dn_pf[3] += tm_now() - _d0; }
-    free(qkv); free(z); free(b); free(a); free(conv); free(outv); free(outr);
+    decode_free(S, qkv); decode_free(S, z); decode_free(S, b); decode_free(S, a);
+    decode_free(S, conv); decode_free(S, outv); decode_free(S, outr);
 }
 
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
+    static _Thread_local DecodeScratch scratch[11];
+    static int tokenwise = -1, dbg_init;
+    static const char *dbg_path;
+    if (!dbg_init) { dbg_path = getenv("DN_DBG"); dbg_init = 1; }
+    if (tokenwise < 0) { const char *e = getenv("QWEN_DN_TOKENWISE"); tokenwise = e && *e == '1'; }
     (void)pos_base;
     Cfg *c = &m->c;
-    int tokw = getenv("DN_DBG") || (getenv("QWEN_DN_TOKENWISE") && getenv("QWEN_DN_TOKENWISE")[0] == '1');
-    if ((S > 1 || (qt_dn_resident(-1) && l->qth_dnout && qt_dnproj_ready(layer))) && c->dn_convk <= 17 && !tokw) {
+    if ((S > 1 || (qt_dn_resident(-1) && l->qth_dnout && qt_dnproj_ready(layer))) && c->dn_convk <= 17 && !dbg_path && !tokenwise) {
         deltanet_phased(m, l, layer, x, S, out);
         return;
     }
@@ -3471,19 +3548,17 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
      * bounded block, then consume rows in order through conv and recurrence. */
     int proj_dim = conv_dim + value_dim;
     int B = qt_dnproj_ready(layer) ? dnproj_batch_rows(S, H, proj_dim) : 1;
-    float *qkvz = falloc((int64_t)B * proj_dim);
+    float *qkvz = decode_falloc(&scratch[0], S, (int64_t)B * proj_dim);
     int gpu_block = 0;
-    float *b   = falloc(vh);
-    float *a   = falloc(vh);
-    float *beta= falloc(vh);
-    float *gg  = falloc(vh);
-    float *conv_out = falloc(conv_dim);
-    float *q = falloc(vh * kdim);
-    float *k = falloc(vh * kdim);
-    float *outv = falloc(value_dim);
-    float *outr = falloc(value_dim);
-    float *kv = falloc(vdim);
-    float *delta = falloc(vdim);
+    float *b   = decode_falloc(&scratch[1], S, vh);
+    float *a   = decode_falloc(&scratch[2], S, vh);
+    float *beta= decode_falloc(&scratch[3], S, vh);
+    float *gg  = decode_falloc(&scratch[4], S, vh);
+    float *conv_out = decode_falloc(&scratch[5], S, conv_dim);
+    float *q = decode_falloc(&scratch[6], S, vh * kdim);
+    float *k = decode_falloc(&scratch[7], S, vh * kdim);
+    float *outv = decode_falloc(&scratch[8], S, value_dim);
+    float *outr = decode_falloc(&scratch[9], S, value_dim);
 
     float *rec = m->DN_rec[layer];      /* [vh*kdim*vdim] */
     float *ring = m->DN_conv[layer];    /* [conv_dim*(convk-1)] */
@@ -3491,7 +3566,7 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
      * prefill block collects every token's gated-norm row and projects them
      * in ONE batched call after the loop instead of one GEMV per token. */
     int dnout_batch = l->qth_dnout && S >= qt_trunk_min_s() && S > 1;
-    float *outr_all = dnout_batch ? falloc((int64_t)S * value_dim) : NULL;
+    float *outr_all = dnout_batch ? decode_falloc(&scratch[10], S, (int64_t)S * value_dim) : NULL;
 
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s * H;
@@ -3609,8 +3684,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
         else if (!qtd(l->qth_dnout, out + (int64_t)s * H, outr, value_dim, H))
             matmul_d(out + (int64_t)s * H, outr, &l->dn_out, 1, value_dim, H);
         if (tm_on()){ if (S==1) g_dn_sub[3]+=tm_now()-_d0; else g_dn_pf[3]+=tm_now()-_d0; }
-        if (layer == 0 && s == 0 && getenv("DN_DBG")) {
-            FILE *dbg = fopen(getenv("DN_DBG"), "wb");
+        if (layer == 0 && s == 0 && dbg_path) {
+            FILE *dbg = fopen(dbg_path, "wb");
             if (dbg) {
                 fwrite(conv_out, sizeof(float), conv_dim, dbg);
                 fwrite(q, sizeof(float), (int64_t)vh * kdim, dbg);
@@ -3629,11 +3704,12 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     if (dnout_batch) {
         if (!qtd_batch(l->qth_dnout, out, outr_all, S, value_dim, H))
             matmul_d(out, outr_all, &l->dn_out, S, value_dim, H);
-        free(outr_all);
+        decode_free(S, outr_all);
     }
-    free(qkvz);   /* qkv and z are regions of this one allocation */
-    free(b); free(a); free(beta); free(gg);
-    free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
+    decode_free(S, qkvz);   /* qkv and z are regions of this one allocation */
+    decode_free(S, b); decode_free(S, a); decode_free(S, beta); decode_free(S, gg);
+    decode_free(S, conv_out); decode_free(S, q); decode_free(S, k);
+    decode_free(S, outv); decode_free(S, outr);
 }
 
 /* The rest of the dense trunk, offered to the placer by name and layer with
@@ -3765,6 +3841,7 @@ static int trunk_probe_gpu_wins(Model *m){
 static void layers_forward_range(Model *m, float *x, int S, int pos_base,
                                  int layer_begin, int layer_end,
                                  int allow_prefetch, FILE *lf) {
+    static _Thread_local DecodeScratch scratch[2];
     Cfg *c = &m->c;
     int D = c->hidden;
     /* a prefill block on the GPU keeps its normed rows and sublayer outputs in the
@@ -3786,7 +3863,10 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         tmp = qt_host_arena(1, sizeof(float) * (size_t)S * D);
         if (!nrm || !tmp) arena = 0;
     }
-    if (!arena) { nrm = falloc((int64_t)S*D); tmp = falloc((int64_t)S*D); }
+    if (!arena) {
+        nrm = decode_falloc(&scratch[0], S, (int64_t)S*D);
+        tmp = decode_falloc(&scratch[1], S, (int64_t)S*D);
+    }
     /* prefill blocks fuse each residual add with the RMSNorm that follows it
      * (post_ln after the mixer, the next layer's in_ln after the MoE): one
      * parallel pass per token row instead of two, same operations per element.
@@ -3903,7 +3983,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
             pilot_prefetch(m, i + 3, x, S);
     }
     if (x != xcaller) memcpy(xcaller, x, sizeof(float) * (size_t)S * D);
-    if (!arena) { free(nrm); free(tmp); }
+    if (!arena) { decode_free(S, nrm); decode_free(S, tmp); }
 }
 
 /* Fotografia dello stato dopo un prefill "pinnato" (SUBMIT pin=1).
@@ -3951,6 +4031,7 @@ static void serve_echo(const char *id, int pos, int token, const float *lo, int 
 static int g_pa_on, g_pa_from; static double g_pa_nll; static long g_pa_n;
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
+    static _Thread_local DecodeScratch scratch[3];
     Cfg *c = &m->c; int D = c->hidden;
     /* A long prompt goes through in blocks of at most QWEN_PREFILL_CHUNK tokens
      * (0 = off).  The GPU expert group dispatches one workgroup row per
@@ -3979,7 +4060,8 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         memset(m->is_queued, 0, (size_t)c->n_layers * c->n_experts);
         pthread_mutex_unlock(&g_pilot_mx);
     }
-    float *x = falloc((int64_t)S*D);
+    /* Chunk recursion above returns before this invocation takes any scratch. */
+    float *x = decode_falloc(&scratch[0], S, (int64_t)S*D);
     for (int s = 0; s < S; s++) {
         /* The gather indexes embed by token id, so an id outside the vocabulary
          * reads off the end. Ids reach here from the tokenizer, from a serve
@@ -4044,7 +4126,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     int all_done = 0;
     if (g_step_logits) {
         /* every row's logits; on the GPU in one call (the head read once for all rows) */
-        float *hr = falloc((int64_t)S*D);
+        float *hr = decode_falloc(&scratch[1], S, (int64_t)S*D);
         for (int s = 0; s < S; s++) rmsnorm_row(hr + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
         all_done = qt_lmhead_matmul_batch(g_step_logits, hr, S, D, c->vocab);
         if (!all_done)
@@ -4052,9 +4134,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
                 float *ls = g_step_logits + (int64_t)s * c->vocab;
                 if (!qt_lmhead_matmul(ls, hr + (int64_t)s*D, D, c->vocab)) matmul_d(ls, hr + (int64_t)s*D, &m->lm_head, 1, D, c->vocab);
             }
-        free(hr);
+        decode_free(S, hr);
     }
-    float *last = falloc(D);
+    float *last = decode_falloc(&scratch[2], S, D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
     double _th = tm_now();
@@ -4062,7 +4144,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     else if (!qt_lmhead_matmul(logit, last, D, c->vocab))
         matmul_d(logit, last, &m->lm_head, 1, D, c->vocab);
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
-    free(x); free(last);
+    decode_free(S, x); decode_free(S, last);
     if (lf) fclose(lf);
     if (m->resident_collecting) {
         int prefill_end = m->first_step;
