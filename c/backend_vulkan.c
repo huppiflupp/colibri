@@ -346,10 +346,15 @@ static int mr_use(int fmt, int S, int I, int O) {
 /* Pipeline and grid of a tiled dispatch (coop_use said yes): the second-generation
  * tiles when the output dimension fits their 128-row blocks, else the first. */
 static VkPipeline coop_pick(int gate_up, int S, int O, uint32_t *gx, uint32_t *gy) {
-    if (G.coop2 && G.sgsize == 64 && O % 128 == 0) {   /* gen 2 hard-codes 4 x wave64 */
+    /* COLI_VK_GU64=1: gate_up shader with 64-output blocks (gate + up of the same 64
+     * outputs share one 128-row tile; experiment) */
+    static int gu64 = -1;
+    if (gu64 < 0) { const char *e = getenv("COLI_VK_GU64"); gu64 = e && *e == '1'; }
+    int bo = gate_up && gu64 ? 64 : 128;
+    if (G.coop2 && G.sgsize == 64 && O % bo == 0) {   /* gen 2 hard-codes 4 x wave64 */
         int v = S >= G.coop2_split;
         int tm = 16 * G.coop2_tt[v];
-        *gx = (uint32_t)((S + tm - 1) / tm); *gy = (uint32_t)(O / 128);
+        *gx = (uint32_t)((S + tm - 1) / tm); *gy = (uint32_t)(O / bo);
         return gate_up ? G.pipe_gu_co2[v] : G.pipe_co2[v];
     }
     int tm = 16 * G.coop_tt;
