@@ -3932,8 +3932,8 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         } else {
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         }
-        static int graph_attn = -1;   /* QWEN_DEC_GRAPH_ATTN=1: attention layers join the graph (the whole token, one submit) */
-        if (graph_attn < 0) graph_attn = getenv("QWEN_DEC_GRAPH_ATTN") && getenv("QWEN_DEC_GRAPH_ATTN")[0] == '1';
+        static int graph_attn = -1;   /* attention layers join the graph: the whole token, one submit (QWEN_DEC_GRAPH_ATTN=0 off) */
+        if (graph_attn < 0) graph_attn = !(getenv("QWEN_DEC_GRAPH_ATTN") && getenv("QWEN_DEC_GRAPH_ATTN")[0] == '0');
         if (dec_graph && tail && S == 1 && (!c->is_attn[i] || graph_attn)) {
             int ls[64], n = 0;
             for (int j = i; j < layer_end && n < 64; j++) {

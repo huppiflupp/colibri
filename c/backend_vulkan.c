@@ -140,7 +140,7 @@ static struct {
      * submitted together with the layer's expert group, which routes on the GPU first */
     VkShaderModule shader_mrt; VkDescriptorSetLayout dsl_mr; VkPipelineLayout plyt_mr;
     VkPipeline pipe_mr_route; VkDescriptorPool dpool_mr; VkDescriptorSet dset_mr;
-    int defer_next, deferred, attn_dec_on;
+    int defer_next, deferred, attn_dec_on, ad2;
     struct { int pending, E, K, D, has_sg, layer; const float *logits, *nrm, *wsg; } route;
     int sgsize;
     int has_bda;         /* bufferDeviceAddress on: buffers usable by address (grouped expert shader) */
@@ -1079,8 +1079,12 @@ int coli_vk_init(const char *spv_path) {
          * than the CPU core: int4 48.3 -> 45.0 tok/s short, 39.2 -> 33.1 at 10k context) */
         G.attn_dec_on = getenv("COLI_VK_ATTN_DEC") && getenv("COLI_VK_ATTN_DEC")[0] == '1';
         { char pd[512];
-          derive_dir_file(spv_path, "attn_dec.spv", pd, sizeof(pd)); G.shader_ad = load_spv(G.dev, pd);
-          derive_dir_file(spv_path, "attn_dec_merge.spv", pd, sizeof(pd)); G.shader_adm = load_spv(G.dev, pd);
+          /* COLI_VK_AD2 (default 1): second core (Codex): a wave per key chunk, q and sums in
+           * registers, subgroup dot products; 0 = the first (LDS-tiled) core */
+          G.ad2 = !(getenv("COLI_VK_AD2") && getenv("COLI_VK_AD2")[0] == '0');
+          derive_dir_file(spv_path, G.ad2 ? "attn_dec2.spv" : "attn_dec.spv", pd, sizeof(pd)); G.shader_ad = load_spv(G.dev, pd);
+          if (!G.shader_ad && G.ad2) { G.ad2 = 0; derive_dir_file(spv_path, "attn_dec.spv", pd, sizeof(pd)); G.shader_ad = load_spv(G.dev, pd); }
+          derive_dir_file(spv_path, G.ad2 ? "attn_dec2_merge.spv" : "attn_dec_merge.spv", pd, sizeof(pd)); G.shader_adm = load_spv(G.dev, pd);
           if (!G.shader_ad || !G.shader_adm ||
               !build_pipeline(G.dev, 4, sizeof(struct PCAD), G.shader_ad, &G.dsl_ad, &G.plyt_ad, &G.pipe_ad, &G.dpool_ad, &G.dset_ad) ||
               !build_pipeline(G.dev, 2, sizeof(struct PCAD), G.shader_adm, &G.dsl_adm, &G.plyt_adm, &G.pipe_adm, &G.dpool_adm, &G.dset_adm))
@@ -2432,7 +2436,9 @@ int coli_vk_dec_record(const ColiDecLayer *d) {
         if (!scratch_reserve(&T->anw, (size_t)2 * hd * f)) return 0;
         { float *nw = T->anw.ptr; for (int i = 0; i < hd; i++) { nw[i] = d->qn ? d->qn[i] : 0.f; nw[hd + i] = d->kn ? d->kn[i] : 0.f; } }
         int want = 80 / KVh; if (want < 1) want = 1;
-        ad_chunk = (pos + 1 + want - 1) / want; if (ad_chunk < 32) ad_chunk = 32; ad_chunk = (ad_chunk + 31) & ~31;   /* measured 32 > 64 > 128 at short context */
+        if (G.ad2) {   /* second core: ~80 workgroups, at most 256 keys a wave (Codex's rule) */
+            ad_chunk = (pos + 1 + want - 1) / want; if (ad_chunk < 1) ad_chunk = 1; if (ad_chunk > 256) ad_chunk = 256;
+        } else { ad_chunk = (pos + 1 + want - 1) / want; if (ad_chunk < 32) ad_chunk = 32; ad_chunk = (ad_chunk + 31) & ~31; }   /* first core: measured 32 > 64 > 128 */
         { const char *e = getenv("COLI_VK_AD_CHUNK"); if (e && atoi(e) > 0) ad_chunk = atoi(e); }
         ad_nch = (pos + 1 + ad_chunk - 1) / ad_chunk;
         if (!scratch_reserve(&g_dec.qkv, nq + 2 * nk) || !scratch_reserve(&g_dec.qb, nqb) || !scratch_reserve(&g_dec.gb, nqb) ||

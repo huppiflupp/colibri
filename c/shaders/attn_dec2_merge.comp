@@ -1,0 +1,85 @@
+#version 450
+// Parallel merge for attn_dec2 / attn_dec. Same bindings, push constants,
+// part layout and dispatch (KV*R, 1, 1) as attn_dec_merge.comp.
+// Requires four full wave64 subgroups, finite nonempty partial states, and
+// 1 <= hd <= 256. Empty states are m=-inf, l=0, o=0.
+// Caller provides a compute-write -> compute-read barrier between passes.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer I  { float part[]; };
+layout(std430, binding = 1) writeonly buffer O { float ctx[]; };
+layout(push_constant) uniform P { int S, H, KV, hd, pos_base, ldt, nch, chunk; float scale; } p;
+
+// 5152 bytes of LDS, independent of nch. Each wave sums every fourth chunk.
+shared float maxima[4], sums[4], weights[256], numerators[4 * 256];
+
+vec4 load_o(int base, int d) {
+    if (d + 3 < p.hd)
+        return vec4(part[base+d], part[base+d+1], part[base+d+2], part[base+d+3]);
+    vec4 v = vec4(0.0);
+    if (d     < p.hd) v.x = part[base+d];
+    if (d + 1 < p.hd) v.y = part[base+d+1];
+    if (d + 2 < p.hd) v.z = part[base+d+2];
+    return v;
+}
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x), wave = int(gl_SubgroupID);
+    int lane = int(gl_SubgroupInvocationID), d = 4 * lane;
+    int row = int(gl_WorkGroupID.x), qpk = p.H / p.KV, R = p.S * qpk;
+    int g = row / R, r = row % R, N = p.KV * p.nch * R;
+    int base = g * p.nch * R + r;
+
+    float m = -1.0 / 0.0;
+    for (int c = tid; c < p.nch; c += 256) {
+        int ix = base + c * R;
+        if (part[N + ix] > 0.0) m = max(m, part[ix]);
+    }
+    m = subgroupMax(m);
+    if (lane == 0) maxima[wave] = m;
+    barrier();
+    float M = max(max(maxima[0], maxima[1]), max(maxima[2], maxima[3]));
+
+    vec4 num = vec4(0.0);
+    float den = 0.0;
+    for (int c0 = 0; c0 < p.nch; c0 += 256) {
+        int nc = min(256, p.nch - c0);
+        float w = 0.0;
+        if (tid < nc) {
+            int ix = base + (c0 + tid) * R;
+            float l = part[N + ix];
+            if (l > 0.0) {
+                w = exp(part[ix] - M);
+                den += l * w;
+            }
+        }
+        weights[tid] = w;
+        barrier();
+        for (int j = wave; j < nc; j += 4) {
+            float a = weights[j];
+            // All-empty tiles never read o or evaluate an invalid exp.
+            if (a > 0.0) {
+                int ix = base + (c0 + j) * R;
+                num = fma(vec4(a), load_o(2 * N + ix * p.hd, d), num);
+            }
+        }
+        barrier(); // All four waves have consumed weights before reuse.
+    }
+
+    den = subgroupAdd(den);
+    if (lane == 0) sums[wave] = den;
+    numerators[wave * 256 + d]     = num.x;
+    numerators[wave * 256 + d + 1] = num.y;
+    numerators[wave * 256 + d + 2] = num.z;
+    numerators[wave * 256 + d + 3] = num.w;
+    barrier();
+    if (tid < p.hd) {
+        float total = (sums[0] + sums[1]) + (sums[2] + sums[3]);
+        float value = (numerators[tid] + numerators[256 + tid]) +
+                      (numerators[512 + tid] + numerators[768 + tid]);
+        int s = r / qpk, h = g * qpk + r % qpk;
+        ctx[(s * p.H + h) * p.hd + tid] = total > 0.0 ? value / total : 0.0;
+    }
+}

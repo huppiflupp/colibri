@@ -1,0 +1,134 @@
+#version 450
+// Split-K causal GQA decode, f32. Drop-in ABI for attn_dec.comp.
+// Dispatch (nch, KV, 1); exactly one full wave64 per workgroup.
+// Q: [S][H][hd], K/V: [KV][ldt][hd], unscaled Q.
+// part: m[N] | l[N] | o[N][hd], N = KV*nch*R, R = S*(H/KV).
+// o is NOT normalised. Compatible with either attn_dec_merge or attn_dec2_merge.
+// Preconditions: subgroupSize == 64, 1 <= hd <= 256, 1 <= R <= 32,
+// H % KV == 0, positive S/KV/H, pos_base >= 0, ldt >= pos_base+S,
+// chunk > 0, nch >= ceil((pos_base+S)/chunk), finite Q/K/V and finite scores.
+// Buffers do not alias; all element offsets / index products fit signed int.
+// See attn_dec2.md for the host chunk rule and limits of this unmeasured design.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Q  { float q[]; };
+layout(std430, binding = 1) readonly buffer KB { float kc[]; };
+layout(std430, binding = 2) readonly buffer VB { float vc[]; };
+layout(std430, binding = 3) writeonly buffer O { float part[]; };
+
+layout(push_constant) uniform P { int S, H, KV, hd, pos_base, ldt, nch, chunk; float scale; } p;
+
+// Four adjacent dimensions per lane: lane i owns [4*i, 4*i+4).
+// Scalar SSBO declarations preserve the old ABI for hd not divisible by four.
+// The full-vector branch has four consecutive addresses, including for hd=256.
+vec4 load_q(int base, int d) {
+    if (d + 3 < p.hd)
+        return vec4(q[base+d], q[base+d+1], q[base+d+2], q[base+d+3]);
+    vec4 v = vec4(0.0);
+    if (d     < p.hd) v.x = q[base+d];
+    if (d + 1 < p.hd) v.y = q[base+d+1];
+    if (d + 2 < p.hd) v.z = q[base+d+2];
+    return v;
+}
+
+vec4 load_k(int base, int d) {
+    if (d + 3 < p.hd)
+        return vec4(kc[base+d], kc[base+d+1], kc[base+d+2], kc[base+d+3]);
+    vec4 v = vec4(0.0);
+    if (d     < p.hd) v.x = kc[base+d];
+    if (d + 1 < p.hd) v.y = kc[base+d+1];
+    if (d + 2 < p.hd) v.z = kc[base+d+2];
+    return v;
+}
+
+vec4 load_v(int base, int d) {
+    if (d + 3 < p.hd)
+        return vec4(vc[base+d], vc[base+d+1], vc[base+d+2], vc[base+d+3]);
+    vec4 v = vec4(0.0);
+    if (d     < p.hd) v.x = vc[base+d];
+    if (d + 1 < p.hd) v.y = vc[base+d+1];
+    if (d + 2 < p.hd) v.z = vc[base+d+2];
+    return v;
+}
+
+void store_o(int base, int d, vec4 v) {
+    if (d     < p.hd) part[base+d]   = v.x;
+    if (d + 1 < p.hd) part[base+d+1] = v.y;
+    if (d + 2 < p.hd) part[base+d+2] = v.z;
+    if (d + 3 < p.hd) part[base+d+3] = v.w;
+}
+
+void main() {
+    int lane = int(gl_SubgroupInvocationID), d = 4 * lane;
+    int c = int(gl_WorkGroupID.x), g = int(gl_WorkGroupID.y);
+    int qpk = p.H / p.KV, R = p.S * qpk, N = p.KV * p.nch * R;
+    int first = c * p.chunk;
+    int end = min(first + p.chunk, p.pos_base + p.S);
+    int base = (g * p.nch + c) * R;
+
+    // Bound the live Q/O vectors to 16 rows. R=17..32 rereads K/V in a
+    // second pass, deliberately trading bandwidth for bounded register use.
+    for (int row0 = 0; row0 < R; row0 += 16) {
+        vec4 qr[16], acc[16];
+        [[unroll]] for (int i = 0; i < 16; i++) {
+            int r = row0 + i;
+            qr[i] = vec4(0.0);
+            acc[i] = vec4(0.0);
+            if (r < R) {
+                int s = r / qpk, h = g * qpk + r % qpk;
+                qr[i] = load_q((s * p.H + h) * p.hd, d);
+            }
+        }
+
+        // Lane i owns the scalar softmax state of row row0+i. This avoids
+        // keeping 16 separate m/l/correction/weight values in every lane.
+        int state_row = row0 + lane;
+        float m = -1.0 / 0.0, l = 0.0;
+        for (int t = first; t < end; t++) {
+            int kvbase = (g * p.ldt + t) * p.hd;
+            vec4 k = load_k(kvbase, d), v = load_v(kvbase, d);
+            float score = 0.0;
+            [[unroll]] for (int i = 0; i < 16; i++) {
+                int r = row0 + i;
+                // Uniform over the subgroup, including the causal check.
+                // Even lanes without a dimension participate with zero.
+                if (r < R && t <= p.pos_base + r / qpk) {
+                    float s = subgroupAdd(dot(qr[i], k)) * p.scale;
+                    if (lane == i) score = s;
+                }
+            }
+
+            float correction = 1.0, weight = 0.0;
+            if (lane < 16 && state_row < R && t <= p.pos_base + state_row / qpk) {
+                float next_m = max(m, score);
+                // No exp(-inf - -inf), including initially empty rows.
+                correction = l > 0.0 ? exp(m - next_m) : 0.0;
+                weight = exp(score - next_m);
+                l = l * correction + weight;
+                m = next_m;
+            }
+
+            // Reconverged full wave: every source lane exists, and shuffle
+            // accepts the loop index without a constant-id requirement.
+            [[unroll]] for (int i = 0; i < 16; i++) {
+                if (row0 + i < R) {
+                    float a = subgroupShuffle(correction, uint(i));
+                    float b = subgroupShuffle(weight, uint(i));
+                    acc[i] = fma(vec4(b), v, acc[i] * a);
+                }
+            }
+        }
+
+        if (lane < 16 && state_row < R) {
+            part[base + state_row] = m;
+            part[N + base + state_row] = l;
+        }
+        [[unroll]] for (int i = 0; i < 16; i++)
+            if (row0 + i < R)
+                store_o(2 * N + (base + row0 + i) * p.hd, d, acc[i]);
+    }
+}
