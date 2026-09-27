@@ -3544,6 +3544,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             float mx = elog[0]; for (int v = 1; v < c->vocab; v++) if (elog[v] > mx) mx = elog[v];
             double Z = 0; for (int v = 0; v < c->vocab; v++) Z += exp((double)elog[v] - mx);
             g_pa_nll += log(Z) + mx - elog[ids[p+1]]; g_pa_n++;
+            { static FILE *pd; static int pdo;   /* PPL_DUMP=file: one NLL per scored token (paired comparisons) */
+              if (!pdo) { pdo = 1; if (getenv("PPL_DUMP")) pd = fopen(getenv("PPL_DUMP"), "w"); }
+              if (pd) { fprintf(pd, "%.9f\n", log(Z) + mx - elog[ids[p+1]]); fflush(pd); } }
         }
         free(erow); free(elog);
     }

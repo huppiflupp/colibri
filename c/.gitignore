@@ -74,3 +74,4 @@ shaders/attn_prep.spv
 shaders/attn_gate.spv
 shaders/qmatmul_grp.spv
 shaders/qmatmul_gate_up_grp.spv
+shaders/attn_flash.spv

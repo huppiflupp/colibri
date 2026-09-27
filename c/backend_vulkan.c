@@ -110,6 +110,9 @@ static struct {
     /* causal prefill attention core (attn_prefill.comp): q, K, V, ctx */
     VkShaderModule shader_ap; VkDescriptorSetLayout dsl_ap; VkPipelineLayout plyt_ap;
     VkPipeline pipe_ap; VkDescriptorPool dpool_ap; VkDescriptorSet dset_ap;
+    /* matrix-unit variant of the same core (attn_flash.comp, same layout/set),
+     * built lazily per (head dim, query heads per kv head) */
+    VkShaderModule shader_af; VkPipeline pipe_af; int af_hd, af_gq;
     Scratch ap_q, ap_k, ap_v, ap_o;
     /* DeltaNet prefill recurrence (dn_recur.comp): qn, kn, v source, beta, exp(g), state, out */
     VkShaderModule shader_dr; VkDescriptorSetLayout dsl_dr; VkPipelineLayout plyt_dr;
@@ -934,6 +937,9 @@ int coli_vk_init(const char *spv_path) {
         if (G.shader_ap && !build_pipeline(G.dev, 4, sizeof(struct PCAP), G.shader_ap, &G.dsl_ap, &G.plyt_ap, &G.pipe_ap, &G.dpool_ap, &G.dset_ap)) {
             vkDestroyShaderModule(G.dev, G.shader_ap, NULL); G.shader_ap = VK_NULL_HANDLE; G.pipe_ap = VK_NULL_HANDLE;
         }
+        const char *fe = getenv("COLI_VK_ATTN_FLASH");
+        char af_path[512]; derive_dir_file(spv_path, "attn_flash.spv", af_path, sizeof(af_path));
+        if (G.pipe_ap && G.coop && !(fe && *fe == '0')) G.shader_af = load_spv(G.dev, af_path);
     }
 
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -1593,6 +1599,32 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     return 1;
 }
 
+/* Matrix-unit attention core for this shape? attn_flash.comp folds all query
+ * heads of a kv head into its 16 rows (so H/KV must divide 16), needs a head dim
+ * that is a multiple of 64 up to 256 and wave64 (4 subgroups, 16-lane clusters).
+ * Returns the pipeline (built on first use for this shape) or NULL. */
+static VkPipeline af_pipeline(int H, int KV, int hd) {
+    int gq = H / KV;
+    if (!G.shader_af || G.sgsize != 64 || hd % 64 || hd > 256 || gq < 1 || gq > 16 || 16 % gq) return VK_NULL_HANDLE;
+    if (G.pipe_af && G.af_hd == hd && G.af_gq == gq) return G.pipe_af;
+    if (G.pipe_af) { vkDeviceWaitIdle(G.dev); vkDestroyPipeline(G.dev, G.pipe_af, NULL); G.pipe_af = VK_NULL_HANDLE; }
+    int sc[2] = {hd, gq};
+    VkSpecializationMapEntry me[2] = {{.constantID = 0, .offset = 0, .size = sizeof(int)},
+                                      {.constantID = 1, .offset = sizeof(int), .size = sizeof(int)}};
+    VkSpecializationInfo spi = {.mapEntryCount = 2, .pMapEntries = me, .dataSize = sizeof sc, .pData = sc};
+    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = G.shader_af, .pName = "main",
+                  .pSpecializationInfo = &spi},
+        .layout = G.plyt_ap};
+    if (vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &G.pipe_af) != VK_SUCCESS) {
+        G.pipe_af = VK_NULL_HANDLE; vkDestroyShaderModule(G.dev, G.shader_af, NULL); G.shader_af = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    }
+    G.af_hd = hd; G.af_gq = gq;
+    return G.pipe_af;
+}
+
 /* A whole gated-attention layer of a prefill block in ONE submit: q/k/v projections
  * -> split/norm/RoPE/KV-cache rows (attn_prep) -> causal core (attn_prefill) ->
  * sigmoid gate (attn_gate) -> o_proj. K/V rows 0..pos_base-1 come from the host
@@ -1647,11 +1679,13 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
     { VkDescriptorBufferInfo bi[4] = {{G.ab_qb.buf, 0, VK_WHOLE_SIZE}, {G.ab_k.buf, 0, VK_WHOLE_SIZE},
                                       {G.ab_v.buf, 0, VK_WHOLE_SIZE}, {G.ab_cx.buf, 0, VK_WHOLE_SIZE}};
       wr_desc(G.dset_ap, 4, bi);
-      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_ap);
+      VkPipeline af = af_pipeline(H, KV, hd);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, af ? af : G.pipe_ap);
       vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_ap, 0, 1, &G.dset_ap, 0, NULL);
       struct PCAP pc = {S, H, KV, hd, pos_base, nt, scale};
       vkCmdPushConstants(cb, G.plyt_ap, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-      vkCmdDispatch(cb, (uint32_t)S, (uint32_t)H, 1); }
+      if (af) { int tpw = 16 / (H / KV); vkCmdDispatch(cb, (uint32_t)((S + tpw - 1) / tpw), (uint32_t)KV, 1); }
+      else vkCmdDispatch(cb, (uint32_t)S, (uint32_t)H, 1); }
     cc_barrier(cb); ts_stage(cb, 2);
     /* 4. gate */
     { VkDescriptorBufferInfo bi[3] = {{G.ab_cx.buf, 0, VK_WHOLE_SIZE}, {G.ab_gb.buf, 0, VK_WHOLE_SIZE}, {G.ab_ag.buf, 0, VK_WHOLE_SIZE}};
@@ -1707,11 +1741,13 @@ int coli_vk_attn_prefill(float *ctx, const float *q, const float *K, const float
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
     ts_begin(G.cmd, TS_SLOT_CMD);
-    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_ap);
+    VkPipeline af = af_pipeline(H, KV, hd);
+    vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, af ? af : G.pipe_ap);
     vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_ap, 0, 1, &G.dset_ap, 0, NULL);
     struct PCAP pc = {S, H, KV, hd, pos_base, nt, scale};
     vkCmdPushConstants(G.cmd, G.plyt_ap, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd, (uint32_t)S, (uint32_t)H, 1);
+    if (af) { int tpw = 16 / (H / KV); vkCmdDispatch(G.cmd, (uint32_t)((S + tpw - 1) / tpw), (uint32_t)KV, 1); }
+    else vkCmdDispatch(G.cmd, (uint32_t)S, (uint32_t)H, 1);
     host_read_barrier(G.cmd);
     ts_end(G.cmd, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -2799,6 +2835,8 @@ void coli_vk_shutdown(void) {
         vkDestroyDescriptorSetLayout(G.dev, G.dsl_dr, NULL);
         vkDestroyShaderModule(G.dev, G.shader_dr, NULL);
     }
+    if (G.pipe_af) vkDestroyPipeline(G.dev, G.pipe_af, NULL);
+    if (G.shader_af) vkDestroyShaderModule(G.dev, G.shader_af, NULL);
     if (G.pipe_ap) {
         vkDestroyDescriptorPool(G.dev, G.dpool_ap, NULL);
         vkDestroyPipeline(G.dev, G.pipe_ap, NULL);
@@ -3858,7 +3896,9 @@ static int run_attn_prefill_case(int S, int H, int KV, int hd, int pos_base, int
     printf("ATTN prefill S=%4d H=%d KV=%d hd=%d pos_base=%d | relL2 %.2e max %.2e%s | %.2f ms (incl. upload)\n",
            S, H, KV, hd, pos_base, rl2, rmax, nf ? " NONFINITE" : "", ms);
     free(q); free(K); free(V); free(cg); free(cc); free(sc);
-    return rl2 > 1e-5 || rmax > 1e-4 || nf;
+    /* f16 operands on the matrix units (attn_flash): P and Q/K/V carry 11 bits */
+    int fl = af_pipeline(H, KV, hd) != VK_NULL_HANDLE;
+    return fl ? (rl2 > 3e-3 || rmax > 3e-2 || nf) : (rl2 > 1e-5 || rmax > 1e-4 || nf);
 }
 
 /* Expert group with several routed rows per expert (prefill / MTP verify): rows[c]
@@ -3951,6 +3991,24 @@ int main(int argc, char **argv) {
         printf(bad ? "FAIL\n" : "PASS\n");
         coli_vk_shutdown();
         return bad;
+    }
+    if (getenv("VK_ATTN_TEST")) {   /* attention cores only (attn_flash / attn_prefill + whole layer) */
+        if (G.pipe_ap) {
+            bad |= run_attn_prefill_case(1, 16, 2, 256, 0, 64);
+            bad |= run_attn_prefill_case(37, 16, 2, 256, 0, 64);
+            bad |= run_attn_prefill_case(20, 16, 2, 256, 30, 64);
+            bad |= run_attn_prefill_case(33, 8, 8, 128, 5, 40);
+            bad |= run_attn_prefill_case(70, 16, 4, 128, 100, 200);  /* GQA 4, prefix across blocks */
+            bad |= run_attn_prefill_case(1011, 16, 2, 256, 0, 1100);
+            bad |= run_attn_prefill_case(1011, 16, 2, 256, 0, 1100);  /* warm timing */
+        }
+        if (G.pipe_ab && G.pipe_ap) {
+            bad |= run_attn_block_case(37, 256, 4, 2, 64, 32, 10);
+            bad |= run_attn_block_case(300, 2048, 16, 2, 256, 64, 0);
+            bad |= run_attn_block_case(64, 2048, 16, 2, 256, 64, 40);
+        }
+        printf(bad ? "FAIL\n" : "PASS\n");
+        coli_vk_shutdown(); return bad;
     }
     if (getenv("VK_PREFILL_TEST")) {
         bad = run_expert_prefill_tests();
