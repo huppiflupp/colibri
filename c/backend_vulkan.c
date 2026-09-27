@@ -435,7 +435,7 @@ static void ts_read(int slot, int label, double host_ms) {
  * ts_stage_read(block, n) attributes the gaps to the stages of that block */
 enum { TSB_DN, TSB_ATTN, TSB_EG, TSB_N };
 static const char *tsb_name[TSB_N][8] = {{"dn:proj", "dn:conv", "dn:prep", "dn:recur", "dn:gnorm", "dn:outproj"},
-                                          {"at:qkv", "at:prep", "at:core", "at:gate", "at:oproj"},
+                                          {"at:q", "at:k", "at:v", "at:prep", "at:core", "at:gate", "at:oproj"},
                                           {"eg:gather", "eg:gate_up", "eg:down", "eg:reduce"}};
 static double g_tsb[TSB_N][8];
 /* queries 4..11 for the G.cmd blocks (dn, attn), 12..19 for the expert group
@@ -1668,10 +1668,14 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
     VKCHECK(vkBeginCommandBuffer(cb, &begin), "beginCmd");
     ts_begin(cb, TS_SLOT_CMD); ts_stage0(cb);
     /* 1. q | k | v projections into one buffer */
+    /* one after the other: run concurrently (no barrier) the three measured
+     * 74 ms over 10 layers, serialised 56 ms (the small k/v tiles compete with q's) */
     rec_mm_off(cb, G.ab_mm[0], tq, G.ab_x.buf, G.ab_qkv.buf, 0, S);
+    cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 0);
     rec_mm_off(cb, G.ab_mm[1], tk, G.ab_x.buf, G.ab_qkv.buf, nq, S);
+    cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 1);
     rec_mm_off(cb, G.ab_mm[2], tv, G.ab_x.buf, G.ab_qkv.buf, nq + nk, S);
-    cc_barrier(cb); ts_stage(cb, 0);
+    cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 2);
     /* 2. split, norm, RoPE, cache rows */
     { VkDescriptorBufferInfo bi[6] = {{G.ab_qkv.buf, 0, VK_WHOLE_SIZE}, {G.ab_nw.buf, 0, VK_WHOLE_SIZE},
                                       {G.ab_qb.buf, 0, VK_WHOLE_SIZE}, {G.ab_gb.buf, 0, VK_WHOLE_SIZE},
@@ -1683,7 +1687,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
                         0, (int)(nq / f), (int)((nq + nk) / f), eps, theta};
       vkCmdPushConstants(cb, G.plyt_ab, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       vkCmdDispatch(cb, (uint32_t)S, (uint32_t)(H + KV), 1); }
-    cc_barrier(cb); ts_stage(cb, 1);
+    cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 3);
     /* 3. causal core */
     { VkDescriptorBufferInfo bi[4] = {{G.ab_qb.buf, 0, VK_WHOLE_SIZE}, {G.ab_k.buf, 0, VK_WHOLE_SIZE},
                                       {G.ab_v.buf, 0, VK_WHOLE_SIZE}, {G.ab_cx.buf, 0, VK_WHOLE_SIZE}};
@@ -1695,7 +1699,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
       vkCmdPushConstants(cb, G.plyt_ap, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       if (af) { int tpw = 16 / (H / KV); vkCmdDispatch(cb, (uint32_t)((S + tpw - 1) / tpw), (uint32_t)KV, 1); }
       else vkCmdDispatch(cb, (uint32_t)S, (uint32_t)H, 1); }
-    cc_barrier(cb); ts_stage(cb, 2);
+    cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 4);
     /* 4. gate */
     { VkDescriptorBufferInfo bi[3] = {{G.ab_cx.buf, 0, VK_WHOLE_SIZE}, {G.ab_gb.buf, 0, VK_WHOLE_SIZE}, {G.ab_ag.buf, 0, VK_WHOLE_SIZE}};
       wr_desc(G.dset_ag, 3, bi);
@@ -1705,9 +1709,9 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
       struct PCAG pc = {n, gate_dim > 0};
       vkCmdPushConstants(cb, G.plyt_ag, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       vkCmdDispatch(cb, (uint32_t)((n + 255) / 256), 1, 1); }
-    cc_barrier(cb); ts_stage(cb, 3);
+    cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 5);
     /* 5. o_proj */
-    rec_mm(cb, G.ab_mm[3], to, G.ab_ag.buf, G.ab_y.buf, S); ts_stage(cb, 4);
+    rec_mm(cb, G.ab_mm[3], to, G.ab_ag.buf, G.ab_y.buf, S); ts_stageb(cb, TSB_ATTN, 6);
     host_read_barrier(cb);
     ts_end(cb, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(cb), "endCmd");
@@ -1716,7 +1720,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
     double th0 = vk_now();
     VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
-    ts_read(TS_SLOT_CMD, TS_ATTN, vk_now() - th0); ts_stage_read(TSB_ATTN, 5);
+    ts_read(TS_SLOT_CMD, TS_ATTN, vk_now() - th0); ts_stage_read(TSB_ATTN, 7);
     memcpy(out, G.ab_y.ptr, nx);
     for (int g = 0; g < KV; g++) {   /* new rows back into the host caches (decode reads them) */
         memcpy(Kc + ((size_t)g * ldt + pos_base) * hd, (char *)G.ab_k.ptr + ((size_t)g * nt + pos_base) * hd * f, (size_t)S * hd * f);
