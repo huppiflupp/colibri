@@ -212,7 +212,7 @@ static struct {
      * evicts cold tier experts instead of thrashing the per-token attention submits
      * (measured: decode attention 7.8s at 7.6 GB resident -> 17.8s at 15.2 GB).
      * VK_EXT_memory_budget lets the tier fill stop at a reserve instead of guessing. */
-    int has_prio, has_budget, has_portability;
+    int has_prio, has_budget, has_portability, has_sgsc;
     float prio;                  /* priority applied to the NEXT allocations (class knob) */
 } G;
 
@@ -534,11 +534,17 @@ static void host_read_barrier(VkCommandBuffer cb) {
 }
 /* A second pipeline on an existing layout, with the multi-row count MR as
  * specialization constant 0 (qmatmul_mr.comp / qmatmul_gate_up_mr.comp). */
+static int g_req_sg;   /* > 0: build_pipeline_mr asks for this subgroup size (VK_EXT_subgroup_size_control) */
+static int g_gemv_sg;  /* the subgroup size wanted for the decode GEMV pipelines (0 = driver default) */
 static int build_pipeline_mr(VkDevice dev, VkPipelineLayout plyt, VkShaderModule shader, int mr, VkPipeline *pipe) {
     VkSpecializationMapEntry me = {.constantID = 0, .offset = 0, .size = sizeof(int)};
     VkSpecializationInfo spi = {.mapEntryCount = 1, .pMapEntries = &me, .dataSize = sizeof(int), .pData = &mr};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = (uint32_t)g_req_sg};
     VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .pNext = g_req_sg > 0 ? &rss : NULL,
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main",
                   .pSpecializationInfo = &spi},
         .layout = plyt};
@@ -650,7 +656,7 @@ int coli_vk_init(const char *spv_path) {
     /* Pressure-proofing extensions (both optional, detected at runtime):
      * memory_priority ranks allocations for the kernel's eviction order,
      * memory_budget exposes how much VRAM a new allocation can still take. */
-    const char *dext[4]; uint32_t ndext = 0;
+    const char *dext[6]; uint32_t ndext = 0;
     {
         uint32_t ne = 0;
         vkEnumerateDeviceExtensionProperties(G.phys, NULL, &ne, NULL);
@@ -665,6 +671,7 @@ int coli_vk_init(const char *spv_path) {
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G.has_budget = 1;
 #endif
                 if (!strcmp(ep[i].extensionName, "VK_KHR_portability_subset")) G.has_portability = 1;
+                if (!strcmp(ep[i].extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) G.has_sgsc = 1;
 #ifdef VK_KHR_cooperative_matrix
                 if (!strcmp(ep[i].extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) G.has_coop_dev = 1;
 #endif
@@ -674,6 +681,9 @@ int coli_vk_init(const char *spv_path) {
     }
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi};
+    /* subgroup size per pipeline (wave32 for the decode GEMV: COLI_VK_GEMV_W32=1) */
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT, .subgroupSizeControl = VK_TRUE};
 #ifdef VK_KHR_cooperative_matrix
     /* Optional tiled matmul on the matrix units: needs the extension, its feature,
      * f16 arithmetic and the Vulkan memory model, plus a 16x16x16 f16 x f16 -> f32
@@ -730,6 +740,10 @@ int coli_vk_init(const char *spv_path) {
      * 04451); conformant drivers never list it, so RADV, NVIDIA and Lavapipe are
      * untouched. Spelled out: the macro sits behind VK_ENABLE_BETA_EXTENSIONS. */
     if (G.has_portability) dext[ndext++] = "VK_KHR_portability_subset";
+    if (G.has_sgsc && getenv("COLI_VK_GEMV_W32") && getenv("COLI_VK_GEMV_W32")[0] == '1') {
+        dext[ndext++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
+        sgf.pNext = (void *)di.pNext; di.pNext = &sgf; g_gemv_sg = 32;
+    }
     di.enabledExtensionCount = ndext; di.ppEnabledExtensionNames = ndext ? dext : NULL;
     G.prio = 0.75f;                              /* default class: dense/resident weights */
     VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
@@ -907,6 +921,7 @@ int coli_vk_init(const char *spv_path) {
             const char *gnm[2] = {"_grp_gemv.spv", "_gate_up_grp_gemv.spv"};
             const char *gm = getenv("COLI_VK_GRP_GEMV_MAX");
             G.grp_gemv_max = gm ? atoi(gm) : 4;
+            g_req_sg = g_gemv_sg;   /* only these pipelines take the requested subgroup size */
             for (int v = 0; ok && v < 2 && G.grp_gemv_max > 0; v++) {
                 char pp[512]; derive_sibling(spv_path, gnm[v], pp, sizeof(pp));
                 G.shader_gv[v] = load_spv(G.dev, pp);
@@ -920,6 +935,7 @@ int coli_vk_init(const char *spv_path) {
                 if (!G.shader_gv4[v] || !build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_gv4[v], 0, &G.pipe_gv4[v])) G.pipe_gv4[v] = VK_NULL_HANDLE;
             }
             if (!G.pipe_gv4[0] || !G.pipe_gv4[1]) G.pipe_gv4[0] = G.pipe_gv4[1] = VK_NULL_HANDLE;
+            g_req_sg = 0;
             if (G.pipe_gv[0] && !(getenv("COLI_VK_DENSE_GEMV") && getenv("COLI_VK_DENSE_GEMV")[0] == '0')) {
                 VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
                 VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
