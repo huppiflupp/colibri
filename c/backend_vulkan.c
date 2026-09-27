@@ -428,8 +428,30 @@ static void ts_read(int slot, int label, double host_ms) {
     g_ts[label].gpu += (double)(v[1] - v[0]) * G.ts_period * 1e-6;
     g_ts[label].host += host_ms; g_ts[label].n++;
 }
+/* stage stamps inside one block (queries 4..19): ts_stage(cb, i) after stage i,
+ * ts_stage_read(block, n) attributes the gaps to the stages of that block */
+enum { TSB_DN, TSB_ATTN, TSB_N };
+static const char *tsb_name[TSB_N][8] = {{"dn:proj", "dn:conv", "dn:prep", "dn:recur", "dn:gnorm", "dn:outproj"},
+                                          {"at:qkv", "at:prep", "at:core", "at:gate", "at:oproj"}};
+static double g_tsb[TSB_N][8];
+static void ts_stage0(VkCommandBuffer cb) {
+    if (!G.ts_on) return;
+    vkCmdResetQueryPool(cb, G.tsq, 4, 16);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, G.tsq, 4);
+}
+static void ts_stage(VkCommandBuffer cb, int i) {
+    if (G.ts_on) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, G.tsq, 5u + i);
+}
+static void ts_stage_read(int b, int n) {
+    if (!G.ts_on) return;
+    uint64_t v[16] = {0};
+    if (vkGetQueryPoolResults(G.dev, G.tsq, 4, n + 1, sizeof v, v, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+    for (int i = 0; i < n; i++) g_tsb[b][i] += (double)(v[i + 1] - v[i]) * G.ts_period * 1e-6;
+}
 static void ts_report(void) {
     if (!G.ts_on) return;
+    for (int b = 0; b < TSB_N; b++) for (int i = 0; i < 8 && tsb_name[b][i]; i++)
+        if (g_tsb[b][i] > 0) fprintf(stderr, "[VK_TS]   %-12s %10.1f ms\n", tsb_name[b][i], g_tsb[b][i]);
     double tg = 0, th = 0;
     fprintf(stderr, "[VK_TS] %-13s %7s %10s %10s %8s\n", "label", "calls", "gpu ms", "host ms", "gpu/host");
     for (int i = 0; i < TS_N; i++) if (g_ts[i].n) {
@@ -939,7 +961,7 @@ int coli_vk_init(const char *spv_path) {
     VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p);
     if (getenv("COLI_VK_TS") && getenv("COLI_VK_TS")[0] == '1' && p.limits.timestampComputeAndGraphics) {
         VkQueryPoolCreateInfo qpi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 4};
+            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 4 + 16};
         if (vkCreateQueryPool(G.dev, &qpi, NULL, &G.tsq) == VK_SUCCESS) { G.ts_on = 1; G.ts_period = p.limits.timestampPeriod; }
     }
     fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s%s, weights %s\n", p.deviceName, G.qfam, G.memtype,
@@ -1496,10 +1518,10 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     VKCHECK(vkResetCommandBuffer(cb, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(cb, &begin), "beginCmd");
-    ts_begin(cb, TS_SLOT_CMD);
+    ts_begin(cb, TS_SLOT_CMD); ts_stage0(cb);
     /* 1. qkv|z = x Wp^T */
     rec_mm(cb, G.db_mm[0], proj, G.db_x.buf, G.db_qz.buf, S);
-    cc_barrier(cb);
+    cc_barrier(cb); ts_stage(cb, 0);
     /* 2. conv + SiLU */
     { VkDescriptorBufferInfo bi[4] = {{G.db_qz.buf, 0, VK_WHOLE_SIZE}, {G.db_cw.buf, 0, VK_WHOLE_SIZE},
                                       {G.db_ring.buf, 0, VK_WHOLE_SIZE}, {G.db_conv.buf, 0, VK_WHOLE_SIZE}};
@@ -1509,7 +1531,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
       struct PCDC pc = {S, conv_dim, convk, pd};
       vkCmdPushConstants(cb, G.plyt_dc, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       vkCmdDispatch(cb, (uint32_t)((conv_dim + 255) / 256), (uint32_t)S, 1); }
-    cc_barrier(cb);
+    cc_barrier(cb); ts_stage(cb, 1);
     /* 3. l2norm q/k, beta, exp(g) */
     { VkDescriptorBufferInfo bi[6] = {{G.db_conv.buf, 0, VK_WHOLE_SIZE}, {G.db_ba.buf, 0, VK_WHOLE_SIZE},
                                       {G.db_par.buf, 0, VK_WHOLE_SIZE}, {G.dr_q.buf, 0, VK_WHOLE_SIZE},
@@ -1520,7 +1542,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
       struct PCDP pc = {S, conv_dim, vk, vh, kdim, qscale};
       vkCmdPushConstants(cb, G.plyt_dp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       vkCmdDispatch(cb, (uint32_t)S, (uint32_t)vk, 1); }
-    cc_barrier(cb);
+    cc_barrier(cb); ts_stage(cb, 2);
     /* 4. recurrence (v straight out of the conv output) */
     { VkDeviceSize hb = (VkDeviceSize)S * vh * f;
       VkDescriptorBufferInfo bi[7] = {{G.dr_q.buf, 0, VK_WHOLE_SIZE}, {G.dr_k.buf, 0, VK_WHOLE_SIZE},
@@ -1532,7 +1554,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
       struct PCDR pc = {S, vh, vk, kdim, vdim, conv_dim, 2 * ktot};
       vkCmdPushConstants(cb, G.plyt_dr, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       vkCmdDispatch(cb, (uint32_t)vh, (uint32_t)((vdim + 3) / 4), 1); }
-    cc_barrier(cb);
+    cc_barrier(cb); ts_stage(cb, 3);
     /* 5. gated RMSNorm */
     { VkDescriptorBufferInfo bi[4] = {{G.dr_o.buf, 0, VK_WHOLE_SIZE}, {G.db_qz.buf, 0, VK_WHOLE_SIZE},
                                       {G.db_nw.buf, 0, VK_WHOLE_SIZE}, {G.db_or.buf, 0, VK_WHOLE_SIZE}};
@@ -1542,9 +1564,9 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
       struct PCDG pc = {S, vh, vdim, pd, conv_dim, eps};
       vkCmdPushConstants(cb, G.plyt_dg, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       vkCmdDispatch(cb, (uint32_t)S, (uint32_t)vh, 1); }
-    cc_barrier(cb);
+    cc_barrier(cb); ts_stage(cb, 4);
     /* 6. out_proj */
-    rec_mm(cb, G.db_mm[1], outp, G.db_or.buf, G.db_y.buf, S);
+    rec_mm(cb, G.db_mm[1], outp, G.db_or.buf, G.db_y.buf, S); ts_stage(cb, 5);
     host_read_barrier(cb);
     ts_end(cb, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(cb), "endCmd");
@@ -1553,7 +1575,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     double th0 = vk_now();
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
-    ts_read(TS_SLOT_CMD, TS_DNBLOCK, vk_now() - th0);
+    ts_read(TS_SLOT_CMD, TS_DNBLOCK, vk_now() - th0); ts_stage_read(TSB_DN, 6);
     memcpy(y, G.db_y.ptr, nx);
     memcpy(state, G.dr_s.ptr, nst);
     /* new ring: the last convk-1 unconvolved qkv inputs (older ones from the old ring) */
@@ -1603,12 +1625,12 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
     VKCHECK(vkResetCommandBuffer(cb, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VKCHECK(vkBeginCommandBuffer(cb, &begin), "beginCmd");
-    ts_begin(cb, TS_SLOT_CMD);
+    ts_begin(cb, TS_SLOT_CMD); ts_stage0(cb);
     /* 1. q | k | v projections into one buffer */
     rec_mm_off(cb, G.ab_mm[0], tq, G.ab_x.buf, G.ab_qkv.buf, 0, S);
     rec_mm_off(cb, G.ab_mm[1], tk, G.ab_x.buf, G.ab_qkv.buf, nq, S);
     rec_mm_off(cb, G.ab_mm[2], tv, G.ab_x.buf, G.ab_qkv.buf, nq + nk, S);
-    cc_barrier(cb);
+    cc_barrier(cb); ts_stage(cb, 0);
     /* 2. split, norm, RoPE, cache rows */
     { VkDescriptorBufferInfo bi[6] = {{G.ab_qkv.buf, 0, VK_WHOLE_SIZE}, {G.ab_nw.buf, 0, VK_WHOLE_SIZE},
                                       {G.ab_qb.buf, 0, VK_WHOLE_SIZE}, {G.ab_gb.buf, 0, VK_WHOLE_SIZE},
@@ -1620,7 +1642,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
                         0, (int)(nq / f), (int)((nq + nk) / f), eps, theta};
       vkCmdPushConstants(cb, G.plyt_ab, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       vkCmdDispatch(cb, (uint32_t)S, (uint32_t)(H + KV), 1); }
-    cc_barrier(cb);
+    cc_barrier(cb); ts_stage(cb, 1);
     /* 3. causal core */
     { VkDescriptorBufferInfo bi[4] = {{G.ab_qb.buf, 0, VK_WHOLE_SIZE}, {G.ab_k.buf, 0, VK_WHOLE_SIZE},
                                       {G.ab_v.buf, 0, VK_WHOLE_SIZE}, {G.ab_cx.buf, 0, VK_WHOLE_SIZE}};
@@ -1630,7 +1652,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
       struct PCAP pc = {S, H, KV, hd, pos_base, nt, scale};
       vkCmdPushConstants(cb, G.plyt_ap, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       vkCmdDispatch(cb, (uint32_t)S, (uint32_t)H, 1); }
-    cc_barrier(cb);
+    cc_barrier(cb); ts_stage(cb, 2);
     /* 4. gate */
     { VkDescriptorBufferInfo bi[3] = {{G.ab_cx.buf, 0, VK_WHOLE_SIZE}, {G.ab_gb.buf, 0, VK_WHOLE_SIZE}, {G.ab_ag.buf, 0, VK_WHOLE_SIZE}};
       wr_desc(G.dset_ag, 3, bi);
@@ -1640,9 +1662,9 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
       struct PCAG pc = {n, gate_dim > 0};
       vkCmdPushConstants(cb, G.plyt_ag, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       vkCmdDispatch(cb, (uint32_t)((n + 255) / 256), 1, 1); }
-    cc_barrier(cb);
+    cc_barrier(cb); ts_stage(cb, 3);
     /* 5. o_proj */
-    rec_mm(cb, G.ab_mm[3], to, G.ab_ag.buf, G.ab_y.buf, S);
+    rec_mm(cb, G.ab_mm[3], to, G.ab_ag.buf, G.ab_y.buf, S); ts_stage(cb, 4);
     host_read_barrier(cb);
     ts_end(cb, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(cb), "endCmd");
@@ -1651,7 +1673,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
     double th0 = vk_now();
     VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
-    ts_read(TS_SLOT_CMD, TS_ATTN, vk_now() - th0);
+    ts_read(TS_SLOT_CMD, TS_ATTN, vk_now() - th0); ts_stage_read(TSB_ATTN, 5);
     memcpy(out, G.ab_y.ptr, nx);
     for (int g = 0; g < KV; g++) {   /* new rows back into the host caches (decode reads them) */
         memcpy(Kc + ((size_t)g * ldt + pos_base) * hd, (char *)G.ab_k.ptr + ((size_t)g * nt + pos_base) * hd * f, (size_t)S * hd * f);
@@ -3919,6 +3941,12 @@ int main(int argc, char **argv) {
         g_ref_gs = 64;
         bad |= run_coop_case(1, 1024, 2048, 8192, 10);   /* DeltaNet qkv, whole prompt */
         bad |= run_coop_case(4, 32, 2048, 512, 20);      /* one Qwen3.6 expert gate/up-shaped matmul */
+        if (getenv("VK_COOP_BENCH")[0] == '2') {       /* attention q | k | v and o_proj shapes, whole prompt */
+            bad |= run_coop_case(1, 1011, 2048, 8192, 10);
+            bad |= run_coop_case(1, 1011, 2048, 512, 10);
+            bad |= run_coop_case(1, 1011, 4096, 2048, 10);
+            bad |= run_coop_case(1, 1011, 2048, 12288, 10);
+        }
         bad |= run_coop_expert_group(4, 2048, 512, 64, 60, 10, 0.f);
         printf(bad ? "FAIL\n" : "PASS\n");
         coli_vk_shutdown();
