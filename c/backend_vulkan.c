@@ -926,23 +926,41 @@ int coli_vk_init(const char *spv_path) {
             }
             if (!ok) G.pipe_grp[0] = G.pipe_grp[1] = VK_NULL_HANDLE;
             /* grouped GEMV twins on the same layouts: decode and small verify batches */
-            const char *gnm[2] = {"_grp_gemv.spv", "_gate_up_grp_gemv.spv"};
+            /* COLI_VK_GEMV_V2: 1 (default) = v2 (streamed Float32, written by Codex: int4 decode
+             * 54.3 -> 55.8 tok/s, byte-identical), 0 = original, 2 = v2b (paired scales, slower).
+             * A missing v2 SPV falls back to the original. */
+            const char *gv2 = getenv("COLI_VK_GEMV_V2");
+            int gv_variant = gv2 && !strcmp(gv2, "0") ? 0 : gv2 && !strcmp(gv2, "2") ? 2 : 1;
+            { char pp[512]; derive_sibling(spv_path, gv_variant == 2 ? "_grp_gemv_v2b.spv" : "_grp_gemv_v2.spv", pp, sizeof(pp));
+              FILE *fv = gv_variant ? fopen(pp, "rb") : NULL; if (fv) fclose(fv); else gv_variant = 0; }
+            const char *gnm[3][2] = {
+                {"_grp_gemv.spv", "_gate_up_grp_gemv.spv"},
+                {"_grp_gemv_v2.spv", "_gate_up_grp_gemv_v2.spv"},
+                {"_grp_gemv_v2b.spv", "_gate_up_grp_gemv_v2b.spv"}
+            };
             const char *gm = getenv("COLI_VK_GRP_GEMV_MAX");
             G.grp_gemv_max = gm ? atoi(gm) : 4;
             g_req_sg = g_gemv_sg;   /* only these pipelines take the requested subgroup size */
             for (int v = 0; ok && v < 2 && G.grp_gemv_max > 0; v++) {
-                char pp[512]; derive_sibling(spv_path, gnm[v], pp, sizeof(pp));
+                char pp[512]; derive_sibling(spv_path, gnm[gv_variant][v], pp, sizeof(pp));
                 G.shader_gv[v] = load_spv(G.dev, pp);
                 if (!G.shader_gv[v] || !build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_gv[v], 0, &G.pipe_gv[v])) G.pipe_gv[v] = VK_NULL_HANDLE;
             }
             if (!G.pipe_gv[0] || !G.pipe_gv[1]) G.pipe_gv[0] = G.pipe_gv[1] = VK_NULL_HANDLE;
-            const char *gnm4[2] = {"_grp_gemv4.spv", "_gate_up_grp_gemv4.spv"};
+            const char *gnm4[3][2] = {
+                {"_grp_gemv4.spv", "_gate_up_grp_gemv4.spv"},
+                {"_grp_gemv4_v2.spv", "_gate_up_grp_gemv4_v2.spv"},
+                {"_grp_gemv4_v2b.spv", "_gate_up_grp_gemv4_v2b.spv"}
+            };
             for (int v = 0; G.pipe_gv[0] && v < 2; v++) {
-                char pp[512]; derive_sibling(spv_path, gnm4[v], pp, sizeof(pp));
+                char pp[512]; derive_sibling(spv_path, gnm4[gv_variant][v], pp, sizeof(pp));
                 G.shader_gv4[v] = load_spv(G.dev, pp);
                 if (!G.shader_gv4[v] || !build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_gv4[v], 0, &G.pipe_gv4[v])) G.pipe_gv4[v] = VK_NULL_HANDLE;
             }
             if (!G.pipe_gv4[0] || !G.pipe_gv4[1]) G.pipe_gv4[0] = G.pipe_gv4[1] = VK_NULL_HANDLE;
+            if (gv_variant) fprintf(stderr, "[VK] GEMV %s: decode %s, NR4 %s\n",
+                gv_variant == 1 ? "v2" : "v2b", G.pipe_gv[0] ? "on" : "unavailable",
+                G.pipe_gv4[0] ? "on" : "unavailable");
             g_req_sg = 0;
             if (G.pipe_gv[0] && !(getenv("COLI_VK_DENSE_GEMV") && getenv("COLI_VK_DENSE_GEMV")[0] == '0')) {
                 VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};

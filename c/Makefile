@@ -683,7 +683,7 @@ ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o
-VK_SPV    = shaders/expert_gather.spv shaders/expert_reduce.spv shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/qmatmul_coop2.spv shaders/qmatmul_gate_up_coop2.spv shaders/qmatmul_grp.spv shaders/qmatmul_gate_up_grp.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_gate_up_grp_gemv.spv shaders/qmatmul_grp_gemv4.spv shaders/qmatmul_gate_up_grp_gemv4.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/attn_prefill.spv shaders/attn_flash.spv shaders/dn_recur.spv shaders/dn_conv.spv shaders/dn_prep.spv shaders/dn_gnorm.spv shaders/attn_prep.spv shaders/attn_gate.spv shaders/resid_norm.spv shaders/dn_ba.spv shaders/dn_ring.spv shaders/attn_dec.spv shaders/attn_dec_merge.spv shaders/moe_route.spv
+VK_SPV    = shaders/expert_gather.spv shaders/expert_reduce.spv shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/qmatmul_coop2.spv shaders/qmatmul_gate_up_coop2.spv shaders/qmatmul_grp.spv shaders/qmatmul_gate_up_grp.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_gate_up_grp_gemv.spv shaders/qmatmul_grp_gemv4.spv shaders/qmatmul_gate_up_grp_gemv4.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/attn_prefill.spv shaders/attn_flash.spv shaders/dn_recur.spv shaders/dn_conv.spv shaders/dn_prep.spv shaders/dn_gnorm.spv shaders/attn_prep.spv shaders/attn_gate.spv shaders/resid_norm.spv shaders/dn_ba.spv shaders/dn_ring.spv shaders/attn_dec.spv shaders/attn_dec_merge.spv shaders/moe_route.spv $(VK_GEMV_V2_SPV)
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -832,6 +832,31 @@ shaders/qmatmul_grp_gemv4.spv: shaders/qmatmul_grp_gemv.comp
 	$(GLSLC) --target-env=vulkan1.2 -DNR4 $< -o $@
 shaders/qmatmul_gate_up_grp_gemv4.spv: shaders/qmatmul_grp_gemv.comp
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP -DNR4 $< -o $@
+# Experimental GEMV replacements, built explicitly (not part of VK_SPV).
+# v2b isolates paired gs=64 scale loads; both keep Float32 activations.
+VK_GEMV_V2_SPV = shaders/qmatmul_grp_gemv_v2.spv shaders/qmatmul_gate_up_grp_gemv_v2.spv \
+                shaders/qmatmul_grp_gemv4_v2.spv shaders/qmatmul_gate_up_grp_gemv4_v2.spv
+VK_GEMV_V2B_SPV = shaders/qmatmul_grp_gemv_v2b.spv shaders/qmatmul_gate_up_grp_gemv_v2b.spv \
+                 shaders/qmatmul_grp_gemv4_v2b.spv shaders/qmatmul_gate_up_grp_gemv4_v2b.spv
+.PHONY: vk-gemv-v2 vk-gemv-v2b
+vk-gemv-v2: $(VK_GEMV_V2_SPV)
+vk-gemv-v2b: $(VK_GEMV_V2B_SPV)
+shaders/qmatmul_grp_gemv_v2.spv: shaders/qmatmul_grp_gemv_v2.comp
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+shaders/qmatmul_gate_up_grp_gemv_v2.spv: shaders/qmatmul_grp_gemv_v2.comp
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gemv4_v2.spv: shaders/qmatmul_grp_gemv_v2.comp
+	$(GLSLC) --target-env=vulkan1.2 -DNR4 $< -o $@
+shaders/qmatmul_gate_up_grp_gemv4_v2.spv: shaders/qmatmul_grp_gemv_v2.comp
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP -DNR4 $< -o $@
+shaders/qmatmul_grp_gemv_v2b.spv: shaders/qmatmul_grp_gemv_v2.comp
+	$(GLSLC) --target-env=vulkan1.2 -DSCALE_PAIR $< -o $@
+shaders/qmatmul_gate_up_grp_gemv_v2b.spv: shaders/qmatmul_grp_gemv_v2.comp
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP -DSCALE_PAIR $< -o $@
+shaders/qmatmul_grp_gemv4_v2b.spv: shaders/qmatmul_grp_gemv_v2.comp
+	$(GLSLC) --target-env=vulkan1.2 -DNR4 -DSCALE_PAIR $< -o $@
+shaders/qmatmul_gate_up_grp_gemv4_v2b.spv: shaders/qmatmul_grp_gemv_v2.comp
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP -DNR4 -DSCALE_PAIR $< -o $@
 shaders/qmatmul_coop2.spv: shaders/qmatmul_coop2.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DDBUF $< -o $@
