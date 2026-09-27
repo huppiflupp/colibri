@@ -794,8 +794,13 @@ int coli_vk_init(const char *spv_path) {
         /* grouped expert shaders: need device addresses and gen 2 (wave64);
          * COLI_VK_GRP=0 off, COLI_VK_GRP_TT=<token tiles> (default 2) */
         const char *eg = getenv("COLI_VK_GRP"), *gt = getenv("COLI_VK_GRP_TT");
-        G.grp_tt = gt ? atoi(gt) : 4; /* power of two only: the double-buffered x fetch splits 64 inputs into
-         * 4*TT per lane (XPL); TT 16 exceeds 64 KB shared memory for gate_up */
+        G.grp_tt = gt ? atoi(gt) : 4; /* Allowed TT: 2, 4, 8. Powers of two only, because the double-buffered x fetch
+         * splits 64 inputs into 4*TT per lane (XPL); other values compute garbage.
+         * The upper bound is a hardware limit: TT 16 needs 68 KB of shared memory
+         * for gate_up (64 KB per workgroup on RDNA3.5 / Radeon 8060S) and 64 f32
+         * accumulator tiles per subgroup. On hardware with more shared memory and
+         * registers per workgroup the limit can be raised (TT 16 is the ceiling of
+         * the XPL scheme: 64 / XPL must stay >= 1). */
         if (G.grp_tt != 2 && G.grp_tt != 4 && G.grp_tt != 8) G.grp_tt = 4;
         if (G.coop2 && G.has_bda && !(eg && *eg == '0')) {
             const char *nm[2] = {"_grp.spv", "_gate_up_grp.spv"};

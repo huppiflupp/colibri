@@ -74,7 +74,7 @@ uint xix(uint r, uint k) { return ((r >> 4u) * 4u + (k >> 4u)) * 256u + (r & 15u
 // Register double buffering: the raw words, scales and x values of the NEXT 64-input
 // step are fetched into registers while the matrix units work on the current step
 // out of shared memory; they are dequantised into shared memory after a barrier.
-#define XPL (TM * 64u / 256u)          // x values per lane per step; TT must be 2, 4 or 8
+#define XPL (TM * 64u / 256u)          // x values per lane per step; TT must be 2, 4 or 8 (16 would exceed 64 KB shared memory on current hardware)
 uint rwg[8];
 float rsg[4];
 #ifdef GATE_UP
