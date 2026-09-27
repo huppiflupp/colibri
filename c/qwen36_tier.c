@@ -938,6 +938,24 @@ int qt_attn_prefill(float *ctx, const float *q, const float *K, const float *V, 
     return 0;
 #endif
 }
+/* Block tail (Vulkan): the next qt_dn_block / qt_attn_block also does the residual
+ * add, the following RMSNorm and the router matmul (dense handle hr) in its submit. */
+int qt_block_post(float *x, float *n, const float *w, float eps, int hr, float *logits, int E){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    if(hr < 0 || hr >= G_dense_n || !G_dense[hr].on || !coli_vk_available()) return 0;
+    coli_vk_block_post(x, n, w, eps, G_dense[hr].t, logits, E);
+    return 1;
+#else
+    (void)x;(void)n;(void)w;(void)eps;(void)hr;(void)logits;(void)E; return 0;
+#endif
+}
+int qt_block_post_done(void){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_available() ? coli_vk_block_post_done() : 0;
+#else
+    return 0;
+#endif
+}
 /* Host arena of the Vulkan backend (slot 0..3): prefill rows kept there are bound
  * by the blocks and the expert group directly, without their staging copies. */
 float *qt_host_arena(int slot, size_t bytes){

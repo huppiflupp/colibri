@@ -138,7 +138,11 @@ static struct {
     int ts_on; VkQueryPool tsq; double ts_period; double eg_th0;
     /* whole attention layer of a prefill (coli_vk_attn_block) */
     VkShaderModule shader_ab, shader_ag; VkDescriptorSetLayout dsl_ab, dsl_ag; VkPipelineLayout plyt_ab, plyt_ag;
-    VkPipeline pipe_ab, pipe_ag; VkDescriptorPool dpool_ab, dpool_ag, ab_pool; VkDescriptorSet dset_ab, dset_ag, ab_mm[4];
+    VkPipeline pipe_ab, pipe_ag; VkDescriptorPool dpool_ab, dpool_ag, ab_pool; VkDescriptorSet dset_ab, dset_ag, ab_mm[5];
+    /* block tail (coli_vk_block_post): residual + RMSNorm, then the router matmul */
+    VkShaderModule shader_rn; VkDescriptorSetLayout dsl_rn; VkPipelineLayout plyt_rn;
+    VkPipeline pipe_rn; VkDescriptorPool dpool_rn; VkDescriptorSet dset_rn; Scratch rn_w;
+    struct { int pending, done; float *x, *n, *logits; const float *w; float eps; ColiVkTensor *router; int E; } post;
     Scratch ab_x, ab_qkv, ab_nw, ab_qb, ab_gb, ab_k, ab_v, ab_cx, ab_ag, ab_y;
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
@@ -216,6 +220,7 @@ struct PCDP { int S, conv_dim, vk, vh, kdim; float scale; };    /* dn_prep.comp 
 struct PCDG { int S, vh, vdim, pstride, zoff; float eps; };     /* dn_gnorm.comp */
 struct PCAB { int S, H, KV, hd, qdim, gate_dim, rotary, pos_base, nt, has_qn, has_kn, q_off, k_off, v_off; float eps, theta; };  /* attn_prep.comp */
 struct PCAG { int n, has_gate; };                               /* attn_gate.comp */
+struct PCRN { int S, D; float eps; };                           /* resid_norm.comp */
 struct PCGRP { int I, O; float limit; int kgat; int ibase; };                        /* qmatmul_grp.comp */
 
 static int pick_memtype(VkPhysicalDevice phys) {
@@ -946,14 +951,20 @@ int coli_vk_init(const char *spv_path) {
             build_pipeline(G.dev, 3, sizeof(struct PCAG), G.shader_ag, &G.dsl_ag, &G.plyt_ag, &G.pipe_ag, &G.dpool_ag, &G.dset_ag);
         if (ok) {
             VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 16};
-            VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 4, .poolSizeCount = 1, .pPoolSizes = &ps};
-            VkDescriptorSetLayout l4[4] = {G.dsl, G.dsl, G.dsl, G.dsl};
-            VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorSetCount = 4, .pSetLayouts = l4};
+            VkDescriptorPoolSize ps5 = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 20};
+            ps = ps5;
+            VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 5, .poolSizeCount = 1, .pPoolSizes = &ps};
+            VkDescriptorSetLayout l4[5] = {G.dsl, G.dsl, G.dsl, G.dsl, G.dsl};   /* [4]: the block tail's router */
+            VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorSetCount = 5, .pSetLayouts = l4};
             ok = vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.ab_pool) == VK_SUCCESS;
             ai.descriptorPool = G.ab_pool;
             ok = ok && vkAllocateDescriptorSets(G.dev, &ai, G.ab_mm) == VK_SUCCESS;
         }
         if (!ok) { G.pipe_ab = G.pipe_ag = VK_NULL_HANDLE; }
+        char pr[512]; derive_dir_file(spv_path, "resid_norm.spv", pr, sizeof(pr));
+        if (ok && (G.shader_rn = load_spv(G.dev, pr)) &&
+            !build_pipeline(G.dev, 4, sizeof(struct PCRN), G.shader_rn, &G.dsl_rn, &G.plyt_rn, &G.pipe_rn, &G.dpool_rn, &G.dset_rn))
+            G.pipe_rn = VK_NULL_HANDLE;
     }
     /* Optional DeltaNet prefill recurrence (COLI_VK_DN_RECUR=0 turns it off). */
     {
@@ -1528,6 +1539,39 @@ static void cc_barrier(VkCommandBuffer cb) {
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
+/* Block tail for the next coli_vk_dn_block / coli_vk_attn_block call (one-shot):
+ * after the block, the same submit adds its output to the residual x and writes
+ * n = RMSNorm(x) * (1 + w) (resid_norm.comp), then logits = n Wr^T (the router).
+ * x, n, logits and the block output must be host-arena rows. coli_vk_block_post_done
+ * says whether the last block ran it; if not the caller does these steps itself. */
+void coli_vk_block_post(float *x, float *n, const float *w, float eps, ColiVkTensor *router, float *logits, int E) {
+    G.post.pending = G.ready && G.pipe_rn && router && x && n && logits && w;
+    G.post.done = 0; G.post.x = x; G.post.n = n; G.post.w = w; G.post.eps = eps;
+    G.post.router = router; G.post.logits = logits; G.post.E = E;
+}
+int coli_vk_block_post_done(void) { G.post.pending = 0; return G.post.done; }
+static void post_record(VkCommandBuffer cb, VkBuffer ybuf, int S, int D) {
+    if (!G.post.pending) return;
+    G.post.pending = 0;
+    ColiVkTensor *r = G.post.router;
+    size_t nx = (size_t)S * D * sizeof(float);
+    VkBuffer xb = arena_buf(G.post.x, nx), nb = arena_buf(G.post.n, nx),
+             lb = arena_buf(G.post.logits, (size_t)S * G.post.E * sizeof(float));
+    if (!ybuf || !xb || !nb || !lb || r->I != D || r->O != G.post.E || !scratch_reserve(&G.rn_w, (size_t)D * sizeof(float))) return;
+    memcpy(G.rn_w.ptr, G.post.w, (size_t)D * sizeof(float));
+    cc_barrier(cb);
+    VkDescriptorBufferInfo bi[4] = {{xb, 0, VK_WHOLE_SIZE}, {ybuf, 0, VK_WHOLE_SIZE}, {G.rn_w.buf, 0, VK_WHOLE_SIZE}, {nb, 0, VK_WHOLE_SIZE}};
+    wr_desc(G.dset_rn, 4, bi);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_rn);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_rn, 0, 1, &G.dset_rn, 0, NULL);
+    struct PCRN pc = {S, D, G.post.eps};
+    vkCmdPushConstants(cb, G.plyt_rn, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cb, (uint32_t)S, 1, 1);
+    cc_barrier(cb);
+    rec_mm(cb, G.ab_mm[4], r, nb, lb, S);
+    G.post.done = 1;
+}
+
 /* A whole DeltaNet layer of a prefill block in ONE submit, nothing read back in
  * between: qkv|z projection (proj, int8 [proj_dim x H]) -> causal conv + SiLU ->
  * l2norm/beta/exp(g) -> gated delta rule -> gated RMSNorm -> out_proj (outp,
@@ -1613,6 +1657,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     cc_barrier(cb); ts_stage(cb, 4);
     /* 6. out_proj */
     rec_mm(cb, G.db_mm[1], outp, G.db_or.buf, ya ? ya : G.db_y.buf, S); ts_stage(cb, 5);
+    post_record(cb, ya, S, H);
     host_read_barrier(cb);
     ts_end(cb, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(cb), "endCmd");
@@ -1747,6 +1792,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
     cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 5);
     /* 5. o_proj */
     rec_mm(cb, G.ab_mm[3], to, G.ab_ag.buf, ya ? ya : G.ab_y.buf, S); ts_stageb(cb, TSB_ATTN, 6);
+    post_record(cb, ya, S, D);
     host_read_barrier(cb);
     ts_end(cb, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(cb), "endCmd");

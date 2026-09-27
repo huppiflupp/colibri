@@ -1,0 +1,34 @@
+#version 450
+// Residual add + RMSNorm of a prefill block on the GPU (Qwen3.6, Qwen3_5MoeRMSNorm):
+//   x[s] += y[s];  n[s] = x[s] * rsqrt(mean(x[s]^2) + eps) * (1 + w)
+// One workgroup per token row; the row stays in registers between the two passes.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer XB { float x[]; };               // [S][D] residual, updated
+layout(std430, binding = 1) readonly buffer YB { float y[]; };      // [S][D] sublayer output
+layout(std430, binding = 2) readonly buffer WB { float w[]; };      // [D]
+layout(std430, binding = 3) writeonly buffer NB { float n[]; };     // [S][D]
+layout(push_constant) uniform P { int S, D; float eps; } p;
+#define MAXPT 16                        // D <= 256 * 16
+shared float red[32];
+void main() {
+    uint s = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    uint b = s * uint(p.D);
+    float v[MAXPT], ss = 0.0;
+    [[unroll]] for (uint j = 0u; j < MAXPT; j++) {
+        uint d = tid + 256u * j;
+        v[j] = 0.0;
+        if (d < uint(p.D)) { v[j] = x[b + d] + y[b + d]; x[b + d] = v[j]; ss += v[j] * v[j]; }
+    }
+    ss = subgroupAdd(ss);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = ss;
+    barrier();
+    if (tid == 0u) { float t = 0.0; for (uint i = 0u; i < gl_NumSubgroups; i++) t += red[i]; red[31] = t; }
+    barrier();
+    float r = 1.0 / sqrt(red[31] / float(p.D) + p.eps);
+    [[unroll]] for (uint j = 0u; j < MAXPT; j++) {
+        uint d = tid + 256u * j;
+        if (d < uint(p.D)) n[b + d] = v[j] * r * (1.0 + w[d]);
+    }
+}

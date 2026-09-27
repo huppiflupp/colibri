@@ -62,6 +62,10 @@ float *coli_vk_dn_stage(int which, size_t bytes);
 /* persistent host-visible, host-cached buffer (slot 0..3) the prefill keeps its rows in;
  * blocks/groups called with exactly this pointer bind it instead of copying */
 float *coli_vk_host_arena(int slot, size_t bytes);
+/* one-shot tail for the next dn/attn block: x += out; n = RMSNorm(x)*(1+w); logits = n Wr^T
+ * (all host-arena rows); _done() says whether it ran and clears the request */
+void coli_vk_block_post(float *x, float *n, const float *w, float eps, ColiVkTensor *router, float *logits, int E);
+int coli_vk_block_post_done(void);
 int  coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn,
                       const float *vsrc, int vstride, int voff, const float *beta, const float *gexp,
                       int S, int vh, int vk, int kdim, int vdim);

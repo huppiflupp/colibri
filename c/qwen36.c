@@ -2530,11 +2530,15 @@ static void qt_cpu_expert(Model *m, int layer, int eid, float w, const float *xs
     for (int d = 0; d < D; d++) os[d] += w * hh[d];
 }
 
+/* router logits the previous block's GPU tail already computed (host arena,
+ * consumed by the next moe() call) */
+static float *g_moe_pre_logits;
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
-    float *logits = falloc((int64_t)S*E);
+    float *pre = g_moe_pre_logits; g_moe_pre_logits = NULL;
+    float *logits = pre ? pre : falloc((int64_t)S*E);
     double _tr = tm_now();
-    if (!(S >= qt_trunk_min_s() && l->qth_gate && qtd_batch(l->qth_gate, logits, x, S, D, E)))
+    if (!pre && !(S >= qt_trunk_min_s() && l->qth_gate && qtd_batch(l->qth_gate, logits, x, S, D, E)))
         matmul_d(logits, x, &l->gate, S, D, E);
     tm_add(S, 4, tm_now()-_tr);
     if (c->has_bias && l->gate_bias) {
@@ -2888,7 +2892,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
      * once per bounded chunk. */
     if (!use_qt) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
-    free(logits); free(g); free(u); free(hh); free(sh); free(shu); free(shd);
+    if (!pre) free(logits);
+    free(g); free(u); free(hh); free(sh); free(shu); free(shd);
 }
 
 /* Gated DeltaNet (linear_attention) forward — recurrent gated-delta-rule.
@@ -3458,6 +3463,17 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
      * Not with the layer dump or the pilot, which look at x in between. */
     int fuse = S > 1 && !lf && !(allow_prefetch && g_pilot >= 1 && S <= 8);
     int normed = 0;                       /* nrm already holds in_ln(x) for layer i */
+    /* GPU block tail: with the arena the residual stream moves into it as well
+     * (slot 2, logits slot 3); each DeltaNet/attention block then adds its output
+     * to x, applies post_ln and runs the router in its own submit
+     * (QWEN_BLOCK_TAIL=0: these steps stay on the CPU) */
+    float *xcaller = x, *lg = NULL;
+    int tail = fuse && arena && !(getenv("QWEN_BLOCK_TAIL") && getenv("QWEN_BLOCK_TAIL")[0] == '0');
+    if (tail) {
+        float *xg = qt_host_arena(2, sizeof(float) * (size_t)S * D);
+        lg = qt_host_arena(3, sizeof(float) * (size_t)S * c->n_experts);
+        if (xg && lg) { memcpy(xg, x, sizeof(float) * (size_t)S * D); x = xg; } else tail = 0;
+    }
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
         /* rows are independent: a prefill block normalises them in parallel,
@@ -3472,6 +3488,8 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         }
         double _t0 = tm_now();
+        int posted = tail && l->qth_gate &&
+                     qt_block_post(x, nrm, l->post_ln, c->eps, l->qth_gate - 1, lg, c->n_experts);
         if (c->is_attn[i]) {
             attention(m, l, i, nrm, S, pos_base, tmp);
             tm_add(S, 1, tm_now()-_t0);
@@ -3480,6 +3498,10 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
             tm_add(S, 0, tm_now()-_t0);
         }
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
+        if (posted && qt_block_post_done()) {   /* x, nrm and the router logits came back with the block */
+            g_moe_pre_logits = lg;
+            goto mixer_done;
+        }
         if (fuse) {
             #pragma omp parallel for schedule(static)
             for (int s = 0; s < S; s++) {
@@ -3537,6 +3559,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         if (allow_prefetch && g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
             pilot_prefetch(m, i + 3, x, S);
     }
+    if (x != xcaller) memcpy(xcaller, x, sizeof(float) * (size_t)S * D);
     if (!arena) { free(nrm); free(tmp); }
 }
 
