@@ -1170,6 +1170,7 @@ static int dense_bits(void){ static int v=-1; if(v<0){ const char *e=getenv("COL
  * K1b planar layout (unsigned nibbles v+8, block b: lo nibbles = elements
  * b*64..b*64+31, hi = b*64+32..b*64+63). The quantizer is the symmetric
  * absmax/7 the expert containers use. */
+static int q4_signed_start(void){ static int v=-1; if(v<0){ const char *e=getenv("COLI_DENSE_Q4_SIGNED"); v=e&&*e=='1'; } return v; }
 static void pack_int4_g64_planar(const float *w, uint8_t *q4, float *sg, int O, int I){
     int rb = I / 2, ng = I / 64;
     #pragma omp parallel for schedule(static)
@@ -1187,6 +1188,13 @@ static void pack_int4_g64_planar(const float *w, uint8_t *q4, float *sg, int O, 
              * rounds: measured on the 35B this recovers a third of the
              * perplexity absmax alone loses at 4 bits. */
             float best_s = amax / 7.f; if (best_s < 1e-8f) best_s = 1e-8f;
+            /* COLI_DENSE_Q4_SIGNED=1: start from the SIGNED extreme mapped to -8, so the
+             * one extra negative code is used (int4 is asymmetric: -8..7); the scale may
+             * then be negative (agent-int4 candidate B, without the imatrix part). */
+            if (q4_signed_start()) {
+                float smax = 0.f; for (int k = 0; k < 64; k++) if (fabsf(blk[k]) > fabsf(smax)) smax = blk[k];
+                if (fabsf(smax) > 1e-8f) best_s = smax / -8.f;
+            }
             int best_q[64]; double best_err = 1e30;
             float s = best_s;
             for (int round = 0; round < 4; round++) {
@@ -1200,7 +1208,7 @@ static void pack_int4_g64_planar(const float *w, uint8_t *q4, float *sg, int O, 
                 if (err < best_err) { best_err = err; best_s = s; memcpy(best_q, q, sizeof q); }
                 if (qq <= 0) break;
                 float ns = (float)(wq / qq);          /* least-squares scale for these codes */
-                if (ns <= 0.f || ns == s) break;
+                if (ns * s <= 0.f || ns == s) break;  /* same sign as the start (may be negative) */
                 s = ns;
             }
             sr[g] = best_s;
