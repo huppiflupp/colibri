@@ -1380,6 +1380,7 @@ int qt_batch_gpu_reduce(void){
     const char *e=getenv("QT_PREFILL_GPU_REDUCE");
     return qt_batch_ok() && !(e && *e=='0');  /* checked: PPL 7.71 vs 7.66 (1024 wikitext tokens) */
 }
+static double qt_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e3+t.tv_nsec/1e6; }
 static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float *x,
                                const float *weights,float *res,uint8_t *done,
                                QtTensor *xg,QtTensor *xu,QtTensor *xd){
@@ -1387,6 +1388,7 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
     /* xg/xu/xd: an extra always-resident pseudo expert with id G.ne (the shared
      * expert, from the dense trunk) that the caller routes as pair k = K-1 */
     int E=G.ne + (xg?1:0), D=G.D, NE=G.ne;
+    static double t_pre, t_gpu, t_post; static long t_n; double t0 = qt_now_ms();
     size_t pairs=(size_t)S*K;
     int *cnt=calloc((size_t)E,sizeof(int)), *first=malloc((size_t)E*sizeof(int));
     int *order=malloc(pairs*sizeof(int));          /* pair ids grouped by expert */
@@ -1430,12 +1432,14 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
     }
     pthread_mutex_unlock(&G.mx);
 
+    double t1 = qt_now_ms();
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     if(ok && weights){
         if(nex) ok=coli_vk_expert_prefill(pg,pg+nex,pg+2*nex,allrows,nex,order,weights,S,K,x,res);
         else memset(res,0,(size_t)S*D*sizeof(float));
     }
 #endif
+    double t2 = qt_now_ms();
     for(int j0=0;ok&&!weights&&j0<nex;j0+=QT_BATCH_GROUP){
         int c=nex-j0<QT_BATCH_GROUP?nex-j0:QT_BATCH_GROUP, rows[QT_BATCH_GROUP];
         size_t r0=(size_t)first[ex[j0]], nr=0;
@@ -1460,6 +1464,9 @@ static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float
     pthread_mutex_unlock(&G.mx);
     free(cnt); free(first); free(order); free(ex); free(fill); free(xb); free(yb); free(pg); free(allrows);
     if(!ok){ memset(done,0,pairs); fprintf(stderr,"[qtier] prefill batch failed at layer %d\n",layer); }
+    t_pre += t1 - t0; t_gpu += t2 - t1; t_post += qt_now_ms() - t2;
+    if(getenv("QT_BATCH_PROF") && ++t_n % 40 == 0)
+        fprintf(stderr,"[qtier] batch prof (40 layers): prep %.1f | backend %.1f | post %.1f ms\n", t_pre, t_gpu, t_post);
     return ok;
 }
 
