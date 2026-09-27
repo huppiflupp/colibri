@@ -21,7 +21,7 @@ layout(constant_id = 0) const uint UNUSED = 0;     // pipeline built like the ti
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SRef { float v[]; };
 layout(std430, binding = 0) readonly buffer X  { vec4 x4[]; };     // input rows (float, read as vec4)
-layout(std430, binding = 1) readonly buffer IT { uvec4 items[]; };  // (expert, row, first output row, -)
+layout(std430, binding = 1) readonly buffer IT { uvec4 items[]; };  // (expert, first row, first output row, rows)
 layout(std430, binding = 2) readonly buffer ET { uint etab[]; };    // as qmatmul_grp.comp
 layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 #ifdef GATE_UP
@@ -81,6 +81,14 @@ float red(float v, uint lpr) {
 #ifndef RPS
 #define RPS 4u                                 // row slots per subgroup and pass (loads in flight)
 #endif
+#ifdef NR4
+#define MAXNR 4u                               // few-row twin: up to 4 input rows per item (item.w),
+#else                                          // the weights read once for all of them
+#define MAXNR 1u
+#endif
+#ifndef NR4
+// one input row per item: the original decode kernel, unchanged (the few-row
+// build below measured slower for a single row: MoE 9.2 -> 11.5 ms/token)
 void main() {
     uvec4 it = items[uint(p.ibase) + gl_WorkGroupID.x];
     uint eb = it.x * 16u;
@@ -163,3 +171,100 @@ void main() {
         }
     }
 }
+#else
+float dotw(int fmt, uvec4 v, uint x0) {        // one uvec4 of weights against input row starting at xsh[x0]
+    if (fmt == 1) return d8(v.x, xsh[x0]) + d8(v.y, xsh[x0 + 1u]) + d8(v.z, xsh[x0 + 2u]) + d8(v.w, xsh[x0 + 3u]);
+    return d4(v.x, xsh[x0], xsh[x0 + 1u]) + d4(v.y, xsh[x0 + 2u], xsh[x0 + 3u]) +
+           d4(v.z, xsh[x0 + 4u], xsh[x0 + 5u]) + d4(v.w, xsh[x0 + 6u], xsh[x0 + 7u]);
+}
+void main() {
+    uvec4 it = items[uint(p.ibase) + gl_WorkGroupID.x];
+    uint eb = it.x * 16u;
+    WRef4 wg = WRef4(packUint2x32(uvec2(etab[eb + 0u], etab[eb + 1u])));
+    SRef gsc = SRef(packUint2x32(uvec2(etab[eb + 2u], etab[eb + 3u])));
+#ifdef GATE_UP
+    WRef4 wu = WRef4(packUint2x32(uvec2(etab[eb + 4u], etab[eb + 5u])));
+    SRef usc = SRef(packUint2x32(uvec2(etab[eb + 6u], etab[eb + 7u])));
+#endif
+    uint xoff = etab[eb + 9u]; int fmt = int(etab[eb + 10u]);
+    uint rowWords = etab[eb + 11u]; int gs = int(etab[eb + 12u]);
+    uint r = it.y, o0 = it.z, nr = clamp(it.w, 1u, MAXNR), tid = gl_LocalInvocationID.x, I = uint(p.I), I4 = I / 4u;
+    for (uint k = 0u; k < nr; k++) {           // input rows r .. r+nr-1 side by side (host: nr * I <= 8192)
+        uint xr = xoff + r + k;
+#ifdef GATE_UP
+        if (p.kgat > 0) xr = uint(order[xr]) / uint(p.kgat);
+#endif
+        for (uint i = tid; i < I4; i += 256u) xsh[k * I4 + i] = x4[xr * I4 + i];
+    }
+    barrier();
+    uint lane = gl_SubgroupInvocationID, nl = gl_SubgroupSize, sg = gl_SubgroupID, nsg = gl_NumSubgroups;
+    uint W4 = fmt == 1 ? I / 16u : I / 32u;            // uvec4 per row
+    uint XW = fmt == 1 ? 4u : 8u;                      // xsh vec4 per uvec4 of weights
+    uint lpr = min(nl, W4), rg = nl / lpr;             // lanes per row, rows side by side
+    uint rr = lane / lpr, jj = lane % lpr;
+    uint ng = (I + uint(gs) - 1u) / uint(max(gs, 1));
+    uint rows_sg = (RPW + nsg - 1u) / nsg;             // rows this subgroup owns
+    for (uint base = 0u; base < rows_sg; base += RPS * rg) {
+        float ag[RPS * MAXNR], au[RPS * MAXNR];
+        [[unroll]] for (uint t = 0u; t < RPS * MAXNR; t++) { ag[t] = 0.0; au[t] = 0.0; }
+        for (uint j = jj; j < W4; j += lpr) {
+            uvec4 vg[RPS];
+#ifdef GATE_UP
+            uvec4 vu[RPS];
+#endif
+            [[unroll]] for (uint t = 0u; t < RPS; t++) {      // all loads first: RPS in flight
+                uint q = sg * rows_sg + base + t * rg + rr, o = o0 + q;
+                bool ok = base + t * rg + rr < rows_sg && q < RPW && o < uint(p.O);
+                vg[t] = ok ? wg.v[o * rowWords / 4u + j] : uvec4(0u);
+#ifdef GATE_UP
+                vu[t] = ok ? wu.v[o * rowWords / 4u + j] : uvec4(0u);
+#endif
+            }
+            float sgv[RPS], suv[RPS];
+            [[unroll]] for (uint t = 0u; t < RPS; t++) {
+                uint q = sg * rows_sg + base + t * rg + rr, o = o0 + q;
+                sgv[t] = 1.0; suv[t] = 1.0;
+                if (fmt == 4 && o < uint(p.O)) {
+                    sgv[t] = gsc.v[o * ng + (j * 32u) / uint(gs)];
+#ifdef GATE_UP
+                    suv[t] = usc.v[o * ng + (j * 32u) / uint(gs)];
+#endif
+                }
+            }
+            /* input row k's values for this word once, against every weight row t
+             * (loading them per t made shared memory the bottleneck) */
+            [[unroll]] for (uint k = 0u; k < MAXNR; k++) if (k < nr) {
+                uint x0 = k * I4 + j * XW;
+                vec4 xv[8];
+                [[unroll]] for (uint i = 0u; i < 8u; i++) xv[i] = (fmt == 1 && i >= 4u) ? vec4(0.0) : xsh[x0 + i];
+                [[unroll]] for (uint t = 0u; t < RPS; t++) {
+                    float dg = fmt == 1 ? d8(vg[t].x, xv[0]) + d8(vg[t].y, xv[1]) + d8(vg[t].z, xv[2]) + d8(vg[t].w, xv[3])
+                                        : d4(vg[t].x, xv[0], xv[1]) + d4(vg[t].y, xv[2], xv[3]) + d4(vg[t].z, xv[4], xv[5]) + d4(vg[t].w, xv[6], xv[7]);
+                    ag[t * MAXNR + k] += sgv[t] * dg;
+#ifdef GATE_UP
+                    float du = fmt == 1 ? d8(vu[t].x, xv[0]) + d8(vu[t].y, xv[1]) + d8(vu[t].z, xv[2]) + d8(vu[t].w, xv[3])
+                                        : d4(vu[t].x, xv[0], xv[1]) + d4(vu[t].y, xv[2], xv[3]) + d4(vu[t].z, xv[4], xv[5]) + d4(vu[t].w, xv[6], xv[7]);
+                    au[t * MAXNR + k] += suv[t] * du;
+#endif
+                }
+            }
+        }
+        [[unroll]] for (uint t = 0u; t < RPS; t++) {
+            uint q = sg * rows_sg + base + t * rg + rr, o = o0 + q;
+            bool ok = base + t * rg + rr < rows_sg && q < RPW && o < uint(p.O);
+            [[unroll]] for (uint k = 0u; k < MAXNR; k++) if (k < nr) {
+                float g = red(ag[t * MAXNR + k], lpr);
+                if (ok && fmt != 4) g *= gsc.v[o];
+#ifdef GATE_UP
+                float u = red(au[t * MAXNR + k], lpr);
+                if (ok && fmt != 4) u *= usc.v[o];
+                if (p.limit > 0.0) { g = min(g, p.limit); u = clamp(u, -p.limit, p.limit); }
+                if (ok && jj == 0u) y[(xoff + r + k) * uint(p.O) + o] = (g / (1.0 + exp(-g))) * u;
+#else
+                if (ok && jj == 0u) y[(xoff + r + k) * uint(p.O) + o] = g;
+#endif
+            }
+        }
+    }
+}
+#endif

@@ -683,7 +683,7 @@ ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o
-VK_SPV    = shaders/expert_gather.spv shaders/expert_reduce.spv shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/qmatmul_coop2.spv shaders/qmatmul_gate_up_coop2.spv shaders/qmatmul_grp.spv shaders/qmatmul_gate_up_grp.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_gate_up_grp_gemv.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/attn_prefill.spv shaders/attn_flash.spv shaders/dn_recur.spv shaders/dn_conv.spv shaders/dn_prep.spv shaders/dn_gnorm.spv shaders/attn_prep.spv shaders/attn_gate.spv shaders/resid_norm.spv shaders/dn_ba.spv
+VK_SPV    = shaders/expert_gather.spv shaders/expert_reduce.spv shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/qmatmul_coop2.spv shaders/qmatmul_gate_up_coop2.spv shaders/qmatmul_grp.spv shaders/qmatmul_gate_up_grp.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_gate_up_grp_gemv.spv shaders/qmatmul_grp_gemv4.spv shaders/qmatmul_gate_up_grp_gemv4.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/attn_prefill.spv shaders/attn_flash.spv shaders/dn_recur.spv shaders/dn_conv.spv shaders/dn_prep.spv shaders/dn_gnorm.spv shaders/attn_prep.spv shaders/attn_gate.spv shaders/resid_norm.spv shaders/dn_ba.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -828,6 +828,10 @@ shaders/qmatmul_grp_gemv.spv: shaders/qmatmul_grp_gemv.comp
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
 shaders/qmatmul_gate_up_grp_gemv.spv: shaders/qmatmul_grp_gemv.comp
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gemv4.spv: shaders/qmatmul_grp_gemv.comp
+	$(GLSLC) --target-env=vulkan1.2 -DNR4 $< -o $@
+shaders/qmatmul_gate_up_grp_gemv4.spv: shaders/qmatmul_grp_gemv.comp
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP -DNR4 $< -o $@
 shaders/qmatmul_coop2.spv: shaders/qmatmul_coop2.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DDBUF $< -o $@
@@ -1211,7 +1215,7 @@ qwen36: qwen36$(EXE)
 endif
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+qwen36$(EXE): qwen36.c qwen36_mtp.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts

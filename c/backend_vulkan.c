@@ -136,6 +136,8 @@ static struct {
     VkPipeline pipe_grp_s[2];   /* TT = 2 twin for the last (<= 32-row) tile of an expert */
     int grp_n[2], grp_ns[2], grp_mix[2];   /* full / small items per phase of the recorded group */
     VkShaderModule shader_gv[2]; VkPipeline pipe_gv[2];   /* grouped GEMV (few rows per expert) */
+    VkShaderModule shader_gv4[2]; VkPipeline pipe_gv4[2]; /* its twin with up to 4 input rows per item */
+    int grp_gemv_nr;                                      /* the recorded group has items with > 1 row */
     int grp_gemv, grp_gemv_max;
     /* dense matmuls with few rows through the grouped GEMV (one table entry) */
     VkDescriptorPool gvd_pool; VkDescriptorSet gvd_set; Scratch gvd_it, gvd_et; int gvd_on;
@@ -901,6 +903,13 @@ int coli_vk_init(const char *spv_path) {
                 if (!G.shader_gv[v] || !build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_gv[v], 0, &G.pipe_gv[v])) G.pipe_gv[v] = VK_NULL_HANDLE;
             }
             if (!G.pipe_gv[0] || !G.pipe_gv[1]) G.pipe_gv[0] = G.pipe_gv[1] = VK_NULL_HANDLE;
+            const char *gnm4[2] = {"_grp_gemv4.spv", "_gate_up_grp_gemv4.spv"};
+            for (int v = 0; G.pipe_gv[0] && v < 2; v++) {
+                char pp[512]; derive_sibling(spv_path, gnm4[v], pp, sizeof(pp));
+                G.shader_gv4[v] = load_spv(G.dev, pp);
+                if (!G.shader_gv4[v] || !build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_gv4[v], 0, &G.pipe_gv4[v])) G.pipe_gv4[v] = VK_NULL_HANDLE;
+            }
+            if (!G.pipe_gv4[0] || !G.pipe_gv4[1]) G.pipe_gv4[0] = G.pipe_gv4[1] = VK_NULL_HANDLE;
             if (G.pipe_gv[0] && !(getenv("COLI_VK_DENSE_GEMV") && getenv("COLI_VK_DENSE_GEMV")[0] == '0')) {
                 VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
                 VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
@@ -1397,7 +1406,8 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         int gv = G.gvd_on && !co && S <= G.grp_gemv_max && I % 32 == 0 && I <= 8192 && t->rowWords % 4 == 0 &&
                  (fmt == 1 || fmt == 2 || (fmt == 4 && t->gs % 32 == 0));
         if (gv) {
-            int nit = S * ((O + 63) / 64);
+            int nrs = G.pipe_gv4[0] && S > 1 && S * I <= 8192 ? S : 1;   /* rows per item: weights read once for all */
+            int nit = (S / nrs) * ((O + 63) / 64);
             gv = scratch_reserve(&G.gvd_it, (size_t)nit * 16) && scratch_reserve(&G.gvd_et, 64);
             if (gv) {
                 uint32_t *e = G.gvd_et.ptr, *it = G.gvd_it.ptr; memset(e, 0, 64);
@@ -1405,11 +1415,11 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                 e[0] = (uint32_t)wa; e[1] = (uint32_t)(wa >> 32); e[2] = (uint32_t)sa; e[3] = (uint32_t)(sa >> 32);
                 e[8] = (uint32_t)S; e[9] = 0; e[10] = (uint32_t)fmt; e[11] = (uint32_t)t->rowWords; e[12] = (uint32_t)t->gs;
                 int k = 0;
-                for (int r = 0; r < S; r++) for (int o0 = 0; o0 < O; o0 += 64) { it[4*k] = 0; it[4*k+1] = (uint32_t)r; it[4*k+2] = (uint32_t)o0; it[4*k+3] = 0; k++; }
+                for (int r = 0; r < S; r += nrs) for (int o0 = 0; o0 < O; o0 += 64) { it[4*k] = 0; it[4*k+1] = (uint32_t)r; it[4*k+2] = (uint32_t)o0; it[4*k+3] = (uint32_t)nrs; k++; }
                 VkDescriptorBufferInfo bi[4] = {{xin, 0, VK_WHOLE_SIZE}, {G.gvd_it.buf, 0, VK_WHOLE_SIZE},
                                                 {G.gvd_et.buf, 0, VK_WHOLE_SIZE}, {G.y.buf, 0, VK_WHOLE_SIZE}};
                 wr_desc(G.gvd_set, 4, bi);
-                vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gv[0]);
+                vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nrs > 1 ? G.pipe_gv4[0] : G.pipe_gv[0]);
                 vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_grp[0], 0, 1, &G.gvd_set, 0, NULL);
                 struct PCGRP gpc = {I, O, 0.f, 0, 0};
                 vkCmdPushConstants(G.cmd, G.plyt_grp[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gpc), &gpc);
@@ -2126,10 +2136,20 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         if (G.grp_gemv) {
             static int rpw_gu = -1; if (rpw_gu < 0) { const char *e = getenv("COLI_VK_GV_RPW"); rpw_gu = e ? atoi(e) : 64; }
             int tot = 0; for (int c = 0; c < count; c++) tot += rows[c];
+            /* all rows of an expert in one item (weights read once) when they fit xsh */
+            int nitems_rows[2] = {0, 0};
+            G.grp_gemv_nr = 0;
+            for (int v = 0; v < 2; v++) { int Iin = v ? D : I; for (int c = 0; c < count; c++) {
+                /* several rows per expert in one item only when some expert has them all:
+                 * one 2-row shared expert switching the whole group to the few-row build
+                 * measured slower (MTP verify, MoE 17.4 ms per step) -> COLI_VK_GRP_NR4 */
+                static int nr4 = -1; if (nr4 < 0) { const char *e = getenv("COLI_VK_GRP_NR4"); nr4 = e && *e == '1'; }
+                int one = nr4 && G.pipe_gv4[0] && rows[c] > 1 && rows[c] * Iin <= 8192;
+                nitems_rows[v] += one ? 1 : rows[c]; G.grp_gemv_nr |= one; } }
             for (int v = 0; v < 2; v++) {
                 static int rpw_dn = -1; if (rpw_dn < 0) { const char *e = getenv("COLI_VK_GV_RPW_DN"); rpw_dn = e ? atoi(e) : 64; }
                 int O = v ? I : D, rpw = v ? rpw_gu : rpw_dn;   /* = RPW of qmatmul_grp_gemv.comp */
-                nbig[v] = tot * ((O + rpw - 1) / rpw); nsm[v] = 0; G.grp_mix[v] = 0;
+                nbig[v] = nitems_rows[v] * ((O + rpw - 1) / rpw); nsm[v] = 0; G.grp_mix[v] = 0; (void)tot;
                 grp = grp && scratch_reserve(&G.grp_it[v], (size_t)nbig[v] * 16) && scratch_reserve(&G.grp_et[v], (size_t)count * 64);
             }
             for (int v = 0; v < 2 && grp; v++) {
@@ -2143,8 +2163,9 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
                     e[0] = (uint32_t)wa; e[1] = (uint32_t)(wa >> 32); e[2] = (uint32_t)sa; e[3] = (uint32_t)(sa >> 32);
                     e[4] = (uint32_t)wb; e[5] = (uint32_t)(wb >> 32); e[6] = (uint32_t)sb; e[7] = (uint32_t)(sb >> 32);
                     e[8] = (uint32_t)rows[c]; e[9] = (uint32_t)off[c]; e[10] = (uint32_t)a->fmt; e[11] = (uint32_t)a->rowWords; e[12] = (uint32_t)a->gs;
-                    for (int r = 0; r < rows[c]; r++)
-                        for (int o0 = 0; o0 < O; o0 += rpw) { uint32_t *q = it + (size_t)n * 4; q[0] = c; q[1] = r; q[2] = o0; q[3] = 0; n++; }
+                    int Iin = v ? D : I, nrs = G.grp_gemv_nr && rows[c] > 1 && rows[c] * Iin <= 8192 ? rows[c] : 1;
+                    for (int r = 0; r < rows[c]; r += nrs)
+                        for (int o0 = 0; o0 < O; o0 += rpw) { uint32_t *q = it + (size_t)n * 4; q[0] = c; q[1] = r; q[2] = o0; q[3] = (uint32_t)nrs; n++; }
                 }
             }
         } else {
@@ -2190,7 +2211,8 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
             struct PCGRP pc = {v ? D : I, v ? I : D, g_swiglu_limit, v && ggat ? ep->K : 0, 0};
             vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_grp[v], 0, 1, &G.dset_grp[v], 0, NULL);
             if (G.grp_n[v]) {
-                vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.grp_gemv ? G.pipe_gv[v] : G.pipe_grp[v]);
+                vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  G.grp_gemv ? (G.grp_gemv_nr ? G.pipe_gv4[v] : G.pipe_gv[v]) : G.pipe_grp[v]);
                 vkCmdPushConstants(G.eg_cmd, G.plyt_grp[v], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                 vkCmdDispatch(G.eg_cmd, (uint32_t)G.grp_n[v], 1, 1);
             }

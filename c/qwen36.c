@@ -2943,7 +2943,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         /* Shared expert folded into the same GPU submit as the routed experts
          * (pair K of every token, weight = its sigmoid gate) when it is GPU-placed:
          * no separate shared-expert round trips. QWEN_SHEXP_FOLD=0 keeps it apart. */
-        int fold = reduce && l->qth_shg && l->qth_shu && l->qth_shd && (S >= qt_trunk_min_s() || S == 1) &&
+        int fold = reduce && l->qth_shg && l->qth_shu && l->qth_shd && (S >= qt_trunk_min_s() || S <= 4) &&
                    !(getenv("QWEN_SHEXP_FOLD") && getenv("QWEN_SHEXP_FOLD")[0] == '0');
         int batch_ok = 0, folded = 0, direct = 0;
         if (fold && res) {
@@ -3094,6 +3094,13 @@ static int dnproj_batch_rows(int S, int H, int O) {
  * exactly those of the token loop (the conv walks its ring per channel, the
  * recurrence per head, matmul_d/matmul are row-exact across S), so the
  * result is bit-identical. QWEN_DN_TOKENWISE=1 keeps the token loop. */
+/* MTP hooks (qwen36_mtp.h): step() also writes the rows' hidden states after
+ * output_norm (g_step_hid, [S][D]) and every row's logits (g_step_logits,
+ * [S][vocab]); deltanet_phased copies each layer's recurrent state and conv ring
+ * as they stand right after token g_dn_cap_after (for dropping a rejected draft). */
+static float *g_step_hid, *g_step_logits;
+static float **g_dn_cap_rec, **g_dn_cap_ring;
+static int g_dn_cap_after = -1, g_dn_cap_n;
 static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c;
     int vh = c->dn_vheads, vk = c->dn_kheads, kdim = c->dn_kdim, vdim = c->dn_vdim;
@@ -3188,6 +3195,18 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
             co[cc] = acc / (1.f + expf(-acc));   /* silu */
         }
     }
+    if (g_dn_cap_after >= 0 && g_dn_cap_after < S && g_dn_cap_ring && g_dn_cap_ring[layer]) {
+        /* the ring as it would stand after token g_dn_cap_after (same rule, S' = that + 1) */
+        int S1 = g_dn_cap_after + 1;
+        float *cap = g_dn_cap_ring[layer];
+        for (int cc = 0; cc < conv_dim; cc++) {
+            const float *rg = ring + (int64_t)cc * (convk - 1);
+            for (int kk = 0; kk < convk - 1; kk++) {
+                int src = S1 - (convk - 1) + kk;
+                cap[(int64_t)cc * (convk - 1) + kk] = src >= 0 ? qkv[(int64_t)src * conv_dim + cc] : rg[src + convk - 1];
+            }
+        }
+    }
     /* carry the ring: the last convk-1 inputs (older ones from the old ring) */
     #pragma omp parallel for schedule(static)
     for (int cc = 0; cc < conv_dim; cc++) {
@@ -3279,7 +3298,13 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
                 float qkd = qh[kk]; const float *Sr = Sh + (int64_t)kk * vdim;
                 for (int vv = 0; vv < vdim; vv++) ov[vv] += qkd * Sr[vv];
             }
+            if (s == g_dn_cap_after && g_dn_cap_rec && g_dn_cap_rec[layer])
+                memcpy(g_dn_cap_rec[layer] + (int64_t)h * kdim * vdim, Sh, sizeof(float) * (size_t)kdim * vdim);
         }
+    }
+    if (!dn_gpu && g_dn_cap_after >= 0 && g_dn_cap_after < S && g_dn_cap_rec && g_dn_cap_rec[layer]) {
+        #pragma omp atomic
+        g_dn_cap_n++;
     }
     if (tm_on()) { double t = tm_now(); g_dn_pf[2] += t - _d0; _d0 = t; }
     /* 4. gated RMSNorm (silu(z) gate) of every row, then one out_proj */
@@ -3860,11 +3885,27 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         free(erow); free(elog);
     }
 #endif
+    if (g_step_hid)
+        for (int s = 0; s < S; s++) rmsnorm_row(g_step_hid + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
+    int all_done = 0;
+    if (g_step_logits) {
+        /* every row's logits; on the GPU in one call (the head read once for all rows) */
+        float *hr = falloc((int64_t)S*D);
+        for (int s = 0; s < S; s++) rmsnorm_row(hr + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
+        all_done = qt_lmhead_matmul_batch(g_step_logits, hr, S, D, c->vocab);
+        if (!all_done)
+            for (int s = 0; s < S - 1; s++) {   /* the last row comes from the regular path below */
+                float *ls = g_step_logits + (int64_t)s * c->vocab;
+                if (!qt_lmhead_matmul(ls, hr + (int64_t)s*D, D, c->vocab)) matmul_d(ls, hr + (int64_t)s*D, &m->lm_head, 1, D, c->vocab);
+            }
+        free(hr);
+    }
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
     double _th = tm_now();
-    if (!qt_lmhead_matmul(logit, last, D, c->vocab))
+    if (all_done) memcpy(logit, g_step_logits + (int64_t)(S-1) * c->vocab, sizeof(float) * (size_t)c->vocab);
+    else if (!qt_lmhead_matmul(logit, last, D, c->vocab))
         matmul_d(logit, last, &m->lm_head, 1, D, c->vocab);
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
     free(x); free(last);
@@ -3878,6 +3919,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             /* mode 2: keep collecting through decode for incremental pin */
         }
     }
+    if (g_step_logits) memcpy(g_step_logits + (int64_t)(S-1) * m->c.vocab, logit, sizeof(float) * (size_t)m->c.vocab);
     return logit;
 }
 
@@ -4169,10 +4211,13 @@ static void ensure_kv(Model *m){
 }
 
 static int serve_eos_ids(int *ids, int cap);
+static void ensure_kv(Model *m);
+#include "qwen36_mtp.h"
 /* Returns the number of tokens generated: n_new, or fewer with STOP_EOS=1 when the
  * model emits <|im_end|> / <|endoftext|> (the CLI is a benchmark and by default
  * always runs n_new steps; the serve loop stops on its own). */
 static int generate(Model *m, const int *prompt, int np, int n_new, int *out) {
+    if (g_mtp.on) return generate_mtp(m, prompt, np, n_new, out);
     Cfg *c = &m->c;
     int eos_ids[4], n_eos = getenv("STOP_EOS") && getenv("STOP_EOS")[0] == '1' ? serve_eos_ids(eos_ids, 4) : 0;
     /* Same ceiling serve_one() enforces. Past max_position_embeddings the RoPE
@@ -4870,6 +4915,8 @@ int main(int argc, char **argv) {
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
     static Model m; model_init(&m, snap, cap, bits);
+    /* QWEN_MTP=<gguf>: the trained MTP block drafts one token per main step (qwen36_mtp.h) */
+    if (getenv("QWEN_MTP") && *getenv("QWEN_MTP") && !mtp_load(&m, getenv("QWEN_MTP"))) return 1;
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());

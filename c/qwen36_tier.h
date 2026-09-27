@@ -39,6 +39,7 @@
  * pacing the expert stream. qt_init places no experts on that device. */
 int  qt_lmhead_init(const int8_t *q, const float *sc, int I, int O);
 int  qt_lmhead_init4(const uint8_t *q4, const float *sg, int I, int O);
+int  qt_lmhead_matmul_batch(float *y, const float *x, int S, int I, int O);
 int  qt_lmhead_matmul(float *y, const float *x, int I, int O);
 
 /* ---- placement table (R4) ------------------------------------------------
@@ -192,6 +193,7 @@ static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(voi
 static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_lmhead_init4(const uint8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static inline int  qt_lmhead_matmul_batch(float*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 #define QT_PLACE_CPU (-1)
 static inline int  qt_place_of(const char*a,int b){(void)a;(void)b;return QT_PLACE_CPU;}

@@ -876,6 +876,12 @@ fail_storage:
 int qt_ready(void){ return G.on; }
 const char *qt_backend_name(void){ return QT_BACKEND; }
 
+static int qt_gpu_rows(int S, int I, int O);
+/* lm_head over S rows in one call (the GPU reads the head once for all of them) */
+int qt_lmhead_matmul_batch(float *y, const float *x, int S, int I, int O){
+    if(!G_lmh.on || S < 1 || !qt_gpu_rows(S, I, O)) return 0;
+    return be_trunk_matmul(&G_lmh.t, y, x, S, I, O, G_lmh.dev);
+}
 int qt_lmhead_init4(const uint8_t *q4, const float *sg, int I, int O){
     if(!G_lmh.dev_ok||!G.on||!q4||!sg||I % 64) return 0;
     if(!be_trunk_upload4(&G_lmh.t,q4,sg,I,O,G_lmh.dev)) return 0;
