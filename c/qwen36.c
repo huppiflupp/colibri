@@ -927,11 +927,14 @@ static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fpr
 /* y[S,O] = x[S,I] @ W^T,  W is [O,I] row-major */
 /* f32 matmul with a vectorised reduction (omp simd over the input dimension):
  * NOT bit-identical to matmul() -- for paths that already are not (the GPU
- * DeltaNet block). Parallel over (output, token). */
+ * DeltaNet block). Parallel over (token, output). */
 static void matmul_vec(float *y, const float *x, const float *W, int S, int I, int O) {
+    /* tokens outer: a thread's x row stays in cache across all O outputs (the
+     * small W is shared); o outer streamed every x row O times -- the DeltaNet
+     * b/a projections (O = 32) read 256 MB per call on a 1011-token block */
     #pragma omp parallel for collapse(2) schedule(static)
-    for (int o = 0; o < O; o++)
-        for (int s = 0; s < S; s++) {
+    for (int s = 0; s < S; s++)
+        for (int o = 0; o < O; o++) {
             const float *w = W + (int64_t)o * I, *xs = x + (int64_t)s * I;
             float acc = 0.f;
             #pragma omp simd reduction(+:acc)
