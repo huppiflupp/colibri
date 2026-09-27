@@ -2133,6 +2133,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
         rec_mm_few_off(cb, G.ab_mm[1], 3, tk, xa ? xa : G.ab_x.buf, G.ab_qkv.buf, nq, S);
         rec_mm_few_off(cb, G.ab_mm[2], 4, tv, xa ? xa : G.ab_x.buf, G.ab_qkv.buf, nq + nk, S);
         cc_barrier(cb);
+        ts_stageb(cb, TSB_ATTN, 0); ts_stageb(cb, TSB_ATTN, 1); ts_stageb(cb, TSB_ATTN, 2);   /* q|k|v together */
     } else {
     rec_mm_off(cb, G.ab_mm[0], tq, xa ? xa : G.ab_x.buf, G.ab_qkv.buf, 0, S);
     cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 0);
