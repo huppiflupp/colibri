@@ -725,6 +725,7 @@ typedef struct {
      * three matrices. Offered per layer as "dnout", "attnproj", "shexp";
      * see trunk_offer_dense / trunk_place_dense. */
     int qth_dnout, qth_q, qth_k, qth_v, qth_o, qth_shg, qth_shu, qth_shd;
+    int qth_gate;              /* router [E x D] on the shared expert's device (prefill blocks only) */
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
@@ -2533,7 +2534,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
     double _tr = tm_now();
-    matmul_d(logits, x, &l->gate, S, D, E);
+    if (!(S >= qt_trunk_min_s() && l->qth_gate && qtd_batch(l->qth_gate, logits, x, S, D, E)))
+        matmul_d(logits, x, &l->gate, S, D, E);
     tm_add(S, 4, tm_now()-_tr);
     if (c->has_bias && l->gate_bias) {
         for (int s = 0; s < S; s++) { float *pr = logits + (int64_t)s*E; for (int e = 0; e < E; e++) pr[e] += l->gate_bias[e]; }
@@ -3358,6 +3360,13 @@ static int trunk_place_dense(Model *m, double *vram_bytes){
         if (l->qth_shg) { placed++; vram += (double)qdw_bytes(&l->sh_g); }
         if (l->qth_shu) { placed++; vram += (double)qdw_bytes(&l->sh_u); }
         if (l->qth_shd) { placed++; vram += (double)qdw_bytes(&l->sh_d); }
+        /* the router beside it (0.5 MB int8, outside the placer's budget): prefill
+         * blocks score all tokens on the tiles instead of a CPU GEMM between two
+         * GPU submits. QWEN_ROUTER_GPU=0 keeps it on the CPU. */
+        if (l->qth_shg && !(getenv("QWEN_ROUTER_GPU") && getenv("QWEN_ROUTER_GPU")[0] == '0')) {
+            l->qth_gate = qdw_place(&l->gate, dev);
+            if (l->qth_gate) { placed++; vram += (double)qdw_bytes(&l->gate); }
+        }
     }
     if (vram_bytes) *vram_bytes = vram;
     return placed;
