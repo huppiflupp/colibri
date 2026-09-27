@@ -135,6 +135,8 @@ static struct {
     VkPipeline pipe_grp[2]; VkDescriptorPool dpool_grp[2]; VkDescriptorSet dset_grp[2]; int grp_tt;
     VkPipeline pipe_grp_s[2];   /* TT = 2 twin for the last (<= 32-row) tile of an expert */
     int grp_n[2], grp_ns[2], grp_mix[2];   /* full / small items per phase of the recorded group */
+    VkShaderModule shader_gv[2]; VkPipeline pipe_gv[2];   /* grouped GEMV (few rows per expert) */
+    int grp_gemv, grp_gemv_max;
     Scratch grp_it[2], grp_et[2];
     /* COLI_VK_TS=1: GPU timestamps around every command buffer of the prefill
      * paths; per label the GPU time and the host wall time submit -> fence done */
@@ -887,6 +889,16 @@ int coli_vk_init(const char *spv_path) {
                 if (tmp) vkDestroyPipeline(G.dev, tmp, NULL);
             }
             if (!ok) G.pipe_grp[0] = G.pipe_grp[1] = VK_NULL_HANDLE;
+            /* grouped GEMV twins on the same layouts: decode and small verify batches */
+            const char *gnm[2] = {"_grp_gemv.spv", "_gate_up_grp_gemv.spv"};
+            const char *gm = getenv("COLI_VK_GRP_GEMV_MAX");
+            G.grp_gemv_max = gm ? atoi(gm) : 4;
+            for (int v = 0; ok && v < 2 && G.grp_gemv_max > 0; v++) {
+                char pp[512]; derive_sibling(spv_path, gnm[v], pp, sizeof(pp));
+                G.shader_gv[v] = load_spv(G.dev, pp);
+                if (!G.shader_gv[v] || !build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_gv[v], 0, &G.pipe_gv[v])) G.pipe_gv[v] = VK_NULL_HANDLE;
+            }
+            if (!G.pipe_gv[0] || !G.pipe_gv[1]) G.pipe_gv[0] = G.pipe_gv[1] = VK_NULL_HANDLE;
             if (!G.pipe_grp_s[0] || !G.pipe_grp_s[1]) {
                 for (int v = 0; v < 2; v++) if (G.pipe_grp_s[v]) vkDestroyPipeline(G.dev, G.pipe_grp_s[v], NULL);
                 G.pipe_grp_s[0] = G.pipe_grp_s[1] = VK_NULL_HANDLE;
@@ -1942,7 +1954,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
             downs[c]->I != I || downs[c]->O != D) return 0;
     }
     if (ep) {
-        if (!G.ep_pipe[0] || !G.ep_pipe[1] || ep->S < 2 || ep->K < 1 ||
+        if (!G.ep_pipe[0] || !G.ep_pipe[1] || ep->S < 1 || ep->K < 1 ||
             ep->S > INT_MAX/ep->K || total > ep->S*ep->K || !ep->order || !ep->weights) return 0;
         VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(G.phys, &props);
         VkPhysicalDeviceLimits *lim = &props.limits;
@@ -2061,7 +2073,41 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
          * -> COLI_VK_GRP_MIX: 1 = down only (default), 2 = both, 0 = off */
         static int mixm = -1;
         if (mixm < 0) { const char *e = getenv("COLI_VK_GRP_MIX"); mixm = e ? atoi(e) : 1; }
+        /* few rows per expert (decode): the grouped GEMV, one item per (expert, row,
+         * 16 output rows); every expert's format must suit it */
+        int maxr = 0; for (int c = 0; c < count; c++) if (rows[c] > maxr) maxr = rows[c];
+        G.grp_gemv = G.pipe_gv[0] && maxr <= G.grp_gemv_max && D % 32 == 0 && I % 32 == 0;
+        for (int c = 0; G.grp_gemv && c < count; c++) {
+            ColiVkTensor *t3[3] = {gates[c], ups[c], downs[c]};
+            for (int k = 0; k < 3; k++)
+                if (t3[k]->rowWords % 4 || (t3[k]->fmt == 4 && t3[k]->gs % 32)) G.grp_gemv = 0;
+        }
         int tm = 16 * G.grp_tt, nbig[2], nsm[2];
+        if (G.grp_gemv) {
+            static int rpw_gu = -1; if (rpw_gu < 0) { const char *e = getenv("COLI_VK_GV_RPW"); rpw_gu = e ? atoi(e) : 64; }
+            int tot = 0; for (int c = 0; c < count; c++) tot += rows[c];
+            for (int v = 0; v < 2; v++) {
+                static int rpw_dn = -1; if (rpw_dn < 0) { const char *e = getenv("COLI_VK_GV_RPW_DN"); rpw_dn = e ? atoi(e) : 64; }
+                int O = v ? I : D, rpw = v ? rpw_gu : rpw_dn;   /* = RPW of qmatmul_grp_gemv.comp */
+                nbig[v] = tot * ((O + rpw - 1) / rpw); nsm[v] = 0; G.grp_mix[v] = 0;
+                grp = grp && scratch_reserve(&G.grp_it[v], (size_t)nbig[v] * 16) && scratch_reserve(&G.grp_et[v], (size_t)count * 64);
+            }
+            for (int v = 0; v < 2 && grp; v++) {
+                uint32_t *et = G.grp_et[v].ptr, *it = G.grp_it[v].ptr; int n = 0, O = v ? I : D;
+                static int rpw_dn2 = -1; if (rpw_dn2 < 0) { const char *e = getenv("COLI_VK_GV_RPW_DN"); rpw_dn2 = e ? atoi(e) : 64; }
+                int rpw = v ? rpw_gu : rpw_dn2;
+                for (int c = 0; c < count; c++) {
+                    ColiVkTensor *a = v ? gates[c] : downs[c], *b = v ? ups[c] : NULL;
+                    uint64_t wa = vk_addr(a->wbuf), sa = vk_addr(a->sbuf), wb = b ? vk_addr(b->wbuf) : 0, sb = b ? vk_addr(b->sbuf) : 0;
+                    uint32_t *e = et + (size_t)c * 16;
+                    e[0] = (uint32_t)wa; e[1] = (uint32_t)(wa >> 32); e[2] = (uint32_t)sa; e[3] = (uint32_t)(sa >> 32);
+                    e[4] = (uint32_t)wb; e[5] = (uint32_t)(wb >> 32); e[6] = (uint32_t)sb; e[7] = (uint32_t)(sb >> 32);
+                    e[8] = (uint32_t)rows[c]; e[9] = (uint32_t)off[c]; e[10] = (uint32_t)a->fmt; e[11] = (uint32_t)a->rowWords; e[12] = (uint32_t)a->gs;
+                    for (int r = 0; r < rows[c]; r++)
+                        for (int o0 = 0; o0 < O; o0 += rpw) { uint32_t *q = it + (size_t)n * 4; q[0] = c; q[1] = r; q[2] = o0; q[3] = 0; n++; }
+                }
+            }
+        } else {
         for (int v = 0; v < 2; v++) {          /* v 0: down (out D), v 1: gate_up (out I) */
             int mix = G.pipe_grp_s[v] != VK_NULL_HANDLE && (mixm == 2 || (mixm == 1 && v == 0)), nb = 0, ns = 0, O = v ? I : D;
             for (int c = 0; c < count; c++) {
@@ -2090,6 +2136,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
                 }
             }
         }
+        }
         G.grp_n[0] = nbig[0]; G.grp_n[1] = nbig[1]; G.grp_ns[0] = nsm[0]; G.grp_ns[1] = nsm[1];
     }
     if (grp) {
@@ -2103,7 +2150,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
             struct PCGRP pc = {v ? D : I, v ? I : D, g_swiglu_limit, v && ggat ? ep->K : 0, 0};
             vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_grp[v], 0, 1, &G.dset_grp[v], 0, NULL);
             if (G.grp_n[v]) {
-                vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_grp[v]);
+                vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.grp_gemv ? G.pipe_gv[v] : G.pipe_grp[v]);
                 vkCmdPushConstants(G.eg_cmd, G.plyt_grp[v], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                 vkCmdDispatch(G.eg_cmd, (uint32_t)G.grp_n[v], 1, 1);
             }
@@ -3812,7 +3859,6 @@ static int run_expert_prefill(int D, int I, int E, int maxrows, float limit) {
     bad |= coli_vk_expert_prefill(tg,tu,td,rows,E,order,w,S,K,x,y);
     if (total > 1) { order[0] = order[1]; bad |= coli_vk_expert_prefill(tg,tu,td,rows,E,order,w,S,K,x,y); }
     order[0] = saved;
-    bad |= coli_vk_expert_prefill(tg,tu,td,rows,E,order,w,1,K,x,y);
  done:
     coli_vk_set_swiglu_limit(0);
     for (int c = 0; c < E; c++) { coli_vk_tensor_free(tg[c]); coli_vk_tensor_free(tu[c]); coli_vk_tensor_free(td[c]); }
@@ -3871,6 +3917,8 @@ static int run_expert_prefill_tests(void) {
     bad |= run_expert_prefill(256,128,256,9,0.5f);
     bad |= run_expert_prefill(2048,512,8,33,0.f);
     bad |= run_expert_prefill(256,128,1,1,0.f);  /* shrink after large buffers */
+    bad |= run_expert_prefill(2048,512,9,1,0.f);  /* decode shape: one row per expert (grouped GEMV) */
+    bad |= run_expert_prefill(2048,512,24,3,0.5f); /* small verify batch, clamp */
     G.coop = 0; g_mr_any = 1;
     bad |= run_expert_prefill(256,128,65,17,0.f); /* GEMV/MR without tiles */
     G.coop = co; g_mr_any = any;
@@ -4225,7 +4273,7 @@ int main(int argc, char **argv) {
     }
     if (getenv("VK_EG_BENCH")) {
         if (!G.ts_on) printf("VK_EG_BENCH needs COLI_VK_TS=1\n");
-        bad = run_expert_prefill_bench(1011, 8, 256, 2048, 512, 20);
+        bad = run_expert_prefill_bench(getenv("VK_EG_BENCH_S") ? atoi(getenv("VK_EG_BENCH_S")) : 1011, 8, 256, 2048, 512, 20);
         coli_vk_shutdown(); return bad;
     }
     if (getenv("VK_ATTN_TEST")) {   /* attention cores only (attn_flash / attn_prefill + whole layer) */

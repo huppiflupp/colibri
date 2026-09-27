@@ -1455,7 +1455,7 @@ static double qt_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,
 static int qt_issue_batch_impl(int layer,const int *eids,int S,int K,const float *x,
                                const float *weights,float *res,uint8_t *done,
                                QtTensor *xg,QtTensor *xu,QtTensor *xd){
-    if(!qt_batch_ok() || S<2 || K<1 || S>INT_MAX/K || layer<0 || layer>=G.nl) return 0;
+    if(!qt_batch_ok() || S<1 || K<1 || S>INT_MAX/K || layer<0 || layer>=G.nl) return 0;
     /* xg/xu/xd: an extra always-resident pseudo expert with id G.ne (the shared
      * expert, from the dense trunk) that the caller routes as pair k = K-1 */
     int E=G.ne + (xg?1:0), D=G.D, NE=G.ne;

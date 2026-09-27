@@ -1,0 +1,165 @@
+#version 450
+// GROUPED GEMV for few rows per expert (decode, S = 1; small verify batches): one
+// dispatch covers every expert of a layer, like qmatmul_grp.comp, but each work
+// item is (expert, one of its rows, a block of RPW output rows) and every weight
+// is read once per row with 16-byte loads -- no tiles, no dequantisation into
+// shared memory (the tile kernel spends a 128 x 64 dequant block on a single row).
+//   y[r,o]   = sum_i x[r,i] * dequant(W[o,i])                     (default)
+//   hid[r,o] = silu(gate[r,o]) * up[r,o]                           (-DGATE_UP)
+// One subgroup per output row (lanes stride uvec4 words), subgroupAdd reduction.
+// fmt: 1 = int8 per-row scale, 2 = int4 per-row scale, 4 = grouped int4 (gs % 32 == 0).
+// Host gates: I % 32 == 0, rowWords % 4 == 0.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint UNUSED = 0;     // pipeline built like the tile kernel (spec const 0)
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SRef { float v[]; };
+layout(std430, binding = 0) readonly buffer X  { vec4 x4[]; };     // input rows (float, read as vec4)
+layout(std430, binding = 1) readonly buffer IT { uvec4 items[]; };  // (expert, row, first output row, -)
+layout(std430, binding = 2) readonly buffer ET { uint etab[]; };    // as qmatmul_grp.comp
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+#ifdef GATE_UP
+layout(std430, binding = 4) readonly buffer OR { int order[]; };    // kgat > 0: token row = order[j] / kgat
+#endif
+layout(push_constant) uniform P { int I, O; float limit; int kgat; int ibase; } p;
+
+#ifndef RPW
+#ifdef GATE_UP
+#define RPW 64u                                // output rows per workgroup (decode, measured 16/32/64/128/256: 64-128 best)
+#else
+#define RPW 64u                                // down: short rows (I = 512), more of them per workgroup
+#endif
+#endif
+shared vec4 xsh[2048];                         // I <= 8192
+
+float i8(uint w, uint k) { return float(int(w << (24u - 8u * k)) >> 24); }
+// dot of one int4 word (8 nibbles, value = n - 8) with 8 inputs
+float d4(uint w, vec4 a, vec4 b) {
+    return a.x * float(int(w & 15u) - 8) + a.y * float(int((w >> 4u) & 15u) - 8) +
+           a.z * float(int((w >> 8u) & 15u) - 8) + a.w * float(int((w >> 12u) & 15u) - 8) +
+           b.x * float(int((w >> 16u) & 15u) - 8) + b.y * float(int((w >> 20u) & 15u) - 8) +
+           b.z * float(int((w >> 24u) & 15u) - 8) + b.w * float(int(w >> 28u) - 8);
+}
+float d8(uint w, vec4 a) { return a.x * i8(w, 0u) + a.y * i8(w, 1u) + a.z * i8(w, 2u) + a.w * i8(w, 3u); }
+
+// row o of one matrix: fmt 4/2 -> uvec4 = 32 inputs, fmt 1 -> uvec4 = 16 inputs
+float row_dot(WRef4 w, SRef sc, int fmt, uint rowWords, int gs, uint o, uint lane, uint nl) {
+    uint I = uint(p.I), rb = o * rowWords / 4u;
+    float acc = 0.0;
+    if (fmt == 1) {
+        for (uint j = lane; j < I / 16u; j += nl) {
+            uvec4 v = w.v[rb + j]; uint x0 = j * 4u;
+            acc += d8(v.x, xsh[x0]) + d8(v.y, xsh[x0 + 1u]) + d8(v.z, xsh[x0 + 2u]) + d8(v.w, xsh[x0 + 3u]);
+        }
+        return acc;   // per-row scale after the reduction
+    }
+    uint ng = (I + uint(gs) - 1u) / uint(max(gs, 1));
+    for (uint j = lane; j < I / 32u; j += nl) {
+        uvec4 v = w.v[rb + j]; uint x0 = j * 8u;
+        float t = d4(v.x, xsh[x0], xsh[x0 + 1u]) + d4(v.y, xsh[x0 + 2u], xsh[x0 + 3u]) +
+                  d4(v.z, xsh[x0 + 4u], xsh[x0 + 5u]) + d4(v.w, xsh[x0 + 6u], xsh[x0 + 7u]);
+        acc += fmt == 4 ? t * sc.v[o * ng + (j * 32u) / uint(gs)] : t;
+    }
+    return acc;
+}
+
+// lanes per row: a row of fmt 4 holds I/32 uvec4 (64 at I = 2048, 16 at I = 512),
+// fmt 1 I/16; LPR lanes share one row, nl/LPR rows run side by side in a subgroup
+float red(float v, uint lpr) {
+    if (lpr >= 64u) return subgroupAdd(v);
+    if (lpr == 32u) return subgroupClusteredAdd(v, 32u);
+    if (lpr == 16u) return subgroupClusteredAdd(v, 16u);
+    if (lpr == 8u) return subgroupClusteredAdd(v, 8u);
+    return subgroupClusteredAdd(v, 4u);
+}
+#ifndef RPS
+#define RPS 4u                                 // row slots per subgroup and pass (loads in flight)
+#endif
+void main() {
+    uvec4 it = items[uint(p.ibase) + gl_WorkGroupID.x];
+    uint eb = it.x * 16u;
+    WRef4 wg = WRef4(packUint2x32(uvec2(etab[eb + 0u], etab[eb + 1u])));
+    SRef gsc = SRef(packUint2x32(uvec2(etab[eb + 2u], etab[eb + 3u])));
+#ifdef GATE_UP
+    WRef4 wu = WRef4(packUint2x32(uvec2(etab[eb + 4u], etab[eb + 5u])));
+    SRef usc = SRef(packUint2x32(uvec2(etab[eb + 6u], etab[eb + 7u])));
+#endif
+    uint xoff = etab[eb + 9u]; int fmt = int(etab[eb + 10u]);
+    uint rowWords = etab[eb + 11u]; int gs = int(etab[eb + 12u]);
+    uint r = it.y, o0 = it.z, tid = gl_LocalInvocationID.x, I = uint(p.I), I4 = I / 4u;
+    uint xr = xoff + r;
+#ifdef GATE_UP
+    if (p.kgat > 0) xr = uint(order[xr]) / uint(p.kgat);
+#endif
+    for (uint i = tid; i < I4; i += 256u) xsh[i] = x4[xr * I4 + i];
+    barrier();
+    uint lane = gl_SubgroupInvocationID, nl = gl_SubgroupSize, sg = gl_SubgroupID, nsg = gl_NumSubgroups;
+    uint W4 = fmt == 1 ? I / 16u : I / 32u;            // uvec4 per row
+    uint lpr = min(nl, W4), rg = nl / lpr;             // lanes per row, rows side by side
+    uint rr = lane / lpr, jj = lane % lpr;
+    uint ng = (I + uint(gs) - 1u) / uint(max(gs, 1));
+    uint rows_sg = (RPW + nsg - 1u) / nsg;             // rows this subgroup owns
+    for (uint base = 0u; base < rows_sg; base += RPS * rg) {
+        float ag[RPS], au[RPS];
+        [[unroll]] for (uint t = 0u; t < RPS; t++) { ag[t] = 0.0; au[t] = 0.0; }
+        for (uint j = jj; j < W4; j += lpr) {
+            uvec4 vg[RPS];
+#ifdef GATE_UP
+            uvec4 vu[RPS];
+#endif
+            [[unroll]] for (uint t = 0u; t < RPS; t++) {      // all loads first: RPS in flight
+                uint q = sg * rows_sg + base + t * rg + rr, o = o0 + q;
+                bool ok = base + t * rg + rr < rows_sg && q < RPW && o < uint(p.O);
+                vg[t] = ok ? wg.v[o * rowWords / 4u + j] : uvec4(0u);
+#ifdef GATE_UP
+                vu[t] = ok ? wu.v[o * rowWords / 4u + j] : uvec4(0u);
+#endif
+            }
+            [[unroll]] for (uint t = 0u; t < RPS; t++) {
+                uint q = sg * rows_sg + base + t * rg + rr, o = o0 + q;
+                if (fmt == 1) {
+                    uint x0 = j * 4u;
+                    ag[t] += d8(vg[t].x, xsh[x0]) + d8(vg[t].y, xsh[x0 + 1u]) + d8(vg[t].z, xsh[x0 + 2u]) + d8(vg[t].w, xsh[x0 + 3u]);
+#ifdef GATE_UP
+                    au[t] += d8(vu[t].x, xsh[x0]) + d8(vu[t].y, xsh[x0 + 1u]) + d8(vu[t].z, xsh[x0 + 2u]) + d8(vu[t].w, xsh[x0 + 3u]);
+#endif
+                } else {
+                    uint x0 = j * 8u;
+                    float sgv = 1.0, suv = 1.0;
+                    if (fmt == 4 && o < uint(p.O)) {
+                        sgv = gsc.v[o * ng + (j * 32u) / uint(gs)];
+#ifdef GATE_UP
+                        suv = usc.v[o * ng + (j * 32u) / uint(gs)];
+#endif
+                    }
+                    ag[t] += sgv * (d4(vg[t].x, xsh[x0], xsh[x0 + 1u]) + d4(vg[t].y, xsh[x0 + 2u], xsh[x0 + 3u]) +
+                                    d4(vg[t].z, xsh[x0 + 4u], xsh[x0 + 5u]) + d4(vg[t].w, xsh[x0 + 6u], xsh[x0 + 7u]));
+#ifdef GATE_UP
+                    au[t] += suv * (d4(vu[t].x, xsh[x0], xsh[x0 + 1u]) + d4(vu[t].y, xsh[x0 + 2u], xsh[x0 + 3u]) +
+                                    d4(vu[t].z, xsh[x0 + 4u], xsh[x0 + 5u]) + d4(vu[t].w, xsh[x0 + 6u], xsh[x0 + 7u]));
+#endif
+                }
+            }
+        }
+        [[unroll]] for (uint t = 0u; t < RPS; t++) {
+            uint q = sg * rows_sg + base + t * rg + rr, o = o0 + q;
+            bool ok = base + t * rg + rr < rows_sg && q < RPW && o < uint(p.O);
+            float g = red(ag[t], lpr);
+            if (ok && fmt != 4) g *= gsc.v[o];
+#ifdef GATE_UP
+            float u = red(au[t], lpr);
+            if (ok && fmt != 4) u *= usc.v[o];
+            if (p.limit > 0.0) { g = min(g, p.limit); u = clamp(u, -p.limit, p.limit); }
+            if (ok && jj == 0u) y[(xoff + r) * uint(p.O) + o] = (g / (1.0 + exp(-g))) * u;
+#else
+            if (ok && jj == 0u) y[(xoff + r) * uint(p.O) + o] = g;
+#endif
+        }
+    }
+}

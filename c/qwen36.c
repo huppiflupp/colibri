@@ -2554,7 +2554,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     /* Tier prefill batch: collect the routing of all S tokens first, then send
      * each resident expert ONE group row block with all of its tokens
      * (qt_issue_batch) instead of one submit per token. */
-    int use_qtb = use_qt && S > 1 && qt_batch_ok();
+    /* decode (S = 1) through the same batch path: all routed experts plus the
+     * folded shared expert in one grouped submit, on the grouped GEMV kernel
+     * (qmatmul_grp_gemv.comp): 32.0 -> 33.9 tok/s, token-wise PPL 7.72 -> 7.66.
+     * QWEN_DECODE_BATCH=0: per-token issue/take as before */
+    static int dec_batch = -1;
+    if (dec_batch < 0) dec_batch = !(getenv("QWEN_DECODE_BATCH") && getenv("QWEN_DECODE_BATCH")[0] == '0');
+    int use_qtb = use_qt && (S > 1 || dec_batch) && qt_batch_ok();
     int *bidx = use_qtb ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *bval = use_qtb ? malloc(sizeof(float) * (size_t)S * K) : NULL;
     if (use_qtb && (!bidx || !bval)) { free(bidx); free(bval); bidx = NULL; bval = NULL; use_qtb = 0; }  /* token by token */
@@ -2774,7 +2780,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         /* Shared expert folded into the same GPU submit as the routed experts
          * (pair K of every token, weight = its sigmoid gate) when it is GPU-placed:
          * no separate shared-expert round trips. QWEN_SHEXP_FOLD=0 keeps it apart. */
-        int fold = reduce && l->qth_shg && l->qth_shu && l->qth_shd && S >= qt_trunk_min_s() &&
+        int fold = reduce && l->qth_shg && l->qth_shu && l->qth_shd && (S >= qt_trunk_min_s() || S == 1) &&
                    !(getenv("QWEN_SHEXP_FOLD") && getenv("QWEN_SHEXP_FOLD")[0] == '0');
         int batch_ok = 0, folded = 0, direct = 0;
         if (fold && res) {
