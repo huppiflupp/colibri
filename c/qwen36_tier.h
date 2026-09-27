@@ -159,6 +159,8 @@ float *qt_host_arena(int slot, size_t bytes);
 int qt_block_post(float *x, float *n, const float *w, float eps, int hr, float *logits, int E);
 int qt_block_post_done(void);
 int qt_dn_ba_ready(void);
+void qt_expert_post(float *x, float *n, const float *w, float eps);
+int qt_expert_post_done(void);
 int qt_dn_recur(float *outv, float *state, const float *qn, const float *kn, const float *v,
                 const float *beta, const float *gexp, int S, int vh, int vk, int kdim, int vdim);
 int qt_attn_prefill(float *ctx, const float *q, const float *K, const float *V, int ldt,
@@ -219,6 +221,8 @@ static inline float *qt_host_arena(int a,size_t b){(void)a;(void)b;return 0;}
 static inline int qt_block_post(float *a,float *b,const float *c,float d,int e,float *f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int qt_block_post_done(void){return 0;}
 static inline int qt_dn_ba_ready(void){return 0;}
+static inline void qt_expert_post(float *a,float *b,const float *c,float d){(void)a;(void)b;(void)c;(void)d;}
+static inline int qt_expert_post_done(void){return 0;}
 static inline int qt_dn_recur(float*a,float*b,const float*c,const float*d,const float*e,const float*f,const float*g,int h,int i,int j,int k,int l){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;return 0;}
 static inline int qt_attn_prefill(float*a,const float*b,const float*c,const float*d,int e,int f,int g,int h,int i,int j,float k){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;return 0;}
 static inline int qt_issue_batch(int a,const int*b,int c,int d,const float*e,float*f,uint8_t*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}

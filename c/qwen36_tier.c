@@ -949,6 +949,20 @@ int qt_block_post(float *x, float *n, const float *w, float eps, int hr, float *
     (void)x;(void)n;(void)w;(void)eps;(void)hr;(void)logits;(void)E; return 0;
 #endif
 }
+void qt_expert_post(float *x, float *n, const float *w, float eps){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    if(coli_vk_available()) coli_vk_expert_post(x, n, w, eps);
+#else
+    (void)x;(void)n;(void)w;(void)eps;
+#endif
+}
+int qt_expert_post_done(void){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_available() ? coli_vk_expert_post_done() : 0;
+#else
+    return 0;
+#endif
+}
 int qt_dn_ba_ready(void){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     return coli_vk_available() && coli_vk_dn_ba_ready();

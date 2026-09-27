@@ -3537,8 +3537,12 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         }
     mixer_done:
         _t0 = tm_now();
+        /* with the block tail the expert group's submit also adds its output to x
+         * and applies the next layer's in_ln (the last layer: x only matters) */
+        if (tail) qt_expert_post(x, nrm, i + 1 < layer_end ? m->L[i + 1].in_ln : l->in_ln, c->eps);
         moe(m, l, i, nrm, S, tmp);
         tm_add(S, 2, tm_now()-_t0);
+        if (tail && qt_expert_post_done()) { normed = i + 1 < layer_end; continue; }
         if (fuse) {
             const float *nw = i + 1 < layer_end ? m->L[i + 1].in_ln : NULL;
             #pragma omp parallel for schedule(static)

@@ -146,6 +146,7 @@ static struct {
     VkShaderModule shader_rn; VkDescriptorSetLayout dsl_rn; VkPipelineLayout plyt_rn;
     VkPipeline pipe_rn; VkDescriptorPool dpool_rn; VkDescriptorSet dset_rn; Scratch rn_w;
     struct { int pending, done; float *x, *n, *logits; const float *w; float eps; ColiVkTensor *router; int E; } post;
+    struct { int pending, done; float *x, *n; const float *w; float eps; } epost;
     Scratch ab_x, ab_qkv, ab_nw, ab_qb, ab_gb, ab_k, ab_v, ab_cx, ab_ag, ab_y;
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
@@ -1557,6 +1558,26 @@ void coli_vk_block_post(float *x, float *n, const float *w, float eps, ColiVkTen
     G.post.router = router; G.post.logits = logits; G.post.E = E;
 }
 int coli_vk_block_post_done(void) { G.post.pending = 0; return G.post.done; }
+static int rn_record(VkCommandBuffer cb, VkBuffer xb, VkBuffer ybuf, VkBuffer nb, const float *w, float eps, int S, int D) {
+    if (!G.pipe_rn || !xb || !ybuf || !nb || !scratch_reserve(&G.rn_w, (size_t)D * sizeof(float))) return 0;
+    memcpy(G.rn_w.ptr, w, (size_t)D * sizeof(float));
+    cc_barrier(cb);
+    VkDescriptorBufferInfo bi[4] = {{xb, 0, VK_WHOLE_SIZE}, {ybuf, 0, VK_WHOLE_SIZE}, {G.rn_w.buf, 0, VK_WHOLE_SIZE}, {nb, 0, VK_WHOLE_SIZE}};
+    wr_desc(G.dset_rn, 4, bi);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_rn);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_rn, 0, 1, &G.dset_rn, 0, NULL);
+    struct PCRN pc = {S, D, eps};
+    vkCmdPushConstants(cb, G.plyt_rn, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cb, (uint32_t)S, 1, 1);
+    return 1;
+}
+/* Tail of the next expert prefill group (one-shot): x += group output; n = RMSNorm(x)
+ * * (1 + w) -- the next layer's input norm -- in the group's submit. */
+void coli_vk_expert_post(float *x, float *n, const float *w, float eps) {
+    G.epost.pending = G.ready && G.pipe_rn && x && n && w; G.epost.done = 0;
+    G.epost.x = x; G.epost.n = n; G.epost.w = w; G.epost.eps = eps;
+}
+int coli_vk_expert_post_done(void) { G.epost.pending = 0; return G.epost.done; }
 static void post_record(VkCommandBuffer cb, VkBuffer ybuf, int S, int D) {
     if (!G.post.pending) return;
     G.post.pending = 0;
@@ -1564,16 +1585,7 @@ static void post_record(VkCommandBuffer cb, VkBuffer ybuf, int S, int D) {
     size_t nx = (size_t)S * D * sizeof(float);
     VkBuffer xb = arena_buf(G.post.x, nx), nb = arena_buf(G.post.n, nx),
              lb = arena_buf(G.post.logits, (size_t)S * G.post.E * sizeof(float));
-    if (!ybuf || !xb || !nb || !lb || r->I != D || r->O != G.post.E || !scratch_reserve(&G.rn_w, (size_t)D * sizeof(float))) return;
-    memcpy(G.rn_w.ptr, G.post.w, (size_t)D * sizeof(float));
-    cc_barrier(cb);
-    VkDescriptorBufferInfo bi[4] = {{xb, 0, VK_WHOLE_SIZE}, {ybuf, 0, VK_WHOLE_SIZE}, {G.rn_w.buf, 0, VK_WHOLE_SIZE}, {nb, 0, VK_WHOLE_SIZE}};
-    wr_desc(G.dset_rn, 4, bi);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_rn);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_rn, 0, 1, &G.dset_rn, 0, NULL);
-    struct PCRN pc = {S, D, G.post.eps};
-    vkCmdPushConstants(cb, G.plyt_rn, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(cb, (uint32_t)S, 1, 1);
+    if (!lb || r->I != D || r->O != G.post.E || !rn_record(cb, xb, ybuf, nb, G.post.w, G.post.eps, S, D)) return;
     cc_barrier(cb);
     rec_mm(cb, G.ab_mm[4], r, nb, lb, S);
     G.post.done = 1;
@@ -2136,6 +2148,12 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.ep_layout[1], 0, 1, &G.ep_set[1], 0, NULL);
         vkCmdPushConstants(G.eg_cmd, G.ep_layout[1], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.eg_cmd, (D+255)/256, ep->S, 1);
+        if (G.epost.pending) {
+            G.epost.pending = 0;
+            size_t nx = (size_t)ep->S * D * sizeof(float);
+            G.epost.done = G.ep_ya && rn_record(G.eg_cmd, arena_buf(G.epost.x, nx), G.ep_ya, arena_buf(G.epost.n, nx),
+                                                G.epost.w, G.epost.eps, ep->S, D);
+        }
     }
     ts_stageb(G.eg_cmd, TSB_EG, 3);
     host_read_barrier(G.eg_cmd);

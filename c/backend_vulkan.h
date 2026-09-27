@@ -67,7 +67,9 @@ float *coli_vk_host_arena(int slot, size_t bytes);
  * (all host-arena rows); _done() says whether it ran and clears the request */
 void coli_vk_block_post(float *x, float *n, const float *w, float eps, ColiVkTensor *router, float *logits, int E);
 int coli_vk_block_post_done(void);
-int coli_vk_dn_ba_ready(void);   /* coli_vk_dn_block takes ba == NULL + wb/wa */
+int coli_vk_dn_ba_ready(void);
+void coli_vk_expert_post(float *x, float *n, const float *w, float eps);   /* one-shot group tail */
+int coli_vk_expert_post_done(void);   /* coli_vk_dn_block takes ba == NULL + wb/wa */
 int  coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn,
                       const float *vsrc, int vstride, int voff, const float *beta, const float *gexp,
                       int S, int vh, int vk, int kdim, int vdim);
