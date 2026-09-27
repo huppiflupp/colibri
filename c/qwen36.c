@@ -874,6 +874,7 @@ double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec+n
 double g_dn_pf[4];                            /* the same split over prefill blocks (S > 1) */
 double g_at_pf[3];                            /* prefill attention: qkv proj+norm+rope, core, gate+o */
 double g_moe_pf[4];                           /* prefill MoE batch: offer, gpu batch, shared, accumulate */
+double g_moe_route_pf;                        /* prefill: softmax/top-k routing after the router matmul */
 double g_tm_step=0;                           /* step() total (decode) */
 static double g_xf_load=0, g_xf_run=0;        /* expert_ffn path: expert fetch (misses) vs compute, decode */
 static double g_tm_win_moe=0; static int g_tm_win_n=0;
@@ -917,8 +918,9 @@ static void tm_report(void){
             g_dn_pf[0], g_dn_pf[1], g_dn_pf[2], g_dn_pf[3]);
     fprintf(stderr,"[timers] prefill attn-sub: qkv+norm+rope %.0f | core %.0f | gate+o %.0f ms\n",
             g_at_pf[0], g_at_pf[1], g_at_pf[2]);
-    fprintf(stderr,"[timers] prefill moe-sub: offer %.0f | gpu batch %.0f | shared %.0f | accumulate %.0f ms\n",
-            g_moe_pf[0], g_moe_pf[1], g_moe_pf[2], g_moe_pf[3]);
+    fprintf(stderr,"[timers] prefill moe-sub: route %.0f | offer %.0f | gpu batch %.0f | shared %.0f | accumulate %.0f | rest %.0f ms\n",
+            g_moe_route_pf, g_moe_pf[0], g_moe_pf[1], g_moe_pf[2], g_moe_pf[3],
+            g_tm_pre[2] - g_tm_pre[4] - g_moe_route_pf - g_moe_pf[0] - g_moe_pf[1] - g_moe_pf[2] - g_moe_pf[3]);
 }
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
@@ -2551,8 +2553,21 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * per token are independent, so a prefill block routes all tokens at once,
      * each exactly as the loop below would; the shared bookkeeping (collected
      * experts, frequencies) follows serially. Only without the features whose
-     * state crosses tokens (momentum logits, cache routing, agreement meter). */
-    int par_route = use_qtb && !(m->momentum_logits && m->pilot_smooth > 0.f) && !g_cache_route && !g_route_agree && E <= 1024;
+     * state crosses tokens (cache routing, agreement meter). The momentum logits
+     * (EMA of the raw router logits for the pilot, on by default: SMOOTH=0.3) do
+     * cross tokens but never feed back into the routing -> updated serially
+     * first, in token order and before softmax_row overwrites the logits. */
+    int par_route = use_qtb && !g_cache_route && !g_route_agree && E <= 1024;
+    double _rt0 = tm_now();
+    if (par_route && m->momentum_logits && m->pilot_smooth > 0.f) {
+        float *ema = m->momentum_logits + (int64_t)layer * E;
+        for (int s = 0; s < S; s++) {
+            const float *pr = logits + (int64_t)s*E;
+            int is_zero = 1; for (int e = 0; e < E; e++) if (ema[e] != 0.f) { is_zero = 0; break; }
+            if (is_zero) { for (int e = 0; e < E; e++) ema[e] = pr[e]; }
+            else { for (int e = 0; e < E; e++) ema[e] = (1.f - m->pilot_smooth)*pr[e] + m->pilot_smooth*ema[e]; }
+        }
+    }
     if (par_route) {
         #pragma omp parallel for schedule(static)
         for (int s = 0; s < S; s++) {
@@ -2716,6 +2731,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
     }
+    if (tm_on() && S > 1) g_moe_route_pf += tm_now() - _rt0;
     if (use_qtb) {
         /* CPU misses, then shared expert, then resident contributions. With
          * QT_PREFILL_GPU_REDUCE=1 the latter arrive as one sum per token; the
