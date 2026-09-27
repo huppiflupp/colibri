@@ -3436,13 +3436,20 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     Cfg *c = &m->c;
     int D = c->hidden;
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    /* prefill blocks fuse each residual add with the RMSNorm that follows it
+     * (post_ln after the mixer, the next layer's in_ln after the MoE): one
+     * parallel pass per token row instead of two, same operations per element.
+     * Not with the layer dump or the pilot, which look at x in between. */
+    int fuse = S > 1 && !lf && !(allow_prefetch && g_pilot >= 1 && S <= 8);
+    int normed = 0;                       /* nrm already holds in_ln(x) for layer i */
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
         /* rows are independent: a prefill block normalises them in parallel,
          * each row exactly as before (decode, S=1, stays serial) */
         /* parallel only for a block: a real branch instead of an if() clause, so
          * decode (S = 1) never enters an OpenMP region here */
-        if (S > 1) {
+        if (normed) normed = 0;
+        else if (S > 1) {
             #pragma omp parallel for schedule(static)
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         } else {
@@ -3457,6 +3464,15 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
             tm_add(S, 0, tm_now()-_t0);
         }
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
+        if (fuse) {
+            #pragma omp parallel for schedule(static)
+            for (int s = 0; s < S; s++) {
+                float *xs = x + (int64_t)s*D; const float *ts = tmp + (int64_t)s*D;
+                for (int d = 0; d < D; d++) xs[d] += ts[d];
+                rmsnorm_row(nrm + (int64_t)s*D, xs, l->post_ln, D, c->eps);
+            }
+            goto mixer_done;
+        }
         /* parallel only for a block: a real branch instead of an if() clause, so
          * decode (S = 1) never enters an OpenMP region here */
         if (S > 1) {
@@ -3476,9 +3492,21 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         } else {
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
         }
+    mixer_done:
         _t0 = tm_now();
         moe(m, l, i, nrm, S, tmp);
         tm_add(S, 2, tm_now()-_t0);
+        if (fuse) {
+            const float *nw = i + 1 < layer_end ? m->L[i + 1].in_ln : NULL;
+            #pragma omp parallel for schedule(static)
+            for (int s = 0; s < S; s++) {
+                float *xs = x + (int64_t)s*D; const float *ts = tmp + (int64_t)s*D;
+                for (int d = 0; d < D; d++) xs[d] += ts[d];
+                if (nw) rmsnorm_row(nrm + (int64_t)s*D, xs, nw, D, c->eps);
+            }
+            normed = nw != NULL;
+            continue;
+        }
         /* parallel only for a block: a real branch instead of an if() clause, so
          * decode (S = 1) never enters an OpenMP region here */
         if (S > 1) {
