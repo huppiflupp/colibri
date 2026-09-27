@@ -873,6 +873,7 @@ double g_qt_iss=0, g_qt_cpu=0, g_qt_tak=0;   /* QTIER-Phasen (Decode) */
 double g_dn_sub[4];                           /* DN: proj, conv+split, l2n+rec, norm+out */
 double g_dn_pf[4];                            /* the same split over prefill blocks (S > 1) */
 double g_at_pf[3];                            /* prefill attention: qkv proj+norm+rope, core, gate+o */
+double g_moe_pf[4];                           /* prefill MoE batch: offer, gpu batch, shared, accumulate */
 double g_tm_step=0;                           /* step() total (decode) */
 static double g_xf_load=0, g_xf_run=0;        /* expert_ffn path: expert fetch (misses) vs compute, decode */
 static double g_tm_win_moe=0; static int g_tm_win_n=0;
@@ -916,6 +917,8 @@ static void tm_report(void){
             g_dn_pf[0], g_dn_pf[1], g_dn_pf[2], g_dn_pf[3]);
     fprintf(stderr,"[timers] prefill attn-sub: qkv+norm+rope %.0f | core %.0f | gate+o %.0f ms\n",
             g_at_pf[0], g_at_pf[1], g_at_pf[2]);
+    fprintf(stderr,"[timers] prefill moe-sub: offer %.0f | gpu batch %.0f | shared %.0f | accumulate %.0f ms\n",
+            g_moe_pf[0], g_moe_pf[1], g_moe_pf[2], g_moe_pf[3]);
 }
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 
@@ -2127,6 +2130,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* split q into query (first hd) and gate (next gate_dim), both per head */
     float *query = falloc((int64_t)S*H*hd);
     float *gate  = falloc((int64_t)S*H*gate_dim);
+    #pragma omp parallel for schedule(static) if(S > 1)
     for (int s = 0; s < S; s++) {
         for (int hh = 0; hh < H; hh++) {
             const float *qs = q + (int64_t)s*q_out + hh*qdim;
@@ -2134,6 +2138,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             if (gate_dim) memcpy(gate + ((int64_t)s*H + hh)*gate_dim, qs + hd, gate_dim*sizeof(float));
         }
     }
+    #pragma omp parallel for schedule(static) if(S > 1)
     for (int s = 0; s < S; s++) {
         for (int hh = 0; hh < H; hh++) {
             float *qh = query + ((int64_t)s*H + hh)*hd;
@@ -2146,6 +2151,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             rope_head_partial(kh, pos_base + s, rotary, kvd, c->theta);
         }
     }
+    #pragma omp parallel for schedule(static) if(S > 1)
     for (int s = 0; s < S; s++) for (int kvh = 0; kvh < KV; kvh++) {
         int t = pos_base + s;
         memcpy(m->K[layer] + ((int64_t)kvh*m->max_t + t)*kvd, k + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
@@ -2187,6 +2193,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     if (tm_on() && S > 1) { double t = tm_now(); g_at_pf[1] += t - _a0; _a0 = t; }
     /* apply attn_output_gate: attn_out *= sigmoid(gate) */
     float *ag = falloc((int64_t)S*H*hd);
+    #pragma omp parallel for schedule(static) if(S > 1)
     for (int s = 0; s < S; s++) for (int hh = 0; hh < H; hh++) for (int dd = 0; dd < hd; dd++) {
         int o = ((int64_t)s*H + hh)*hd + dd;
         float g = gate_dim ? gate[o] : 0.f;
@@ -2458,7 +2465,61 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     int *bidx = use_qtb ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *bval = use_qtb ? malloc(sizeof(float) * (size_t)S * K) : NULL;
     if (use_qtb && (!bidx || !bval)) { free(bidx); free(bval); bidx = NULL; bval = NULL; use_qtb = 0; }  /* token by token */
-    for (int s = 0; s < S; s++) {
+    /* Batch routing in parallel: softmax, group-limited top-k and renormalisation
+     * per token are independent, so a prefill block routes all tokens at once,
+     * each exactly as the loop below would; the shared bookkeeping (collected
+     * experts, frequencies) follows serially. Only without the features whose
+     * state crosses tokens (momentum logits, cache routing, agreement meter). */
+    int par_route = use_qtb && !(m->momentum_logits && m->pilot_smooth > 0.f) && !g_cache_route && !g_route_agree && E <= 1024;
+    if (par_route) {
+        #pragma omp parallel for schedule(static)
+        for (int s = 0; s < S; s++) {
+            float *pr = logits + (int64_t)s*E;
+            softmax_row(pr, E);
+            uint8_t keep[1024]; int Ec = E;
+            if (c->n_group > 1 && c->n_group <= Ec) {
+                int per = E / c->n_group;
+                float gs[1024];
+                for (int gi = 0; gi < c->n_group; gi++) {
+                    float b1 = -1e30f, b2 = -1e30f;
+                    for (int e = gi*per; e < gi*per+per; e++) { float v = pr[e]; if (v > b1) { b2=b1; b1=v; } else if (v > b2) b2=v; }
+                    gs[gi] = b1 + b2;
+                }
+                uint8_t gkeep[1024] = {0};
+                for (int kk = 0; kk < c->topk_group; kk++) {
+                    int bg = -1; float bv = -1e30f;
+                    for (int gi = 0; gi < c->n_group; gi++) { if (!gkeep[gi] && gs[gi] > bv) { bv = gs[gi]; bg = gi; } }
+                    if (bg < 0) break; gkeep[bg] = 1;
+                }
+                for (int e = 0; e < Ec; e++) keep[e] = 0;
+                for (int gi = 0; gi < c->n_group; gi++) if (gkeep[gi]) for (int e = gi*per; e < gi*per+per; e++) keep[e] = 1;
+            } else {
+                for (int e = 0; e < Ec; e++) keep[e] = 1;
+            }
+            int *idx = bidx + (int64_t)s*K; float *val = bval + (int64_t)s*K;
+            uint8_t taken[1024] = {0};
+            for (int kk = 0; kk < K; kk++) {
+                int best = -1; float bv = -1e30f;
+                for (int e = 0; e < E; e++) {
+                    if (!keep[e] || taken[e]) continue;
+                    if (pr[e] > bv) { bv = pr[e]; best = e; }
+                }
+                idx[kk] = best; val[kk] = bv;
+                if (best >= 0) taken[best] = 1;
+            }
+            float sm=0; for (int kk=0;kk<K;kk++) sm+=val[kk]; if (sm>0) for (int kk=0;kk<K;kk++) val[kk]/=sm;
+        }
+        for (int s = 0; s < S; s++) {
+            const int *idx = bidx + (int64_t)s*K;
+            if (m->resident_collecting)
+                for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) m->seen[(int64_t)layer * E + idx[kk]] = 1;
+            if (!m->hot_pinned && m->freq) {
+                uint32_t *freq_l = m->freq + (int64_t)layer * E;
+                for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
+            }
+        }
+    }
+    for (int s = 0; s < (par_route ? 0 : S); s++) {
         float *pr = logits + (int64_t)s*E;
         if (m->momentum_logits && m->pilot_smooth > 0.f) {
             float *ema = m->momentum_logits + (int64_t)layer * E;
@@ -2582,6 +2643,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         /* One expert_get + offer per DISTINCT expert of the layer, carrying its
          * use count (heat and hit statistics as for per-token offers), instead
          * of one mutex round per routed (token, expert) pair. */
+        extern double g_moe_pf[4];
+        double _m0 = tm_now();
         {
             uint32_t *uses = calloc((size_t)E, sizeof(uint32_t));
             if (uses) {
@@ -2596,6 +2659,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 for (int i = 0; i < S * K; i++) { Slot *sl; expert_get(m, layer, bidx[i], &sl); tier_offer_slot(layer, bidx[i], sl); }
             }
         }
+        if (tm_on()) { double t = tm_now(); g_moe_pf[0] += t - _m0; _m0 = t; }
         int reduce = qt_batch_gpu_reduce();
         float *res = malloc(sizeof(float) * (size_t)S * (reduce ? 1 : K) * D);
         uint8_t *done = calloc((size_t)S * K, 1);
@@ -2603,6 +2667,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         int batch_ok = res && (reduce ? qt_issue_batch_reduce(layer, bidx, S, K, x, bval, res, done)
                                      : qt_issue_batch(layer, bidx, S, K, x, res, done));
         if (!batch_ok) memset(done, 0, (size_t)S * K);
+        if (tm_on()) { double t = tm_now(); g_moe_pf[1] += t - _m0; _m0 = t; }
         /* Shared expert of all S tokens in three batched matmuls when it is GPU-
          * placed (a prefill block); the sum per token keeps its old place below. */
         int Ish = c->shared_inter;
@@ -2613,8 +2678,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             double _ts2 = tm_now();
             if (!qtd_batch(l->qth_shg, hg, x, S, D, Ish)) matmul_d(hg, x, &l->sh_g, S, D, Ish);
             if (!qtd_batch(l->qth_shu, hu, x, S, D, Ish)) matmul_d(hu, x, &l->sh_u, S, D, Ish);
+            #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < (int64_t)S * Ish; i++) { float sv = hg[i]; hg[i] = (sv / (1.f + expf(-sv))) * hu[i]; }
             if (!qtd_batch(l->qth_shd, shb, hg, S, Ish, D)) matmul_d(shb, hg, &l->sh_d, S, Ish, D);
+            #pragma omp parallel for schedule(static)
             for (int s = 0; s < S; s++) {
                 float sgate = 1.f;
                 if (l->sh_gate) {
@@ -2627,6 +2694,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             tm_add(S, 3, tm_now()-_ts2);
             free(hg); free(hu);
         }
+        if (tm_on()) { double t = tm_now(); g_moe_pf[2] += t - _m0; _m0 = t; }
+        /* Per-token sums in their fixed order. Tokens are independent, but a CPU
+         * miss computes into shared scratch (g, u, hh) -> parallel only when the
+         * GPU took every pair and the shared expert came batched. */
+        int any_miss = 0;
+        for (int i = 0; i < S * K && !any_miss; i++) any_miss = !done[i];
+        #pragma omp parallel for schedule(static) if(!any_miss && shb)
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s*D; float *os = out + (int64_t)s*D;
             for (int kk = 0; kk < K; kk++)
@@ -2642,6 +2716,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 for (int d = 0; d < D; d++) os[d] += w * row[d];
             }
         }
+        if (tm_on()) { g_moe_pf[3] += tm_now() - _m0; }
         free(res); free(done); free(bidx); free(bval); free(shb); free(sgb);
     }
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
@@ -3188,6 +3263,9 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
+        /* rows are independent: a prefill block normalises them in parallel,
+         * each row exactly as before (decode, S=1, stays serial) */
+        #pragma omp parallel for schedule(static) if(S > 1)
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         double _t0 = tm_now();
         if (c->is_attn[i]) {
@@ -3198,14 +3276,17 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
             tm_add(S, 0, tm_now()-_t0);
         }
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
+        #pragma omp parallel for schedule(static) if(S > 1)
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* post-deltanet residual */
         if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
             pilot_prefetch(m, i + 1, x, S);
+        #pragma omp parallel for schedule(static) if(S > 1)
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
         _t0 = tm_now();
         moe(m, l, i, nrm, S, tmp);
         tm_add(S, 2, tm_now()-_t0);
+        #pragma omp parallel for schedule(static) if(S > 1)
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);
         if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
