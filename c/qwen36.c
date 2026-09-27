@@ -2935,22 +2935,27 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
      * the placed trunk uses anyway; the rest f32.) */
     if (l->qth_dnout && qt_dnproj_ready(layer) && S >= qt_trunk_min_s() &&
         !(getenv("QWEN_DN_BLOCK") && getenv("QWEN_DN_BLOCK")[0] == '0')) {
-        float *bb = falloc((int64_t)S * vh), *aa = falloc((int64_t)S * vh);
         float *ba = falloc((int64_t)S * 2 * vh), *par = falloc(2 * vh);
         double _tb = tm_now();
-        matmul_vec(bb, x, l->dn_b, S, H, vh);
-        matmul_vec(aa, x, l->dn_a, S, H, vh);
+        /* b | a in one parallel pass, straight into the [S][2*vh] layout the
+         * block takes (each value the same dot product as matmul_vec's) */
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int s = 0; s < S; s++)
+            for (int o = 0; o < 2 * vh; o++) {
+                const float *w = o < vh ? l->dn_b + (int64_t)o * H : l->dn_a + (int64_t)(o - vh) * H;
+                const float *xs = x + (int64_t)s * H;
+                float acc = 0.f;
+                #pragma omp simd reduction(+:acc)
+                for (int i = 0; i < H; i++) acc += xs[i] * w[i];
+                ba[(int64_t)s * 2 * vh + o] = acc;
+            }
         if (tm_on()) g_dn_pf[1] += tm_now() - _tb;   /* dn block: small b/a projections on the CPU */
-        for (int s = 0; s < S; s++) {
-            memcpy(ba + (int64_t)s * 2 * vh, bb + (int64_t)s * vh, (size_t)vh * sizeof(float));
-            memcpy(ba + (int64_t)s * 2 * vh + vh, aa + (int64_t)s * vh, (size_t)vh * sizeof(float));
-        }
         memcpy(par, l->dn_alog, (size_t)vh * sizeof(float));
         memcpy(par + vh, l->dn_dtbias, (size_t)vh * sizeof(float));
         int ok = qt_dn_block(layer, l->qth_dnout - 1, x, ba, l->dn_conv, par, l->dn_norm,
                              m->DN_conv[layer], m->DN_rec[layer], S, H, conv_dim, convk,
                              vh, vk, kdim, vdim, c->eps, scale, out);
-        free(bb); free(aa); free(ba); free(par);
+        free(ba); free(par);
         if (ok) { if (tm_on()) g_dn_pf[0] += tm_now() - _d0; return; }
     }
     /* 1. projections of every token */
