@@ -123,6 +123,11 @@ static struct {
     VkDescriptorSet dset_dc, dset_dp, dset_dg, db_mm[2];
     Scratch db_x, db_qz, db_ba, db_par, db_cw, db_ring, db_conv, db_bg, db_nw, db_or, db_y;
     int sgsize;
+    int has_bda;         /* bufferDeviceAddress on: buffers usable by address (grouped expert shader) */
+    /* grouped expert shaders (qmatmul_grp / qmatmul_gate_up_grp): [0] down, [1] gate_up */
+    VkShaderModule shader_grp[2]; VkDescriptorSetLayout dsl_grp[2]; VkPipelineLayout plyt_grp[2];
+    VkPipeline pipe_grp[2]; VkDescriptorPool dpool_grp[2]; VkDescriptorSet dset_grp[2]; int grp_tt;
+    Scratch grp_it[2], grp_et[2];
     /* COLI_VK_TS=1: GPU timestamps around every command buffer of the prefill
      * paths; per label the GPU time and the host wall time submit -> fence done */
     int ts_on; VkQueryPool tsq; double ts_period; double eg_th0;
@@ -205,6 +210,7 @@ struct PCDP { int S, conv_dim, vk, vh, kdim; float scale; };    /* dn_prep.comp 
 struct PCDG { int S, vh, vdim, pstride, zoff; float eps; };     /* dn_gnorm.comp */
 struct PCAB { int S, H, KV, hd, qdim, gate_dim, rotary, pos_base, nt, has_qn, has_kn, q_off, k_off, v_off; float eps, theta; };  /* attn_prep.comp */
 struct PCAG { int n, has_gate; };                               /* attn_gate.comp */
+struct PCGRP { int I, O; float limit; };                        /* qmatmul_grp.comp */
 
 static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -263,6 +269,7 @@ static int pick_memtype_stage(VkPhysicalDevice phys) {
 }
 
 static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype, VkBufferUsageFlags usage) {
+    if (G.has_bda) usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = bytes, .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -276,10 +283,17 @@ static int alloc_buf_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void *
         .priority = G.prio};
     if (G.has_prio) ai.pNext = &pri;
 #endif
+    VkMemoryAllocateFlagsInfo maf = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    if (G.has_bda) { maf.pNext = (void *)ai.pNext; ai.pNext = &maf; }
     VKCHECK(vkAllocateMemory(G.dev, &ai, NULL, mem), "vkAllocateMemory");
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
     if (ptr) VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
     return 1;
+}
+static uint64_t vk_addr(VkBuffer b) {
+    VkBufferDeviceAddressInfo ai = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b};
+    return (uint64_t)vkGetBufferDeviceAddress(G.dev, &ai);
 }
 static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
     return alloc_buf_mt(bytes, buf, mem, ptr, memtype, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -607,9 +621,11 @@ int coli_vk_init(const char *spv_path) {
             }
         }
         G.has_coop_dev = cfg && cmf.cooperativeMatrix && v12.shaderFloat16 && v12.vulkanMemoryModel;
+        int bda = v12.bufferDeviceAddress && !(getenv("COLI_VK_BDA") && getenv("COLI_VK_BDA")[0] == '0');
         if (G.has_coop_dev) {
             memset(&v12, 0, sizeof v12); v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
             v12.shaderFloat16 = VK_TRUE; v12.vulkanMemoryModel = VK_TRUE;
+            if (bda) { v12.bufferDeviceAddress = VK_TRUE; G.has_bda = 1; }
             memset(&cmf, 0, sizeof cmf); cmf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
             cmf.cooperativeMatrix = VK_TRUE;
             v12.pNext = &cmf; cmf.pNext = (void *)di.pNext; di.pNext = &v12;
@@ -774,6 +790,26 @@ int coli_vk_init(const char *spv_path) {
                 ok = build_pipeline_mr(G.dev, G.plyt, G.shader_co2, G.coop2_tt[v], &G.pipe_co2[v]) &&
                      build_pipeline_mr(G.dev, G.plyt_gu, G.shader_gu_co2, G.coop2_tt[v], &G.pipe_gu_co2[v]);
             G.coop2 = ok;
+        }
+        /* grouped expert shaders: need device addresses and gen 2 (wave64);
+         * COLI_VK_GRP=0 off, COLI_VK_GRP_TT=<token tiles> (default 2) */
+        const char *eg = getenv("COLI_VK_GRP"), *gt = getenv("COLI_VK_GRP_TT");
+        G.grp_tt = gt ? atoi(gt) : 4; /* power of two only: the double-buffered x fetch splits 64 inputs into
+         * 4*TT per lane (XPL); TT 16 exceeds 64 KB shared memory for gate_up */
+        if (G.grp_tt != 2 && G.grp_tt != 4 && G.grp_tt != 8) G.grp_tt = 4;
+        if (G.coop2 && G.has_bda && !(eg && *eg == '0')) {
+            const char *nm[2] = {"_grp.spv", "_gate_up_grp.spv"};
+            int ok = 1;
+            for (int v = 0; ok && v < 2; v++) {
+                char pp[512]; derive_sibling(spv_path, nm[v], pp, sizeof(pp));
+                G.shader_grp[v] = load_spv(G.dev, pp);
+                VkPipeline tmp = VK_NULL_HANDLE;
+                ok = G.shader_grp[v] &&
+                     build_pipeline(G.dev, 4, sizeof(struct PCGRP), G.shader_grp[v], &G.dsl_grp[v], &G.plyt_grp[v], &tmp, &G.dpool_grp[v], &G.dset_grp[v]) &&
+                     build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_grp[v], G.grp_tt, &G.pipe_grp[v]);
+                if (tmp) vkDestroyPipeline(G.dev, tmp, NULL);
+            }
+            if (!ok) G.pipe_grp[0] = G.pipe_grp[1] = VK_NULL_HANDLE;
         }
     }
 
@@ -955,8 +991,9 @@ static VkResult vk_fence_wait(VkDevice dev, VkFence f);
 static int arena_suballoc_locked(size_t bytes, VkBuffer *buf, void **ptr, int dl, VkWArena **ablk) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = bytes,
-        .usage = dl ? (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
-                    : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .usage = (dl ? (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+                     : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) |
+                 (G.has_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0),
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
@@ -980,6 +1017,9 @@ static int arena_suballoc_locked(size_t bytes, VkBuffer *buf, void **ptr, int dl
             .priority = G.prio};
         if (G.has_prio) ai.pNext = &pri;
 #endif
+        VkMemoryAllocateFlagsInfo maf = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+            .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+        if (G.has_bda) { maf.pNext = (void *)ai.pNext; ai.pNext = &maf; }
         if (vkAllocateMemory(G.dev, &ai, NULL, &a->mem) != VK_SUCCESS ||
             (!dl && vkMapMemory(G.dev, a->mem, 0, cap, 0, (void **)&a->base) != VK_SUCCESS)) {
             if (a->mem) vkFreeMemory(G.dev, a->mem, NULL);
@@ -1790,6 +1830,51 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         vkCmdDispatch(G.eg_cmd, (D+255)/256, total, 1);
         vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
+    /* Grouped: every expert of the prefill batch in ONE dispatch per phase (expert
+     * table with device addresses + item list), when all of them take the tiles. */
+    int grp = ep && G.coop && G.pipe_grp[0] && G.pipe_grp[1] && I % 128 == 0 && D % 128 == 0 && D % 64 == 0 && I % 64 == 0;
+    for (int c = 0; grp && c < count; c++) {
+        int gf = gates[c]->fmt, df = downs[c]->fmt;
+        if (!(gf == 1 || gf == 2 || gf == 4) || !(df == 1 || df == 2 || df == 4) ||
+            (gf == 4 && (gates[c]->gs < 8 || gates[c]->gs % 8)) || (df == 4 && (downs[c]->gs < 8 || downs[c]->gs % 8))) grp = 0;
+    }
+    if (grp) {
+        int tm = 16 * G.grp_tt, nit[2] = {0, 0};
+        for (int c = 0; c < count; c++) { int nt = (rows[c] + tm - 1) / tm; nit[1] += nt * (I / 128); nit[0] += nt * (D / 128); }
+        for (int v = 0; v < 2 && grp; v++)
+            grp = scratch_reserve(&G.grp_it[v], (size_t)nit[v] * 16) && scratch_reserve(&G.grp_et[v], (size_t)count * 64);
+        for (int v = 0; v < 2 && grp; v++) {   /* v 1: gate_up (out I), v 0: down (out D) */
+            uint32_t *et = G.grp_et[v].ptr, *it = G.grp_it[v].ptr; int n = 0, O = v ? I : D;
+            for (int c = 0; c < count; c++) {
+                ColiVkTensor *a = v ? gates[c] : downs[c], *b = v ? ups[c] : NULL;
+                uint64_t wa = vk_addr(a->wbuf), sa = vk_addr(a->sbuf), wb = b ? vk_addr(b->wbuf) : 0, sb = b ? vk_addr(b->sbuf) : 0;
+                uint32_t *e = et + (size_t)c * 16;
+                e[0] = (uint32_t)wa; e[1] = (uint32_t)(wa >> 32); e[2] = (uint32_t)sa; e[3] = (uint32_t)(sa >> 32);
+                e[4] = (uint32_t)wb; e[5] = (uint32_t)(wb >> 32); e[6] = (uint32_t)sb; e[7] = (uint32_t)(sb >> 32);
+                e[8] = (uint32_t)rows[c]; e[9] = (uint32_t)off[c]; e[10] = (uint32_t)a->fmt; e[11] = (uint32_t)a->rowWords; e[12] = (uint32_t)a->gs;
+                /* A-major: token tiles of one (expert, output block) adjacent */
+                for (int ob = 0; ob < O / 128; ob++)
+                    for (int t0 = 0; t0 < rows[c]; t0 += tm) { uint32_t *q = it + (size_t)n * 4; q[0] = c; q[1] = t0; q[2] = ob; q[3] = 0; n++; }
+            }
+        }
+    }
+    if (grp) {
+        VkBuffer xin[2] = {G.eg_h.buf, G.eg_x.buf}, yout[2] = {G.eg_y.buf, G.eg_h.buf};
+        int nit[2] = {0, 0}, tm = 16 * G.grp_tt;
+        for (int c = 0; c < count; c++) { int nt = (rows[c] + tm - 1) / tm; nit[1] += nt * (I / 128); nit[0] += nt * (D / 128); }
+        for (int step = 0; step < 2; step++) {
+            int v = step == 0 ? 1 : 0;       /* gate_up first, then down */
+            VkDescriptorBufferInfo bi[4] = {{xin[v], 0, VK_WHOLE_SIZE}, {G.grp_it[v].buf, 0, VK_WHOLE_SIZE},
+                                            {G.grp_et[v].buf, 0, VK_WHOLE_SIZE}, {yout[v], 0, VK_WHOLE_SIZE}};
+            wr_desc(G.dset_grp[v], 4, bi);
+            vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_grp[v]);
+            vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_grp[v], 0, 1, &G.dset_grp[v], 0, NULL);
+            struct PCGRP pc = {v ? D : I, v ? I : D, g_swiglu_limit};
+            vkCmdPushConstants(G.eg_cmd, G.plyt_grp[v], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(G.eg_cmd, (uint32_t)nit[v], 1, 1);
+            if (step == 0) vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        }
+    } else {
     /* phase 1: fused gate+up+silu -> hidden (per expert, bound to its x/hidden slices) */
     /* Experts with more than one routed row take the multi-row shader, the rest the
      * one-row shader; order within a phase is free (the dispatches are independent). */
@@ -1821,6 +1906,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         if (co) vkCmdDispatch(G.eg_cmd, cgx, cgy, 1);
         else vkCmdDispatch(G.eg_cmd, (uint32_t)((D + 7) / 8), (uint32_t)(mr ? (rows[c] + G.mr - 1) / G.mr : rows[c]), 1);
     }
+    }   /* per-expert dispatches */
     if (ep) {
         vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         struct PCEP pc = {ep->S, D, ep->K, total};
@@ -3463,7 +3549,10 @@ static int run_expert_prefill(int D, int I, int E, int maxrows, float limit) {
     for (int d = 0; d < D; d++) if (y[(size_t)(S-1)*D+d] != 0.f) bad = 1;
     printf("PREFILL D=%d I=%d E=%d rows=%d S=%d clamp=%.1f coop=%d | CPU relL2 %.2e max %.2e | old relL2 %.2e max %.2e | repeat %s\n",
            D,I,E,total,S,limit,G.coop,l2,mx,lo,mo,repeat ? "exact" : "DIFF");
-    bad |= nf || no || l2 > 3e-3 || mx > 2e-2 || lo > 2e-6 || mo > 2e-6 || !repeat;
+    /* the grouped path runs every expert through the f16 tiles, the old per-expert
+     * path takes the f32 GEMV below 8 rows: equal only up to f16 rounding then */
+    double tol_old = (G.coop && G.pipe_grp[0]) ? 3e-3 : 2e-6;
+    bad |= nf || no || l2 > 3e-3 || mx > 2e-2 || lo > tol_old || mo > (tol_old > 1e-5 ? 2e-2 : 2e-6) || !repeat;
     /* Reject duplicate/out-of-range metadata and decode without submitting. */
     int saved = order[0]; order[0] = pairs;
     bad |= coli_vk_expert_prefill(tg,tu,td,rows,E,order,w,S,K,x,y);

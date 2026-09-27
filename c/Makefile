@@ -683,7 +683,7 @@ ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o
-VK_SPV    = shaders/expert_gather.spv shaders/expert_reduce.spv shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/qmatmul_coop2.spv shaders/qmatmul_gate_up_coop2.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/attn_prefill.spv shaders/dn_recur.spv shaders/dn_conv.spv shaders/dn_prep.spv shaders/dn_gnorm.spv shaders/attn_prep.spv shaders/attn_gate.spv
+VK_SPV    = shaders/expert_gather.spv shaders/expert_reduce.spv shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/qmatmul_coop2.spv shaders/qmatmul_gate_up_coop2.spv shaders/qmatmul_grp.spv shaders/qmatmul_gate_up_grp.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/attn_prefill.spv shaders/dn_recur.spv shaders/dn_conv.spv shaders/dn_prep.spv shaders/dn_gnorm.spv shaders/attn_prep.spv shaders/attn_gate.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:
@@ -820,6 +820,10 @@ backend_vulkan.o: backend_vulkan.c backend_vulkan.h .build-config
 # The fused gate+up variant of the tiled shader is the same source with -DGATE_UP.
 # Generation 2 is built with register double buffering (-DDBUF): measured 3-25 %
 # faster on gfx1151 than fetching each step after the barrier.
+shaders/qmatmul_grp.spv: shaders/qmatmul_grp.comp
+	$(GLSLC) --target-env=vulkan1.2 -DDBUF $< -o $@
+shaders/qmatmul_gate_up_grp.spv: shaders/qmatmul_grp.comp
+	$(GLSLC) --target-env=vulkan1.2 -DDBUF -DGATE_UP $< -o $@
 shaders/qmatmul_coop2.spv: shaders/qmatmul_coop2.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DDBUF $< -o $@
