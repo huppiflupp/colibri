@@ -40,6 +40,42 @@ void main() {
     float s[MAXR];
     [[unroll]] for (uint r = 0u; r < MAXR; r++)
         s[r] = (r < R && live) ? st[sb + (r * LPC + li) * vd + col] : 0.0;
+#ifndef NO_PREFETCH   // -DNO_PREFETCH: the plain loop below
+    // software pipelining: token t+1's k, q, v, beta, exp(g) are loaded while token
+    // t is computed -- the step is a latency chain (two clustered sums), the loads
+    // do not depend on the state
+    float kc[MAXR], qc[MAXR], kx[MAXR], qx[MAXR];
+    float ge, bt, vv, gex = 0.0, btx = 0.0, vvx = 0.0;
+    {
+        uint qk = hk * kd;
+        [[unroll]] for (uint r = 0u; r < MAXR; r++) { kc[r] = r < R ? kn[qk + r * LPC + li] : 0.0; qc[r] = r < R ? qn[qk + r * LPC + li] : 0.0; }
+        ge = gexp[h]; bt = beta[h];
+        vv = live ? vsrc[uint(p.voff) + h * vd + col] : 0.0;
+    }
+    for (uint t = 0u; t < uint(p.S); t++) {
+        uint tn = t + 1u < uint(p.S) ? t + 1u : t;
+        uint qk = (tn * uint(p.vk) + hk) * kd;
+        [[unroll]] for (uint r = 0u; r < MAXR; r++) { kx[r] = r < R ? kn[qk + r * LPC + li] : 0.0; qx[r] = r < R ? qn[qk + r * LPC + li] : 0.0; }
+        gex = gexp[tn * uint(p.vh) + h]; btx = beta[tn * uint(p.vh) + h];
+        vvx = live ? vsrc[tn * uint(p.vstride) + uint(p.voff) + h * vd + col] : 0.0;
+        float part = 0.0;
+        [[unroll]] for (uint r = 0u; r < MAXR; r++) if (r < R) {
+            s[r] *= ge;
+            part += kc[r] * s[r];
+        }
+        float kv = subgroupClusteredAdd(part, LPC);
+        float dl = (vv - kv) * bt;
+        float op = 0.0;
+        [[unroll]] for (uint r = 0u; r < MAXR; r++) if (r < R) {
+            s[r] += kc[r] * dl;
+            op += qc[r] * s[r];
+        }
+        float o = subgroupClusteredAdd(op, LPC);
+        if (li == 0u && live) outv[(t * uint(p.vh) + h) * vd + col] = o;
+        [[unroll]] for (uint r = 0u; r < MAXR; r++) { kc[r] = kx[r]; qc[r] = qx[r]; }
+        ge = gex; bt = btx; vv = vvx;
+    }
+#else
     for (uint t = 0u; t < uint(p.S); t++) {
         uint qk = (t * uint(p.vk) + hk) * kd;
         float ge = gexp[t * uint(p.vh) + h], bt = beta[t * uint(p.vh) + h];
@@ -59,6 +95,7 @@ void main() {
         float o = subgroupClusteredAdd(op, LPC);
         if (li == 0u && live) outv[(t * uint(p.vh) + h) * vd + col] = o;
     }
+#endif
     [[unroll]] for (uint r = 0u; r < MAXR; r++)
         if (r < R && live) st[sb + (r * LPC + li) * vd + col] = s[r];
 }
