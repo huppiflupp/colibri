@@ -2295,6 +2295,90 @@ static void rope_head_partial(float *x, int pos, int rope_dim, int head_dim, flo
  *  - scale = head_dim^-0.5; GQA repeat_kv.
  *  - attn_out = attn_out * sigmoid(gate), then o_proj (input dim = q_heads*head_dim). */
 static int use_qt_ready_attn(void) { return qt_ready(); }
+/* Attention core for a few query rows (decode S=1, MTP verify S=2, short blocks) on
+ * the CPU.  The q_per_kv query heads of a KV group share their keys, so one task takes
+ * a group and a span of positions, reads every K/V row of the span once for all
+ * S*q_per_kv query rows and keeps an online-softmax partial (max, sum, unnormalised
+ * output); the partials of all spans are merged at the end.  The spans spread a long
+ * cache over all threads.  The per-head loop it replaces read the cache once per head
+ * on only H threads with a scalar dot product, and its cost grew with the context
+ * (decode fell from ~38 to ~20 tok/s at 8k). */
+static void attn_core_few(float *ctx, const float *query, const float *K, const float *V, int ldt,
+                          int S, int H, int KV, int hd, int pos_base, float scale) {
+    int qpk = H / KV, R = S * qpk, T = pos_base + S, nth = 1;
+#ifdef _OPENMP
+    nth = omp_get_max_threads();
+#endif
+    int per = (nth + KV - 1) / KV;                  /* spans per group: one per thread */
+    int span = (T + per - 1) / per;
+    if (span < 64) span = 64;                       /* short caches: fewer, fuller tasks */
+    span = (span + 15) & ~15;
+    int nsp = (T + span - 1) / span, ntask = KV * nsp;
+    static float *part; static size_t part_n;       /* callers run one at a time */
+    size_t need = (size_t)ntask * R * (2 + hd + span);
+    if (need > part_n) { free(part); part = malloc(need * sizeof(float)); part_n = need; }
+    float *pm = part, *pl = pm + (size_t)ntask*R, *po = pl + (size_t)ntask*R;
+    float *psc = po + (size_t)ntask*R*hd;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int task = 0; task < ntask; task++) {
+        int kvh = task / nsp, t0 = (task % nsp) * span, t1 = t0 + span;
+        if (t1 > T) t1 = T;
+        const float *Kh = K + (int64_t)kvh*ldt*hd, *Vh = V + (int64_t)kvh*ldt*hd;
+        float *sc = psc + (size_t)task*R*span, *mx = pm + (size_t)task*R;
+        float *sum = pl + (size_t)task*R, *o = po + (size_t)task*R*hd;
+        for (int r = 0; r < R; r++) mx[r] = -INFINITY;
+        for (int t = t0; t < t1; t++) {
+            const float *kr = Kh + (int64_t)t*hd;
+            for (int r = 0; r < R; r++) {
+                int s = r / qpk;
+                float v = -INFINITY;
+                if (t <= pos_base + s) {                /* causal within the block */
+                    const float *qv = query + ((int64_t)s*H + kvh*qpk + r % qpk)*hd;
+                    float acc = 0;
+                    #pragma omp simd reduction(+:acc)
+                    for (int d = 0; d < hd; d++) acc += qv[d] * kr[d];
+                    v = acc * scale;
+                    if (v > mx[r]) mx[r] = v;
+                }
+                sc[(size_t)r*span + (t - t0)] = v;
+            }
+        }
+        for (int r = 0; r < R; r++) {
+            float *p = sc + (size_t)r*span, s_ = 0;
+            for (int t = 0; t < t1 - t0; t++) { p[t] = mx[r] == -INFINITY ? 0.f : expf(p[t] - mx[r]); s_ += p[t]; }
+            sum[r] = s_;
+        }
+        memset(o, 0, (size_t)R*hd*sizeof(float));
+        for (int t = t0; t < t1; t++) {                 /* each V row once for all rows */
+            const float *vr = Vh + (int64_t)t*hd;
+            for (int r = 0; r < R; r++) {
+                float a = sc[(size_t)r*span + (t - t0)], *orow = o + (size_t)r*hd;
+                if (a == 0.f) continue;
+                #pragma omp simd
+                for (int d = 0; d < hd; d++) orow[d] += a * vr[d];
+            }
+        }
+    }
+    #pragma omp parallel for schedule(static)
+    for (int g = 0; g < KV*R; g++) {                    /* merge the spans of one row */
+        int kvh = g / R, r = g % R, s = r / qpk;
+        float M = -INFINITY, den = 0;
+        for (int sp = 0; sp < nsp; sp++) { float v = pm[(size_t)(kvh*nsp + sp)*R + r]; if (v > M) M = v; }
+        float *cx = ctx + ((int64_t)s*H + kvh*qpk + r % qpk)*hd;
+        for (int d = 0; d < hd; d++) cx[d] = 0;
+        for (int sp = 0; sp < nsp; sp++) {
+            size_t ti = (size_t)(kvh*nsp + sp)*R + r;
+            if (pm[ti] == -INFINITY) continue;
+            float w = expf(pm[ti] - M);
+            den += w * pl[ti];
+            const float *orow = po + ti*hd;
+            for (int d = 0; d < hd; d++) cx[d] += w * orow[d];
+        }
+        float inv = 1.f / den;
+        for (int d = 0; d < hd; d++) cx[d] *= inv;
+    }
+}
+
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, D = c->hidden;
@@ -2405,7 +2489,11 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
      * caches above, so the keys 0 .. pos_base+S-1 are complete). */
     int gpu_core = kvd == hd && S > 1 && use_qt_ready_attn() &&
                    qt_attn_prefill(ctx, query, m->K[layer], m->V[layer], m->max_t, S, H, KV, hd, pos_base, scale);
-    if (!gpu_core)
+    static int attn_ref = -1;                /* QWEN_ATTN_REF=1: the old per-head loop */
+    if (attn_ref < 0) { const char *e = getenv("QWEN_ATTN_REF"); attn_ref = e && *e == '1'; }
+    if (!gpu_core && kvd == hd && !attn_ref)
+        attn_core_few(ctx, query, m->K[layer], m->V[layer], m->max_t, S, H, KV, hd, pos_base, scale);
+    else if (!gpu_core)
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
         for (int s = 0; s < S; s++) {
@@ -3815,6 +3903,23 @@ static int g_pa_on, g_pa_from; static double g_pa_nll; static long g_pa_n;
 
 static float *step(Model *m, const int *ids, int S, int pos_base) {
     Cfg *c = &m->c; int D = c->hidden;
+    /* A long prompt goes through in blocks of at most QWEN_PREFILL_CHUNK tokens
+     * (0 = off).  The GPU expert group dispatches one workgroup row per
+     * (token, expert) pair, and Vulkan caps a dispatch dimension at 65535: above
+     * ~7300 tokens (x 9 pairs) the whole prompt's MoE fell back to the CPU. */
+    static int chunk = -1;
+    if (chunk < 0) { const char *e = getenv("QWEN_PREFILL_CHUNK"); chunk = e ? atoi(e) : 4096; }
+    if (chunk > 0 && S > chunk && !g_step_logits && !g_pa_on && g_dn_cap_after < 0) {
+        float *hid = g_step_hid, *lo = NULL;
+        for (int s0 = 0; s0 < S; s0 += chunk) {
+            int n = S - s0 < chunk ? S - s0 : chunk;
+            free(lo);
+            g_step_hid = hid ? hid + (int64_t)s0*D : NULL;
+            lo = step(m, ids + s0, n, pos_base + s0);
+        }
+        g_step_hid = hid;
+        return lo;
+    }
     if (m->resident_mode && m->first_step) m->resident_collecting = 1;
     /* Per-layer residual dump (last token) for torch-free cosine debugging.
      * Set DUMP_LAYERS=<path> to write n_layers * D raw float32 rows. */
