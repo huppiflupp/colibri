@@ -162,6 +162,11 @@ int qt_dn_block(int layer, int hout, const float *x, const float *ba, const floa
                 float eps, float qscale, float *y, int cap);
 int qt_dn_resident(int on);
 int qt_moe_chain_ready(int layer);
+int qt_dec_record(int layer, int hout, int hrt, int hsg, int hsu, int hsd, const float *wb, const float *wa,
+                  const float *convw, const float *par, const float *normw, const float *post_w, const float *next_w,
+                  const float *wsg, float *ring, float *state, float *x, float *nrm, float *tmp, float *logits,
+                  int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim, int E, int K, int I, float eps, float qscale);
+int qt_dec_run(int n, const int *layers, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E);
 void qt_defer_next_block(int on);
 int qt_deferred(void);
 int qt_flush_deferred(void);
@@ -240,6 +245,8 @@ static inline int qt_issue_batch_reduce_sh(int a,const int*b,int c,int d,const f
 static inline int qt_dn_block(int a,int b,const float*c,const float*d,const float*wb_,const float*wa_,const float*e,const float*f,const float*g,float*h,float*i,int j,int k,int l,int m,int n,int o,int q,int r,float t,float u,float*v,int cap_){(void)a;(void)b;(void)c;(void)d;(void)wb_;(void)wa_;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)q;(void)r;(void)t;(void)u;(void)v;(void)cap_;return 0;}
 static inline int qt_dn_resident(int on){(void)on;return 0;}
 static inline int qt_moe_chain_ready(int l){(void)l;return 0;}
+static inline int qt_dec_record(int a,int b,int c,int d,int e,int f,const float*g,const float*h,const float*i,const float*j,const float*k,const float*l,const float*m,const float*n,float*o,float*p,float*q,float*r,float*s,float*t,int u,int v,int w,int x,int y,int z,int aa,int bb,int cc,int dd,float ee,float ff){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)p;(void)q;(void)r;(void)s;(void)t;(void)u;(void)v;(void)w;(void)x;(void)y;(void)z;(void)aa;(void)bb;(void)cc;(void)dd;(void)ee;(void)ff;return 0;}
+static inline int qt_dec_run(int a,const int*b,const float*c,const float*d,const float*e,const float*f,int g,int h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
 static inline void qt_defer_next_block(int on){(void)on;}
 static inline int qt_deferred(void){return 0;}
 static inline int qt_flush_deferred(void){return 1;}

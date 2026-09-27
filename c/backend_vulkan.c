@@ -1714,29 +1714,36 @@ static int gemv_rpw(int nrow, int O) {
     while (O <= 1024 && rpw > 16 && nrow * ((O + rpw - 1) / rpw) < 160) rpw /= 2;
     return rpw;
 }
-static void rec_mm_few_off(VkCommandBuffer cb, VkDescriptorSet set, int k, ColiVkTensor *t, VkBuffer xb, VkBuffer yb, VkDeviceSize yoff, int S) {
+/* one grouped-GEMV matmul (tensor t as the only entry) on set gset with item/entry
+ * tables its/ets; 0 when the GEMV does not take this shape */
+static int rec_gv(VkCommandBuffer cb, VkDescriptorSet gset, Scratch *its, Scratch *ets, ColiVkTensor *t,
+                  VkBuffer xb, VkBuffer yb, VkDeviceSize yoff, int S) {
     int fmt = t->fmt, I = t->I, O = t->O;
-    int gv = G.gvb_pool && G.gvb_set[0] && S <= G.grp_gemv_max && I % 32 == 0 && I <= 8192 && t->rowWords % 4 == 0 &&
-             (fmt == 1 || fmt == 2 || (fmt == 4 && t->gs % 32 == 0)) && k >= 0 && k < 8;
-    int nrs = gv && G.pipe_gv4[0] && S > 1 && S * I <= 8192 ? S : 1;
+    if (!gset || !G.pipe_gv[0] || S > G.grp_gemv_max || I % 32 || I > 8192 || t->rowWords % 4 ||
+        !(fmt == 1 || fmt == 2 || (fmt == 4 && t->gs % 32 == 0))) return 0;
+    int nrs = G.pipe_gv4[0] && S > 1 && S * I <= 8192 ? S : 1;
     int rpw = gemv_rpw(S / nrs, O);
     int nit = (S / nrs) * ((O + rpw - 1) / rpw);
-    if (gv) gv = scratch_reserve(&G.gvb_it[k], (size_t)nit * 16) && scratch_reserve(&G.gvb_et[k], 64);
-    if (!gv) { rec_mm_off(cb, set, t, xb, yb, yoff, S); return; }
-    uint32_t *e = G.gvb_et[k].ptr, *it = G.gvb_it[k].ptr; memset(e, 0, 64);
+    if (!scratch_reserve(its, (size_t)nit * 16) || !scratch_reserve(ets, 64)) return 0;
+    uint32_t *e = ets->ptr, *it = its->ptr; memset(e, 0, 64);
     uint64_t wa = vk_addr(t->wbuf), sa = vk_addr(t->sbuf);
     e[0] = (uint32_t)wa; e[1] = (uint32_t)(wa >> 32); e[2] = (uint32_t)sa; e[3] = (uint32_t)(sa >> 32);
     e[8] = (uint32_t)S; e[9] = 0; e[10] = (uint32_t)fmt; e[11] = (uint32_t)t->rowWords; e[12] = (uint32_t)t->gs;
     int n = 0;
     for (int r = 0; r < S; r += nrs) for (int o0 = 0; o0 < O; o0 += rpw) { it[4*n] = 0; it[4*n+1] = (uint32_t)r; it[4*n+2] = (uint32_t)o0; it[4*n+3] = (uint32_t)nrs; n++; }
-    VkDescriptorBufferInfo bi[4] = {{xb, 0, VK_WHOLE_SIZE}, {G.gvb_it[k].buf, 0, VK_WHOLE_SIZE},
-                                    {G.gvb_et[k].buf, 0, VK_WHOLE_SIZE}, {yb, yoff, (VkDeviceSize)S * O * sizeof(float)}};
-    wr_desc(G.gvb_set[k], 4, bi);
+    VkDescriptorBufferInfo bi[4] = {{xb, 0, VK_WHOLE_SIZE}, {its->buf, 0, VK_WHOLE_SIZE},
+                                    {ets->buf, 0, VK_WHOLE_SIZE}, {yb, yoff, (VkDeviceSize)S * O * sizeof(float)}};
+    wr_desc(gset, 4, bi);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, nrs > 1 ? G.pipe_gv4[0] : G.pipe_gv[0]);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_grp[0], 0, 1, &G.gvb_set[k], 0, NULL);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_grp[0], 0, 1, &gset, 0, NULL);
     struct PCGRP gpc = {I, O, 0.f, 0, 0, rpw};
     vkCmdPushConstants(cb, G.plyt_grp[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gpc), &gpc);
     vkCmdDispatch(cb, (uint32_t)nit, 1, 1);
+    return 1;
+}
+static void rec_mm_few_off(VkCommandBuffer cb, VkDescriptorSet set, int k, ColiVkTensor *t, VkBuffer xb, VkBuffer yb, VkDeviceSize yoff, int S) {
+    if (G.gvb_pool && G.gvb_set[0] && k >= 0 && k < 8 && rec_gv(cb, G.gvb_set[k], &G.gvb_it[k], &G.gvb_et[k], t, xb, yb, yoff, S)) return;
+    rec_mm_off(cb, set, t, xb, yb, yoff, S);
 }
 static void rec_mm_few(VkCommandBuffer cb, VkDescriptorSet set, int k, ColiVkTensor *t, VkBuffer xb, VkBuffer yb, int S) {
     rec_mm_few_off(cb, set, k, t, xb, yb, 0, S);
@@ -1756,9 +1763,11 @@ void coli_vk_block_post(float *x, float *n, const float *w, float eps, ColiVkTen
     G.post.router = router; G.post.logits = logits; G.post.E = E;
 }
 int coli_vk_block_post_done(void) { G.post.pending = 0; return G.post.done; }
+static int rn_record_x(VkCommandBuffer cb, VkDescriptorSet set, Scratch *rw, VkBuffer xb, VkBuffer ybuf, VkBuffer nb, const float *w, float eps, int S, int D);
 static int rn_record(VkCommandBuffer cb, VkBuffer xb, VkBuffer ybuf, VkBuffer nb, const float *w, float eps, int S, int D, int slot) {
-    Scratch *rw = slot ? &G.rn_w2 : &G.rn_w;
-    VkDescriptorSet set = slot ? G.dset_rn2 : G.dset_rn;
+    return rn_record_x(cb, slot ? G.dset_rn2 : G.dset_rn, slot ? &G.rn_w2 : &G.rn_w, xb, ybuf, nb, w, eps, S, D);
+}
+static int rn_record_x(VkCommandBuffer cb, VkDescriptorSet set, Scratch *rw, VkBuffer xb, VkBuffer ybuf, VkBuffer nb, const float *w, float eps, int S, int D) {
     if (!G.pipe_rn || !set || !xb || !ybuf || !nb || !scratch_reserve(rw, (size_t)D * sizeof(float))) return 0;
     memcpy(rw->ptr, w, (size_t)D * sizeof(float));
     cc_barrier(cb);
@@ -2317,6 +2326,210 @@ int coli_vk_flush_deferred(void) {
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    return 1;
+}
+/* ---------- decode graph: a fixed command buffer per DeltaNet layer ----------
+ * One token, CLI decode: the DeltaNet block, its residual/norm/router tail, the GPU
+ * routing, the expert group (8 routed slots + the shared expert) and its tail
+ * (x += moe, next layer's norm) recorded ONCE per layer with its own descriptor sets
+ * and tables; the host writes nothing per token.  A run of consecutive DeltaNet
+ * layers goes out as one submit with one wait (coli_vk_dec_run).  A layer is
+ * re-recorded when a buffer it binds changed (arena regrown, state swapped). */
+static struct {
+    VkDescriptorPool pool;
+    Scratch qz, ba, conv, q, k, bg, o, orr, h, y;   /* shared by the fixed buffers (they run in order) */
+} g_dec;
+static struct {
+    VkCommandBuffer cb; int ok;
+    VkBuffer dep[16]; const void *pdep[8];
+    VkDescriptorSet set[20];
+    Scratch it[3], et[3], rw[2], git[2], get[2], order, inv, wts;
+} g_decl[DN_RES_MAX];
+static VkDescriptorSet dec_set(VkDescriptorSetLayout l) {
+    if (!g_dec.pool) {
+        VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 16384};
+        VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 4096, .poolSizeCount = 1, .pPoolSizes = &ps};
+        if (vkCreateDescriptorPool(G.dev, &dpi, NULL, &g_dec.pool) != VK_SUCCESS) { g_dec.pool = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    }
+    VkDescriptorSet d = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_dec.pool, .descriptorSetCount = 1, .pSetLayouts = &l};
+    return vkAllocateDescriptorSets(G.dev, &ai, &d) == VK_SUCCESS ? d : VK_NULL_HANDLE;
+}
+static void dec_bind(VkCommandBuffer cb, VkPipeline pl, VkPipelineLayout ly, VkDescriptorSet set, const void *pc, size_t npc) {
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, ly, 0, 1, &set, 0, NULL);
+    vkCmdPushConstants(cb, ly, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)npc, pc);
+}
+int coli_vk_dec_record(const ColiDecLayer *d) {
+    int L = d->layer, S = 1, H = d->H, vh = d->vh, vk = d->vk, kdim = d->kdim, vdim = d->vdim, E = d->E, K = d->K, I = d->I, K2 = K + 1;
+    if (dn_res_on <= 0 || L < 0 || L >= DN_RES_MAX || L >= MOE_RES_MAX || !G.ready || !G.pipe_dc || !G.pipe_dp || !G.pipe_dr ||
+        !G.pipe_dg || !G.pipe_rg || !G.pipe_dba || !G.pipe_mr_route || !G.pipe_gv[0] || !G.pipe_gv[1] || !G.ep_pipe[1] ||
+        !G.pipe_rn || g_moem[L].E != E || K2 > 16 || H % 4 || H > 8192 || I > 8192 || d->convk > 17) return 0;
+    if (!d->proj || !d->outp || !d->router || !d->shg || !d->shu || !d->shd) return 0;
+    int value_dim = vh * vdim, pd = d->proj->O, ktot = vk * kdim, conv_dim = d->conv_dim, convk = d->convk;
+    if (d->proj->I != H || pd != conv_dim + value_dim || d->outp->I != value_dim || d->outp->O != H ||
+        d->router->I != H || d->router->O != E) return 0;
+    size_t f = sizeof(float), nH = (size_t)H * f;
+    size_t nst = (size_t)vh * kdim * vdim * f, nring = (size_t)conv_dim * (convk - 1) * f;
+    __typeof__(g_dnr[0]) *R = &g_dnr[L];
+    __typeof__(g_dnc[0]) *C = &g_dnc[L];
+    __typeof__(g_decl[0]) *T = &g_decl[L];
+    /* state, ring and constants as the block keeps them */
+    if (R->own && (R->host_st != d->state || R->host_rg != d->ring)) coli_vk_dn_sync(L);
+    if (!scratch_reserve(&R->st, nst) || !scratch_reserve(&R->rg, nring) || !scratch_reserve(&R->cst, nst) || !scratch_reserve(&R->crg, nring)) return 0;
+    if (!R->own) { memcpy(R->st.ptr, d->state, nst); memcpy(R->rg.ptr, d->ring, nring); R->own = 1; R->capv = 0; }
+    R->host_st = d->state; R->host_rg = d->ring; R->nst = nst; R->nrg = nring;
+    size_t npar = (size_t)2 * vh * f, ncw = (size_t)conv_dim * convk * f, nnw = (size_t)vdim * f;
+    if (!scratch_reserve(&C->w, (size_t)2 * vh * H * f) || !scratch_reserve(&C->par, npar) || !scratch_reserve(&C->cw, ncw) || !scratch_reserve(&C->nw, nnw)) return 0;
+    if (C->sw != d->wb) { memcpy(C->w.ptr, d->wb, (size_t)vh * H * f); memcpy((char *)C->w.ptr + (size_t)vh * H * f, d->wa, (size_t)vh * H * f); C->sw = d->wb; }
+    if (C->spar != d->par || memcmp(C->par.ptr, d->par, npar)) { memcpy(C->par.ptr, d->par, npar); C->spar = d->par; }
+    if (C->scw != d->convw) { memcpy(C->cw.ptr, d->convw, ncw); C->scw = d->convw; }
+    if (C->snw != d->normw) { memcpy(C->nw.ptr, d->normw, nnw); C->snw = d->normw; }
+    if (d->wsg && g_moem[L].ssg != d->wsg) {
+        if (!scratch_reserve(&g_moem[L].sg, nH)) return 0;
+        memcpy(g_moem[L].sg.ptr, d->wsg, nH); g_moem[L].ssg = d->wsg;
+    }
+    /* shared scratch (S = 1 sizes, all layers alike: reserved once) */
+    if (!scratch_reserve(&g_dec.qz, (size_t)pd * f) || !scratch_reserve(&g_dec.ba, (size_t)2 * vh * f) ||
+        !scratch_reserve(&g_dec.conv, (size_t)conv_dim * f) || !scratch_reserve(&g_dec.q, (size_t)ktot * f) ||
+        !scratch_reserve(&g_dec.k, (size_t)ktot * f) || !scratch_reserve(&g_dec.bg, (size_t)2 * vh * f) ||
+        !scratch_reserve(&g_dec.o, (size_t)value_dim * f) || !scratch_reserve(&g_dec.orr, (size_t)value_dim * f) ||
+        !scratch_reserve(&g_dec.h, (size_t)K2 * I * f) || !scratch_reserve(&g_dec.y, (size_t)K2 * H * f)) return 0;
+    VkBuffer bx = arena_buf(d->x, nH), bn = arena_buf(d->nrm, nH), bt = arena_buf(d->tmp, nH), bl = arena_buf(d->logits, (size_t)E * f);
+    if (!bx || !bn || !bt || !bl) return 0;
+    VkBuffer dep[16] = {bx, bn, bt, bl, R->st.buf, R->rg.buf, R->crg.buf, C->w.buf, C->par.buf, C->cw.buf, C->nw.buf,
+                        g_moem[L].gu.buf, g_moem[L].dn.buf, d->wsg ? g_moem[L].sg.buf : VK_NULL_HANDLE,
+                        g_dec.qz.buf, g_dec.h.buf};
+    const void *pdep[8] = {d->proj, d->outp, d->router, d->shg, d->shu, d->shd, d->post_w, d->next_w};
+    if (T->ok && !memcmp(T->dep, dep, sizeof dep) && !memcmp(T->pdep, pdep, sizeof pdep)) return 1;
+    T->ok = 0;
+    /* per-layer tables */
+    int rpw_gu = 64, rpw_dn = 64;
+    { const char *e = getenv("COLI_VK_GV_RPW"); if (e) rpw_gu = atoi(e); e = getenv("COLI_VK_GV_RPW_DN"); if (e) rpw_dn = atoi(e); }
+    int ngu = K2 * ((I + rpw_gu - 1) / rpw_gu), ndn = K2 * ((H + rpw_dn - 1) / rpw_dn);
+    if (!scratch_reserve(&T->git[1], (size_t)ngu * 16) || !scratch_reserve(&T->git[0], (size_t)ndn * 16) ||
+        !scratch_reserve(&T->get[1], (size_t)K2 * 64) || !scratch_reserve(&T->get[0], (size_t)K2 * 64) ||
+        !scratch_reserve(&T->order, (size_t)K2 * 4) || !scratch_reserve(&T->inv, (size_t)K2 * 4) || !scratch_reserve(&T->wts, (size_t)K2 * 4)) return 0;
+    for (int v = 0; v < 2; v++) {
+        uint32_t *it = T->git[v].ptr, *et = T->get[v].ptr; int n = 0, O = v ? I : H, rpw = v ? rpw_gu : rpw_dn;
+        memset(et, 0, (size_t)K2 * 64);
+        for (int c = 0; c < K2; c++) for (int o0 = 0; o0 < O; o0 += rpw) { uint32_t *q = it + (size_t)n * 4; q[0] = c; q[1] = 0; q[2] = o0; q[3] = 1; n++; }
+        entry_of(et + (size_t)K * 16, v ? d->shg : d->shd, v ? d->shu : NULL);   /* slot K: the shared expert */
+        et[(size_t)K * 16 + 9] = (uint32_t)K;
+    }
+    for (int c = 0; c < K2; c++) { ((int *)T->order.ptr)[c] = c; ((int *)T->inv.ptr)[c] = c; ((float *)T->wts.ptr)[c] = 0.f; }
+    /* descriptor sets: allocated once per layer */
+    if (!T->set[0]) {
+        VkDescriptorSetLayout ls[16] = {G.dsl_grp[0], G.dsl_dba, G.dsl_dc, G.dsl_rg, G.dsl_dp, G.dsl_dr, G.dsl_dg, G.dsl_grp[0],
+                                        G.dsl_rn, G.dsl_grp[0], G.dsl_mr, G.dsl_grp[1], G.dsl_grp[0], G.ep_dsl[1], G.dsl_rn, G.dsl_rn};
+        for (int i = 0; i < 16; i++) if (!(T->set[i] = dec_set(ls[i]))) return 0;
+    }
+    if (!T->cb) {
+        VkCommandBufferAllocateInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = G.cpool,
+                                           .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        if (vkAllocateCommandBuffers(G.dev, &cbi, &T->cb) != VK_SUCCESS) { T->cb = VK_NULL_HANDLE; return 0; }
+    }
+    VkCommandBuffer cb = T->cb;
+    VKCHECK(vkResetCommandBuffer(cb, 0), "dec resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(cb, &begin), "dec beginCmd");
+    cc_barrier(cb);   /* after the previous layer's buffer in the same submit */
+    VkDescriptorSet *ss = T->set;
+    /* DeltaNet block: input = the normed row, output -> tmp */
+    if (!rec_gv(cb, ss[0], &T->it[0], &T->et[0], d->proj, bn, g_dec.qz.buf, 0, S)) { vkEndCommandBuffer(cb); return 0; }
+    { VkDescriptorBufferInfo bi[3] = {{bn, 0, VK_WHOLE_SIZE}, {C->w.buf, 0, VK_WHOLE_SIZE}, {g_dec.ba.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(ss[1], 3, bi); int pc[3] = {S, H, 2 * vh};
+      dec_bind(cb, G.pipe_dba, G.plyt_dba, ss[1], pc, sizeof pc);
+      vkCmdDispatch(cb, (uint32_t)S, (uint32_t)((2 * vh + 3) / 4), 1); }
+    cc_barrier(cb);
+    { VkDescriptorBufferInfo bi[4] = {{g_dec.qz.buf, 0, VK_WHOLE_SIZE}, {C->cw.buf, 0, VK_WHOLE_SIZE}, {R->rg.buf, 0, VK_WHOLE_SIZE}, {g_dec.conv.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(ss[2], 4, bi); struct PCDC pc = {S, conv_dim, convk, pd};
+      dec_bind(cb, G.pipe_dc, G.plyt_dc, ss[2], &pc, sizeof pc);
+      vkCmdDispatch(cb, (uint32_t)((conv_dim + 255) / 256), (uint32_t)S, 1); }
+    cc_barrier(cb);
+    { VkDescriptorBufferInfo bi[3] = {{g_dec.qz.buf, 0, VK_WHOLE_SIZE}, {R->rg.buf, 0, VK_WHOLE_SIZE}, {R->crg.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(ss[3], 3, bi); struct PCRG pc = {S, conv_dim, convk, pd, -1};
+      dec_bind(cb, G.pipe_rg, G.plyt_rg, ss[3], &pc, sizeof pc);
+      vkCmdDispatch(cb, (uint32_t)((conv_dim + 255) / 256), 1, 1); }
+    { VkDescriptorBufferInfo bi[6] = {{g_dec.conv.buf, 0, VK_WHOLE_SIZE}, {g_dec.ba.buf, 0, VK_WHOLE_SIZE}, {C->par.buf, 0, VK_WHOLE_SIZE},
+                                      {g_dec.q.buf, 0, VK_WHOLE_SIZE}, {g_dec.k.buf, 0, VK_WHOLE_SIZE}, {g_dec.bg.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(ss[4], 6, bi); struct PCDP pc = {S, conv_dim, vk, vh, kdim, d->qscale};
+      dec_bind(cb, G.pipe_dp, G.plyt_dp, ss[4], &pc, sizeof pc);
+      vkCmdDispatch(cb, (uint32_t)((S + 7) / 8), (uint32_t)vk, 1); }
+    cc_barrier(cb);
+    { VkDeviceSize hb = (VkDeviceSize)S * vh * f;
+      VkDescriptorBufferInfo bi[8] = {{g_dec.q.buf, 0, VK_WHOLE_SIZE}, {g_dec.k.buf, 0, VK_WHOLE_SIZE}, {g_dec.conv.buf, 0, VK_WHOLE_SIZE},
+                                      {g_dec.bg.buf, 0, hb}, {g_dec.bg.buf, hb, hb}, {R->st.buf, 0, VK_WHOLE_SIZE},
+                                      {g_dec.o.buf, 0, VK_WHOLE_SIZE}, {R->cst.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(ss[5], 8, bi); struct PCDR pc = {S, vh, vk, kdim, vdim, conv_dim, 2 * ktot, -1};
+      dec_bind(cb, G.pipe_dr, G.plyt_dr, ss[5], &pc, sizeof pc);
+      vkCmdDispatch(cb, (uint32_t)vh, (uint32_t)((vdim + 3) / 4), 1); }
+    cc_barrier(cb);
+    { VkDescriptorBufferInfo bi[4] = {{g_dec.o.buf, 0, VK_WHOLE_SIZE}, {g_dec.qz.buf, 0, VK_WHOLE_SIZE}, {C->nw.buf, 0, VK_WHOLE_SIZE}, {g_dec.orr.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(ss[6], 4, bi); struct PCDG pc = {S, vh, vdim, pd, conv_dim, d->eps};
+      dec_bind(cb, G.pipe_dg, G.plyt_dg, ss[6], &pc, sizeof pc);
+      vkCmdDispatch(cb, (uint32_t)((S + 7) / 8), (uint32_t)vh, 1); }
+    cc_barrier(cb);
+    if (!rec_gv(cb, ss[7], &T->it[1], &T->et[1], d->outp, g_dec.orr.buf, bt, 0, S)) { vkEndCommandBuffer(cb); return 0; }
+    /* block tail: x += tmp, nrm = post_ln(x); logits = router(nrm) */
+    if (!rn_record_x(cb, ss[8], &T->rw[0], bx, bt, bn, d->post_w, d->eps, S, H)) { vkEndCommandBuffer(cb); return 0; }
+    cc_barrier(cb);
+    if (!rec_gv(cb, ss[9], &T->it[2], &T->et[2], d->router, bn, bl, 0, S)) { vkEndCommandBuffer(cb); return 0; }
+    cc_barrier(cb);
+    /* routing into the K slots */
+    { VkDescriptorBufferInfo bi[8] = {{bl, 0, VK_WHOLE_SIZE}, {bn, 0, VK_WHOLE_SIZE},
+                                      {d->wsg ? g_moem[L].sg.buf : g_moem[L].gu.buf, 0, VK_WHOLE_SIZE},
+                                      {g_moem[L].gu.buf, 0, VK_WHOLE_SIZE}, {g_moem[L].dn.buf, 0, VK_WHOLE_SIZE},
+                                      {T->get[1].buf, 0, VK_WHOLE_SIZE}, {T->get[0].buf, 0, VK_WHOLE_SIZE}, {T->wts.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(ss[10], 8, bi); struct PCMR pc = {E, K, H, d->wsg != NULL};
+      dec_bind(cb, G.pipe_mr_route, G.plyt_mr, ss[10], &pc, sizeof pc);
+      vkCmdDispatch(cb, 1, 1, 1); }
+    cc_barrier(cb);
+    /* experts: gate|up (rows through the order list), down, weighted sum */
+    { VkDescriptorBufferInfo bi[5] = {{bn, 0, VK_WHOLE_SIZE}, {T->git[1].buf, 0, VK_WHOLE_SIZE}, {T->get[1].buf, 0, VK_WHOLE_SIZE},
+                                      {g_dec.h.buf, 0, VK_WHOLE_SIZE}, {T->order.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(ss[11], 5, bi); struct PCGRP pc = {H, I, g_swiglu_limit, K2, 0, rpw_gu};
+      dec_bind(cb, G.pipe_gv[1], G.plyt_grp[1], ss[11], &pc, sizeof pc);
+      vkCmdDispatch(cb, (uint32_t)ngu, 1, 1); }
+    cc_barrier(cb);
+    { VkDescriptorBufferInfo bi[4] = {{g_dec.h.buf, 0, VK_WHOLE_SIZE}, {T->git[0].buf, 0, VK_WHOLE_SIZE}, {T->get[0].buf, 0, VK_WHOLE_SIZE},
+                                      {g_dec.y.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(ss[12], 4, bi); struct PCGRP pc = {I, H, g_swiglu_limit, 0, 0, rpw_dn};
+      dec_bind(cb, G.pipe_gv[0], G.plyt_grp[0], ss[12], &pc, sizeof pc);
+      vkCmdDispatch(cb, (uint32_t)ndn, 1, 1); }
+    cc_barrier(cb);
+    { VkDescriptorBufferInfo bi[4] = {{g_dec.y.buf, 0, (VkDeviceSize)K2 * H * f}, {T->inv.buf, 0, (VkDeviceSize)K2 * 4},
+                                      {T->wts.buf, 0, (VkDeviceSize)K2 * 4}, {bt, 0, nH}};
+      wr_desc(ss[13], 4, bi); struct PCEP pc = {S, H, K2, K2};
+      dec_bind(cb, G.ep_pipe[1], G.ep_layout[1], ss[13], &pc, sizeof pc);
+      vkCmdDispatch(cb, (uint32_t)((H + 255) / 256), (uint32_t)S, 1); }
+    /* expert tail: x += tmp, nrm = next layer's in_ln(x) */
+    if (!rn_record_x(cb, ss[14], &T->rw[1], bx, bt, bn, d->next_w, d->eps, S, H)) { vkEndCommandBuffer(cb); return 0; }
+    host_read_barrier(cb);
+    VKCHECK(vkEndCommandBuffer(cb), "dec endCmd");
+    memcpy(T->dep, dep, sizeof dep); memcpy(T->pdep, pdep, sizeof pdep);
+    T->ok = 1;
+    return 1;
+}
+/* Run the fixed buffers of n recorded layers (in order) as one submit and wait. */
+int coli_vk_dec_run(int n, const int *layers, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E) {
+    VkCommandBuffer cbs[DN_RES_MAX];
+    if (n < 1 || n > DN_RES_MAX || G.deferred) return 0;
+    for (int i = 0; i < n; i++) {
+        int L = layers[i];
+        if (L < 0 || L >= DN_RES_MAX || !g_decl[L].ok) return 0;
+        __typeof__(g_dnr[0]) *R = &g_dnr[L];
+        if (!R->own) { memcpy(R->st.ptr, R->host_st, R->nst); memcpy(R->rg.ptr, R->host_rg, R->nrg); R->own = 1; }
+        R->capv = 0;
+        cbs[i] = g_decl[L].cb;
+    }
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = (uint32_t)n, .pCommandBuffers = cbs};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "dec resetFence");
+    VKCHECK(vk_submit(G.queue, &si, G.fence), "dec queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    size_t nH = (size_t)H * sizeof(float);
+    arena_mark_gpu(arena_buf(x, nH)); arena_mark_gpu(arena_buf(nrm, nH)); arena_mark_gpu(arena_buf(tmp, nH));
+    arena_mark_gpu(arena_buf(logits, (size_t)E * sizeof(float)));
     return 1;
 }
 void coli_vk_defer_next_block(int on) { G.defer_next = on && G.pipe_mr_route != VK_NULL_HANDLE; }

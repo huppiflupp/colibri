@@ -64,6 +64,16 @@ int  coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, co
  * (1 if the GPU held it), forget the GPU copy, swap in the state after token cap. */
 int  coli_vk_dn_resident(int on);
 /* chained decode layer: DeltaNet block + its expert group in one submit, routed on the GPU */
+/* decode graph: fixed command buffer per DeltaNet layer (block + tails + GPU routing + experts) */
+typedef struct {
+    int layer; ColiVkTensor *proj, *outp, *router, *shg, *shu, *shd;
+    const float *wb, *wa, *convw, *par, *normw, *post_w, *next_w, *wsg;
+    float *ring, *state, *x, *nrm, *tmp, *logits;
+    int H, conv_dim, convk, vh, vk, kdim, vdim, E, K, I;
+    float eps, qscale;
+} ColiDecLayer;
+int  coli_vk_dec_record(const ColiDecLayer *d);
+int  coli_vk_dec_run(int n, const int *layers, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E);
 int  coli_vk_moe_master(int layer, int E, ColiVkTensor *const *tg, ColiVkTensor *const *tu, ColiVkTensor *const *td);
 int  coli_vk_moe_route(int layer, const float *logits, const float *nrm, const float *wsg, int E, int K, int D);
 int  coli_vk_flush_deferred(void);

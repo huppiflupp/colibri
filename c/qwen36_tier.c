@@ -1747,6 +1747,33 @@ int qt_moe_chain_ready(int layer){
     (void)layer; return 0;
 #endif
 }
+/* Decode graph (Vulkan): record the fixed command buffer of DeltaNet layer `layer`
+ * (handles: out_proj, router, shared gate/up/down) / run a sequence of them. */
+int qt_dec_record(int layer, int hout, int hrt, int hsg, int hsu, int hsd, const float *wb, const float *wa,
+                  const float *convw, const float *par, const float *normw, const float *post_w, const float *next_w,
+                  const float *wsg, float *ring, float *state, float *x, float *nrm, float *tmp, float *logits,
+                  int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim, int E, int K, int I, float eps, float qscale){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    int h[5] = {hout, hrt, hsg, hsu, hsd};
+    for(int i = 0; i < 5; i++) if(h[i] < 0 || h[i] >= G_dense_n || !G_dense[h[i]].on) return 0;
+    if(!qt_dnproj_ready(layer) || !qt_moe_chain_ready(layer)) return 0;
+    ColiDecLayer d = {layer, G_dnp[layer].t, G_dense[hout].t, G_dense[hrt].t, G_dense[hsg].t, G_dense[hsu].t, G_dense[hsd].t,
+                      wb, wa, convw, par, normw, post_w, next_w, wsg, ring, state, x, nrm, tmp, logits,
+                      H, conv_dim, convk, vh, vk, kdim, vdim, E, K, I, eps, qscale};
+    return coli_vk_dec_record(&d);
+#else
+    (void)layer;(void)hout;(void)hrt;(void)hsg;(void)hsu;(void)hsd;(void)wb;(void)wa;(void)convw;(void)par;(void)normw;(void)post_w;
+    (void)next_w;(void)wsg;(void)ring;(void)state;(void)x;(void)nrm;(void)tmp;(void)logits;(void)H;(void)conv_dim;(void)convk;
+    (void)vh;(void)vk;(void)kdim;(void)vdim;(void)E;(void)K;(void)I;(void)eps;(void)qscale; return 0;
+#endif
+}
+int qt_dec_run(int n, const int *layers, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_available() && coli_vk_dec_run(n, layers, x, nrm, tmp, logits, H, E);
+#else
+    (void)n;(void)layers;(void)x;(void)nrm;(void)tmp;(void)logits;(void)H;(void)E; return 0;
+#endif
+}
 void qt_defer_next_block(int on){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     if(coli_vk_available()) coli_vk_defer_next_block(on);
