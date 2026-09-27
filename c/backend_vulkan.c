@@ -1553,7 +1553,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
       vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dp, 0, 1, &G.dset_dp, 0, NULL);
       struct PCDP pc = {S, conv_dim, vk, vh, kdim, qscale};
       vkCmdPushConstants(cb, G.plyt_dp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-      vkCmdDispatch(cb, (uint32_t)S, (uint32_t)vk, 1); }
+      vkCmdDispatch(cb, (uint32_t)((S + 7) / 8), (uint32_t)vk, 1); }
     cc_barrier(cb); ts_stage(cb, 2);
     /* 4. recurrence (v straight out of the conv output) */
     { VkDeviceSize hb = (VkDeviceSize)S * vh * f;
@@ -1575,7 +1575,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
       vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dg, 0, 1, &G.dset_dg, 0, NULL);
       struct PCDG pc = {S, vh, vdim, pd, conv_dim, eps};
       vkCmdPushConstants(cb, G.plyt_dg, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-      vkCmdDispatch(cb, (uint32_t)S, (uint32_t)vh, 1); }
+      vkCmdDispatch(cb, (uint32_t)((S + 7) / 8), (uint32_t)vh, 1); }
     cc_barrier(cb); ts_stage(cb, 4);
     /* 6. out_proj */
     rec_mm(cb, G.db_mm[1], outp, G.db_or.buf, G.db_y.buf, S); ts_stage(cb, 5);
