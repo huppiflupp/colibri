@@ -3999,8 +3999,13 @@ static void ensure_kv(Model *m){
     }
 }
 
-static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
+static int serve_eos_ids(int *ids, int cap);
+/* Returns the number of tokens generated: n_new, or fewer with STOP_EOS=1 when the
+ * model emits <|im_end|> / <|endoftext|> (the CLI is a benchmark and by default
+ * always runs n_new steps; the serve loop stops on its own). */
+static int generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Cfg *c = &m->c;
+    int eos_ids[4], n_eos = getenv("STOP_EOS") && getenv("STOP_EOS")[0] == '1' ? serve_eos_ids(eos_ids, 4) : 0;
     /* Same ceiling serve_one() enforces. Past max_position_embeddings the RoPE
      * positions leave the range the model was trained on, so this is a
      * correctness limit, not just a memory one. */
@@ -4020,6 +4025,8 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         int best = 0; float bv = logit[0];
         for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
         if (s == 0 && g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* record TTFT */
+        { int is_eos = 0; for (int e = 0; e < n_eos; e++) is_eos |= best == eos_ids[e];
+          if (is_eos) { free(logit); return len - np; } }
         if (g_stream) { stream_token(best); fflush(stdout); }
         if (s == n_new - 1) {
             if (getenv("DUMP")) {
@@ -4034,6 +4041,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
           logit = step(m, &one, 1, len - 1);
           if (tm_on()) g_tm_step += tm_now()-_s0; }
     }
+    return len - np;
 }
 
 static int tf_nll(Model *m, const int *full, int nfull, int np, double *nll_out) {
@@ -4856,7 +4864,7 @@ int main(int argc, char **argv) {
         }
     }
     double t = now_s();
-    generate(&m, prompt, np, n_new, out);
+    n_new = generate(&m, prompt, np, n_new, out);
     double dt = now_s() - t;
 
     /* DUMP=<path>: write last-token logits (raw float32, vocab) for a torch-free
