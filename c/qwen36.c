@@ -2788,9 +2788,29 @@ static void qt_cpu_expert(Model *m, int layer, int eid, float w, const float *xs
 /* router logits the previous block's GPU tail already computed (host arena,
  * consumed by the next moe() call) */
 static float *g_moe_pre_logits;
+/* Chained decode layer: the deferred DeltaNet block (its router logits and normed
+ * row still to come) and this expert group go out as one submit; the GPU routes
+ * (moe_route.comp) into K placeholder slots plus the folded shared expert, and the
+ * group's tail adds the output to x and norms it for the next layer. 0: not taken
+ * (the caller flushes the block and routes as usual). */
+static int moe_chain(Model *m, Layer *l, int layer, float *x, float *logits, float *out) {
+    Cfg *c = &m->c; int K = c->topk, E = c->n_experts, D = c->hidden;
+    if (!logits || !l->qth_shg || !l->qth_shu || !l->qth_shd || K > 16) return 0;
+    if (!qt_moe_route(layer, logits, x, l->sh_gate, E, K, D)) return 0;
+    int idx[16]; float val[16], sg = 1.f; uint8_t done[16];
+    for (int k = 0; k < K; k++) { idx[k] = k; val[k] = 1.f / K; }
+    int ok = qt_issue_batch_reduce_sh(layer, idx, 1, K, x, val, l->qth_shg - 1, l->qth_shu - 1, l->qth_shd - 1, &sg, out, done);
+    for (int k = 0; ok && k < K; k++) ok = done[k];
+    return ok;
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *pre = g_moe_pre_logits; g_moe_pre_logits = NULL;
+    if (qt_deferred()) {
+        if (S == 1 && moe_chain(m, l, layer, x, pre, out)) return;
+        qt_flush_deferred();   /* the block alone: logits and x/nrm are there after it */
+    }
     float *logits = pre ? pre : falloc((int64_t)S*E);
     double _tr = tm_now();
     if (!pre && !(S >= qt_trunk_min_s() && l->qth_gate && qtd_batch(l->qth_gate, logits, x, S, D, E)))
@@ -3756,6 +3776,9 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
      * tails (QWEN_DEC_TAIL=1, experiment) */
     static int dec_tail = -1;
     if (dec_tail < 0) dec_tail = getenv("QWEN_DEC_TAIL") && getenv("QWEN_DEC_TAIL")[0] == '1';
+    static int dec_chain = -1;
+    if (dec_chain < 0) dec_chain = getenv("QWEN_DEC_CHAIN") && getenv("QWEN_DEC_CHAIN")[0] == '1';
+    if (dec_chain && dec_tail == 0) dec_tail = 1;
     int dect = dec_tail && S <= 4 && qt_dn_resident(-1) && !lf;
     int arena = (S >= qt_trunk_min_s() || dect) && qt_batch_ok() && !(getenv("QWEN_HOST_ARENA") && getenv("QWEN_HOST_ARENA")[0] == '0');
     if (arena) {
@@ -3798,6 +3821,11 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         double _t0 = tm_now();
         int posted = tail && l->qth_gate &&
                      qt_block_post(x, nrm, l->post_ln, c->eps, l->qth_gate - 1, lg, c->n_experts);
+        /* chained decode layer (QWEN_DEC_CHAIN=1): the DeltaNet block's submit waits
+         * for the layer's expert group, which routes on the GPU (moe_chain) */
+        int chain = posted && dect && dec_chain && S == 1 && !c->is_attn[i] && !(c->has_bias && l->gate_bias) &&
+                    qt_moe_chain_ready(i);
+        qt_defer_next_block(chain);
         if (c->is_attn[i]) {
             attention(m, l, i, nrm, S, pos_base, tmp);
             tm_add(S, 1, tm_now()-_t0);
@@ -3805,6 +3833,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
             deltanet(m, l, i, nrm, S, pos_base, tmp);
             tm_add(S, 0, tm_now()-_t0);
         }
+        qt_defer_next_block(0);
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
         if (posted && qt_block_post_done()) {   /* x, nrm and the router logits came back with the block */
             g_moe_pre_logits = lg;

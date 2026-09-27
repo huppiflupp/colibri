@@ -1,0 +1,77 @@
+#version 450
+// Decode MoE routing on the GPU (one token), for a layer chained into one submit
+// with its DeltaNet block: softmax over the router logits, top-k (the CPU's rule:
+// highest probability first, the lowest expert index on ties), renormalised
+// weights, and the shared expert's sigmoid gate on the normed row.  Writes the
+// grouped-GEMV entry of each chosen expert (copied from the layer's master table,
+// row count 1, row offset = slot) for gate|up and down, and the pair weights
+// (slot K = the shared expert, its entries stay as the host wrote them).
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer LG { float logit[]; };   // [E]
+layout(std430, binding = 1) readonly buffer NR { float nrm[]; };     // [D]
+layout(std430, binding = 2) readonly buffer SG { float wsg[]; };     // [D] shared gate (or none: has_sg = 0)
+layout(std430, binding = 3) readonly buffer MG { uint mgu[]; };      // [E][16] gate|up entries
+layout(std430, binding = 4) readonly buffer MD { uint mdn[]; };      // [E][16] down entries
+layout(std430, binding = 5) buffer EG { uint egu[]; };               // [K+1][16] out
+layout(std430, binding = 6) buffer ED { uint edn[]; };               // [K+1][16] out
+layout(std430, binding = 7) writeonly buffer WT { float wt[]; };     // [K+1] pair weights
+layout(push_constant) uniform P { int E, K, D, has_sg; } p;
+shared float sv[256]; shared int si[256];
+shared float pr[1024];
+shared int pick[16]; shared float pval[16];
+void main() {
+    uint tid = gl_LocalInvocationID.x, E = uint(p.E);
+    // softmax (max, then sum of exp) like softmax_row
+    float m = -3.0e38;
+    for (uint e = tid; e < E; e += 256u) m = max(m, logit[e]);
+    sv[tid] = m; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) { if (tid < s) sv[tid] = max(sv[tid], sv[tid + s]); barrier(); }
+    m = sv[0]; barrier();
+    float sum = 0.0;
+    for (uint e = tid; e < E; e += 256u) { float v = exp(logit[e] - m); pr[e] = v; sum += v; }
+    sv[tid] = sum; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) { if (tid < s) sv[tid] += sv[tid + s]; barrier(); }
+    float tot = sv[0]; barrier();
+    for (uint e = tid; e < E; e += 256u) pr[e] = pr[e] / tot;
+    barrier();
+    // top-k: K rounds of (max, lowest index) over the not yet taken experts
+    for (int k = 0; k < p.K; k++) {
+        float bv = -3.0e38; int bi = 1 << 30;
+        for (uint e = tid; e < E; e += 256u) {
+            bool taken = false;
+            for (int j = 0; j < k; j++) taken = taken || pick[j] == int(e);
+            if (!taken && (pr[e] > bv || (pr[e] == bv && int(e) < bi))) { bv = pr[e]; bi = int(e); }
+        }
+        sv[tid] = bv; si[tid] = bi; barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (tid < s) {
+                float ov = sv[tid + s]; int oi = si[tid + s];
+                if (ov > sv[tid] || (ov == sv[tid] && oi < si[tid])) { sv[tid] = ov; si[tid] = oi; }
+            }
+            barrier();
+        }
+        if (tid == 0u) { pick[k] = si[0]; pval[k] = sv[0]; }
+        barrier();
+    }
+    // shared gate: sigmoid(nrm . wsg)
+    float d = 0.0;
+    if (p.has_sg != 0) for (uint i = tid; i < uint(p.D); i += 256u) d += nrm[i] * wsg[i];
+    sv[tid] = d; barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) { if (tid < s) sv[tid] += sv[tid + s]; barrier(); }
+    if (tid == 0u) {
+        float sm = 0.0;
+        for (int k = 0; k < p.K; k++) sm += pval[k];
+        for (int k = 0; k < p.K; k++) wt[k] = sm > 0.0 ? pval[k] / sm : pval[k];
+        wt[p.K] = p.has_sg != 0 ? 1.0 / (1.0 + exp(-sv[0])) : 1.0;
+    }
+    // entries: slot k <- master[pick[k]], rows 1, offset k
+    for (uint j = tid; j < uint(p.K) * 16u; j += 256u) {
+        uint k = j / 16u, f = j % 16u, e = uint(pick[k]) * 16u + f;
+        uint vg = mgu[e], vd = mdn[e];
+        if (f == 8u) { vg = 1u; vd = 1u; }
+        if (f == 9u) { vg = k; vd = k; }
+        egu[k * 16u + f] = vg; edn[k * 16u + f] = vd;
+    }
+}

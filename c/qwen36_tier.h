@@ -161,6 +161,11 @@ int qt_dn_block(int layer, int hout, const float *x, const float *ba, const floa
                 int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
                 float eps, float qscale, float *y, int cap);
 int qt_dn_resident(int on);
+int qt_moe_chain_ready(int layer);
+void qt_defer_next_block(int on);
+int qt_deferred(void);
+int qt_flush_deferred(void);
+int qt_moe_route(int layer, const float *logits, const float *nrm, const float *wsg, int E, int K, int D);
 int qt_dn_sync(int layer);
 void qt_dn_drop(int layer);
 int qt_dn_rollback(int layer);
@@ -234,6 +239,11 @@ static inline void qt_kv_cut(int l,int f){(void)l;(void)f;}
 static inline int qt_issue_batch_reduce_sh(int a,const int*b,int c,int d,const float*e,const float*f,int g,int h,int i,const float*j,float*k,uint8_t*l){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;return 0;}
 static inline int qt_dn_block(int a,int b,const float*c,const float*d,const float*wb_,const float*wa_,const float*e,const float*f,const float*g,float*h,float*i,int j,int k,int l,int m,int n,int o,int q,int r,float t,float u,float*v,int cap_){(void)a;(void)b;(void)c;(void)d;(void)wb_;(void)wa_;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)q;(void)r;(void)t;(void)u;(void)v;(void)cap_;return 0;}
 static inline int qt_dn_resident(int on){(void)on;return 0;}
+static inline int qt_moe_chain_ready(int l){(void)l;return 0;}
+static inline void qt_defer_next_block(int on){(void)on;}
+static inline int qt_deferred(void){return 0;}
+static inline int qt_flush_deferred(void){return 1;}
+static inline int qt_moe_route(int a,const float*b,const float*c,const float*d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int qt_dn_sync(int l){(void)l;return 0;}
 static inline void qt_dn_drop(int l){(void)l;}
 static inline int qt_dn_rollback(int l){(void)l;return 0;}

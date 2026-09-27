@@ -136,6 +136,12 @@ static struct {
     /* decode attention core (split over key chunks, then merged): attn_dec(_merge).comp */
     VkShaderModule shader_ad, shader_adm; VkDescriptorSetLayout dsl_ad, dsl_adm; VkPipelineLayout plyt_ad, plyt_adm;
     VkPipeline pipe_ad, pipe_adm; VkDescriptorPool dpool_ad, dpool_adm; VkDescriptorSet dset_ad, dset_adm; Scratch ad_part;
+    /* chained decode layer: the DeltaNet block's command buffer is kept (deferred) and
+     * submitted together with the layer's expert group, which routes on the GPU first */
+    VkShaderModule shader_mrt; VkDescriptorSetLayout dsl_mr; VkPipelineLayout plyt_mr;
+    VkPipeline pipe_mr_route; VkDescriptorPool dpool_mr; VkDescriptorSet dset_mr;
+    int defer_next, deferred;
+    struct { int pending, E, K, D, has_sg, layer; const float *logits, *nrm, *wsg; } route;
     int sgsize;
     int has_bda;         /* bufferDeviceAddress on: buffers usable by address (grouped expert shader) */
     /* grouped expert shaders (qmatmul_grp / qmatmul_gate_up_grp): [0] down, [1] gate_up */
@@ -159,6 +165,7 @@ static struct {
     /* block tail (coli_vk_block_post): residual + RMSNorm, then the router matmul */
     VkShaderModule shader_rn; VkDescriptorSetLayout dsl_rn; VkPipelineLayout plyt_rn;
     VkPipeline pipe_rn; VkDescriptorPool dpool_rn; VkDescriptorSet dset_rn; Scratch rn_w;
+    VkDescriptorPool dpool_rn2; VkDescriptorSet dset_rn2; Scratch rn_w2;   /* the expert-group tail's own (chained layers) */
     struct { int pending, done; float *x, *n, *logits; const float *w; float eps; ColiVkTensor *router; int E; } post;
     struct { int pending, done; float *x, *n; const float *w; float eps; } epost;
     Scratch ab_x, ab_qkv, ab_nw, ab_qb, ab_gb, ab_k, ab_v, ab_cx, ab_ag, ab_y;
@@ -234,6 +241,7 @@ struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; i
 struct PCAP { int S, H, KV, hd, pos_base, ldt; float scale; };   /* attn_prefill.comp */
 struct PCDR { int S, vh, vk, kdim, vdim, vstride, voff, cap; }; /* dn_recur.comp */
 struct PCRG { int S, conv_dim, convk, pstride, cap; };          /* dn_ring.comp */
+struct PCMR { int E, K, D, has_sg; };                          /* moe_route.comp */
 struct PCAD { int S, H, KV, hd, pos_base, ldt, nch, chunk; float scale; };   /* attn_dec(_merge).comp */
 struct PCDC { int S, conv_dim, convk, pstride; };               /* dn_conv.comp */
 struct PCDP { int S, conv_dim, vk, vh, kdim; float scale; };    /* dn_prep.comp */
@@ -1006,6 +1014,10 @@ int coli_vk_init(const char *spv_path) {
             ok = ok && vkAllocateDescriptorSets(G.dev, &ai, G.db_mm) == VK_SUCCESS;
         }
         if (!ok) { G.pipe_dc = G.pipe_dp = G.pipe_dg = VK_NULL_HANDLE; }
+        derive_dir_file(spv_path, "moe_route.spv", pa, sizeof(pa));
+        if (ok && (G.shader_mrt = load_spv(G.dev, pa)) &&
+            !build_pipeline(G.dev, 8, sizeof(struct PCMR), G.shader_mrt, &G.dsl_mr, &G.plyt_mr, &G.pipe_mr_route, &G.dpool_mr, &G.dset_mr))
+            G.pipe_mr_route = VK_NULL_HANDLE;
         derive_dir_file(spv_path, "dn_ring.spv", pa, sizeof(pa));
         if (ok && (G.shader_rg = load_spv(G.dev, pa)) &&
             !build_pipeline(G.dev, 3, sizeof(struct PCRG), G.shader_rg, &G.dsl_rg, &G.plyt_rg, &G.pipe_rg, &G.dpool_rg, &G.dset_rg))
@@ -1058,6 +1070,13 @@ int coli_vk_init(const char *spv_path) {
         if (ok && (G.shader_rn = load_spv(G.dev, pr)) &&
             !build_pipeline(G.dev, 4, sizeof(struct PCRN), G.shader_rn, &G.dsl_rn, &G.plyt_rn, &G.pipe_rn, &G.dpool_rn, &G.dset_rn))
             G.pipe_rn = VK_NULL_HANDLE;
+        if (G.pipe_rn) {   /* a second set + weight buffer: block tail and expert tail can sit in one submit */
+            VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
+            VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+            VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorSetCount = 1, .pSetLayouts = &G.dsl_rn};
+            if (vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.dpool_rn2) != VK_SUCCESS ||
+                (ai.descriptorPool = G.dpool_rn2, vkAllocateDescriptorSets(G.dev, &ai, &G.dset_rn2) != VK_SUCCESS)) G.dset_rn2 = VK_NULL_HANDLE;
+        }
     }
     /* Optional DeltaNet prefill recurrence (COLI_VK_DN_RECUR=0 turns it off). */
     {
@@ -1719,14 +1738,16 @@ void coli_vk_block_post(float *x, float *n, const float *w, float eps, ColiVkTen
     G.post.router = router; G.post.logits = logits; G.post.E = E;
 }
 int coli_vk_block_post_done(void) { G.post.pending = 0; return G.post.done; }
-static int rn_record(VkCommandBuffer cb, VkBuffer xb, VkBuffer ybuf, VkBuffer nb, const float *w, float eps, int S, int D) {
-    if (!G.pipe_rn || !xb || !ybuf || !nb || !scratch_reserve(&G.rn_w, (size_t)D * sizeof(float))) return 0;
-    memcpy(G.rn_w.ptr, w, (size_t)D * sizeof(float));
+static int rn_record(VkCommandBuffer cb, VkBuffer xb, VkBuffer ybuf, VkBuffer nb, const float *w, float eps, int S, int D, int slot) {
+    Scratch *rw = slot ? &G.rn_w2 : &G.rn_w;
+    VkDescriptorSet set = slot ? G.dset_rn2 : G.dset_rn;
+    if (!G.pipe_rn || !set || !xb || !ybuf || !nb || !scratch_reserve(rw, (size_t)D * sizeof(float))) return 0;
+    memcpy(rw->ptr, w, (size_t)D * sizeof(float));
     cc_barrier(cb);
-    VkDescriptorBufferInfo bi[4] = {{xb, 0, VK_WHOLE_SIZE}, {ybuf, 0, VK_WHOLE_SIZE}, {G.rn_w.buf, 0, VK_WHOLE_SIZE}, {nb, 0, VK_WHOLE_SIZE}};
-    wr_desc(G.dset_rn, 4, bi);
+    VkDescriptorBufferInfo bi[4] = {{xb, 0, VK_WHOLE_SIZE}, {ybuf, 0, VK_WHOLE_SIZE}, {rw->buf, 0, VK_WHOLE_SIZE}, {nb, 0, VK_WHOLE_SIZE}};
+    wr_desc(set, 4, bi);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_rn);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_rn, 0, 1, &G.dset_rn, 0, NULL);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_rn, 0, 1, &set, 0, NULL);
     struct PCRN pc = {S, D, eps};
     vkCmdPushConstants(cb, G.plyt_rn, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cb, (uint32_t)S, 1, 1);
@@ -1747,7 +1768,7 @@ static void post_record(VkCommandBuffer cb, VkBuffer ybuf, int S, int D) {
     size_t nx = (size_t)S * D * sizeof(float);
     VkBuffer xb = arena_buf(G.post.x, nx), nb = arena_buf(G.post.n, nx),
              lb = arena_buf(G.post.logits, (size_t)S * G.post.E * sizeof(float));
-    if (!lb || r->I != D || r->O != G.post.E || !rn_record(cb, xb, ybuf, nb, G.post.w, G.post.eps, S, D)) return;
+    if (!lb || r->I != D || r->O != G.post.E || !rn_record(cb, xb, ybuf, nb, G.post.w, G.post.eps, S, D, 0)) return;
     cc_barrier(cb);
     rec_mm(cb, G.ab_mm[4], r, nb, lb, S);
     G.post.done = 1;
@@ -1930,6 +1951,16 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     /* 6. out_proj */
     rec_mm_few(cb, G.db_mm[1], 1, outp, G.db_or.buf, ya ? ya : G.db_y.buf, S); ts_stage(cb, 5);
     post_record(cb, ya, S, H);
+    if (G.defer_next && res && ya && S == 1) {   /* chained: submitted with the layer's expert group */
+        G.defer_next = 0;
+        cc_barrier(cb);
+        VKCHECK(vkEndCommandBuffer(cb), "endCmd");
+        G.deferred = 1;
+        g_dnr[layer].own = 1; g_dnr[layer].capv = cap >= 0;
+        G.cmd_ready = 0; G.bound_tensor = NULL;
+        return 1;
+    }
+    G.defer_next = 0;
     host_read_barrier(cb);
     ts_end(cb, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(cb), "endCmd");
@@ -2221,6 +2252,58 @@ static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi
  * overlap the GPU batch with its own CPU share (issue -> CPU rows -> take); the group
  * runs on its OWN command buffer + fence, so in-flight work never collides with the
  * main pipeline (dense matmuls, absorb attention). Returns 0 -> caller falls back. */
+/* Chained decode layer (see G.route): per-layer master tables of the grouped-GEMV
+ * entries of all E experts (gate|up and down), built once from the tier's tensors;
+ * the shared expert gate vector per layer. */
+#define MOE_RES_MAX 128
+static struct { Scratch gu, dn, sg; const float *ssg; int E; } g_moem[MOE_RES_MAX];
+static void entry_of(uint32_t *e, ColiVkTensor *a, ColiVkTensor *b) {
+    uint64_t wa = vk_addr(a->wbuf), sa = vk_addr(a->sbuf), wb = b ? vk_addr(b->wbuf) : 0, sb = b ? vk_addr(b->sbuf) : 0;
+    memset(e, 0, 64);
+    e[0] = (uint32_t)wa; e[1] = (uint32_t)(wa >> 32); e[2] = (uint32_t)sa; e[3] = (uint32_t)(sa >> 32);
+    e[4] = (uint32_t)wb; e[5] = (uint32_t)(wb >> 32); e[6] = (uint32_t)sb; e[7] = (uint32_t)(sb >> 32);
+    e[8] = 1; e[10] = (uint32_t)a->fmt; e[11] = (uint32_t)a->rowWords; e[12] = (uint32_t)a->gs;
+}
+int coli_vk_moe_master(int layer, int E, ColiVkTensor *const *tg, ColiVkTensor *const *tu, ColiVkTensor *const *td) {
+    if (layer < 0 || layer >= MOE_RES_MAX || !G.pipe_mr_route || !G.has_bda) return 0;
+    if (g_moem[layer].E == E) return 1;
+    for (int e = 0; e < E; e++) if (!tg[e] || !tu[e] || !td[e] || tg[e]->dev || td[e]->dev) return 0;
+    if (!scratch_reserve(&g_moem[layer].gu, (size_t)E * 64) || !scratch_reserve(&g_moem[layer].dn, (size_t)E * 64)) return 0;
+    uint32_t *gu = g_moem[layer].gu.ptr, *dn = g_moem[layer].dn.ptr, tmp[16];
+    for (int e = 0; e < E; e++) {
+        entry_of(tmp, tg[e], tu[e]); memcpy(gu + (size_t)e * 16, tmp, 64);
+        entry_of(tmp, td[e], NULL);  memcpy(dn + (size_t)e * 16, tmp, 64);
+    }
+    g_moem[layer].E = E;
+    return 1;
+}
+/* The next expert group routes on the GPU from these arena rows (logits of the
+ * deferred block's router, its normed row) instead of the host's routing; the
+ * caller passes placeholder experts 0..K-1 so the group has K + 1 one-row slots. */
+int coli_vk_moe_route(int layer, const float *logits, const float *nrm, const float *wsg, int E, int K, int D) {
+    if (!G.deferred || layer < 0 || layer >= MOE_RES_MAX || g_moem[layer].E != E || K > 16 || E > 1024) return 0;
+    if (!arena_buf(logits, (size_t)E * 4) || !arena_buf(nrm, (size_t)D * 4)) return 0;
+    if (wsg && (g_moem[layer].ssg != wsg)) {
+        if (!scratch_reserve(&g_moem[layer].sg, (size_t)D * 4)) return 0;
+        memcpy(g_moem[layer].sg.ptr, wsg, (size_t)D * 4); g_moem[layer].ssg = wsg;
+    }
+    G.route.pending = 1; G.route.layer = layer; G.route.E = E; G.route.K = K; G.route.D = D;
+    G.route.has_sg = wsg != NULL; G.route.logits = logits; G.route.nrm = nrm; G.route.wsg = wsg;
+    return 1;
+}
+/* A deferred block whose expert group did not come: submit it alone and wait. */
+int coli_vk_flush_deferred(void) {
+    if (!G.deferred) return 1;
+    G.deferred = 0; G.route.pending = 0;
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    return 1;
+}
+void coli_vk_defer_next_block(int on) { G.defer_next = on && G.pipe_mr_route != VK_NULL_HANDLE; }
+int coli_vk_deferred(void) { return G.deferred; }
+
 static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                              ColiVkTensor *const *downs, const int *rows, int count,
                              const float *x, const ExpertPrefill *ep) {
@@ -2441,6 +2524,23 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         }
         G.grp_n[0] = nbig[0]; G.grp_n[1] = nbig[1]; G.grp_ns[0] = nsm[0]; G.grp_ns[1] = nsm[1];
     }
+    if (grp && G.route.pending && G.grp_gemv && ep && ep->S == 1 && ep->K == G.route.K + 1 && count == G.route.K + 1) {
+        int L = G.route.layer;
+        size_t nE = (size_t)G.route.E * 4, nD = (size_t)G.route.D * 4;
+        VkDescriptorBufferInfo bi[8] = {{arena_buf(G.route.logits, nE), 0, VK_WHOLE_SIZE}, {arena_buf(G.route.nrm, nD), 0, VK_WHOLE_SIZE},
+                                        {G.route.has_sg ? g_moem[L].sg.buf : g_moem[L].gu.buf, 0, VK_WHOLE_SIZE},
+                                        {g_moem[L].gu.buf, 0, VK_WHOLE_SIZE}, {g_moem[L].dn.buf, 0, VK_WHOLE_SIZE},
+                                        {G.grp_et[1].buf, 0, VK_WHOLE_SIZE}, {G.grp_et[0].buf, 0, VK_WHOLE_SIZE},
+                                        {G.ep_weights.buf, 0, VK_WHOLE_SIZE}};
+        wr_desc(G.dset_mr, 8, bi);
+        vkCmdBindPipeline(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_mr_route);
+        vkCmdBindDescriptorSets(G.eg_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_mr, 0, 1, &G.dset_mr, 0, NULL);
+        struct PCMR pc = {G.route.E, G.route.K, G.route.D, G.route.has_sg};
+        vkCmdPushConstants(G.eg_cmd, G.plyt_mr, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.eg_cmd, 1, 1, 1);
+        vkCmdPipelineBarrier(G.eg_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        G.route.pending = 2;   /* recorded */
+    }
     if (grp) {
         VkBuffer xin[2] = {G.eg_h.buf, ggat ? (G.ep_xa ? G.ep_xa : G.ep_x.buf) : G.eg_x.buf}, yout[2] = {G.eg_y.buf, G.eg_h.buf};
         for (int step = 0; step < 2; step++) {
@@ -2510,7 +2610,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
             G.epost.pending = 0;
             size_t nx = (size_t)ep->S * D * sizeof(float);
             G.epost.done = G.ep_ya && rn_record(G.eg_cmd, arena_buf(G.epost.x, nx), G.ep_ya, arena_buf(G.epost.n, nx),
-                                                G.epost.w, G.epost.eps, ep->S, D);
+                                                G.epost.w, G.epost.eps, ep->S, D, 1);
         }
     }
     ts_stageb(G.eg_cmd, TSB_EG, 3);
@@ -2519,7 +2619,17 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     VKCHECK(vkEndCommandBuffer(G.eg_cmd), "eg endCmd");
     if (G.eg_prof) G.eg_t3 = vk_now();
 
-    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.eg_cmd};
+    if (G.route.pending == 1) {   /* routing was asked for but this group could not take it */
+        vkEndCommandBuffer(G.eg_cmd);   /* (recorded, never submitted) */
+        G.route.pending = 0; coli_vk_flush_deferred();
+        return 0;
+    }
+    VkCommandBuffer cbs[2] = {G.cmd, G.eg_cmd};
+    int chained = G.deferred && G.route.pending == 2;
+    G.route.pending = 0;
+    if (G.deferred && !chained) coli_vk_flush_deferred();
+    G.deferred = 0;
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = chained ? 2u : 1u, .pCommandBuffers = chained ? cbs : &G.eg_cmd};
     VKCHECK(vkResetFences(G.dev, 1, &G.eg_fence), "eg resetFence");
     { double vp0 = G.eg_prof ? vk_now() : 0;
       G.eg_th0 = vk_now();

@@ -1664,6 +1664,58 @@ int qt_issue_batch_reduce_sh(int layer,const int *eids,int S,int K,const float *
     free(e2); free(w2); free(d2);
     return ok;
 }
+/* Chained decode layer (Vulkan): the DeltaNet block's submit is held back and goes
+ * out with the layer's expert group, which routes on the GPU (coli_vk_moe_route).
+ * Needs every expert of the layer resident on device 0. */
+int qt_moe_chain_ready(int layer){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    if(!G.on || !coli_vk_available() || layer < 0 || layer >= G.nl) return 0;
+    static int8_t *ok = NULL;
+    if(!ok){ ok = calloc((size_t)G.nl, 1); if(!ok) return 0; }
+    if(ok[layer]) return ok[layer] > 0;
+    QtTensor **g = malloc(sizeof(QtTensor*) * (size_t)G.ne * 3);
+    int good = g != NULL;
+    for(int e = 0; good && e < G.ne; e++){
+        QSlot *q = qs(layer, e);
+        if(!q->resident || !q->tg || !q->tu || !q->td) good = 0;
+        else { g[e] = q->tg; g[G.ne + e] = q->tu; g[2*G.ne + e] = q->td; }
+    }
+    good = good && coli_vk_moe_master(layer, G.ne, g, g + G.ne, g + 2*G.ne);
+    free(g);
+    ok[layer] = good ? 1 : -1;
+    return good;
+#else
+    (void)layer; return 0;
+#endif
+}
+void qt_defer_next_block(int on){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    if(coli_vk_available()) coli_vk_defer_next_block(on);
+#else
+    (void)on;
+#endif
+}
+int qt_deferred(void){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_available() && coli_vk_deferred();
+#else
+    return 0;
+#endif
+}
+int qt_flush_deferred(void){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return !coli_vk_available() || coli_vk_flush_deferred();
+#else
+    return 1;
+#endif
+}
+int qt_moe_route(int layer, const float *logits, const float *nrm, const float *wsg, int E, int K, int D){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_available() && coli_vk_moe_route(layer, logits, nrm, wsg, E, K, D);
+#else
+    (void)layer;(void)logits;(void)nrm;(void)wsg;(void)E;(void)K;(void)D; return 0;
+#endif
+}
 int qt_issue_batch_reduce(int layer,const int *eids,int S,int K,const float *x,
                           const float *weights,float *res,uint8_t *done){
     if(!weights) return 0;

@@ -63,6 +63,12 @@ int  coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, co
 /* Resident DeltaNet state of the block (decode): on/off (-1 queries), host copy back
  * (1 if the GPU held it), forget the GPU copy, swap in the state after token cap. */
 int  coli_vk_dn_resident(int on);
+/* chained decode layer: DeltaNet block + its expert group in one submit, routed on the GPU */
+int  coli_vk_moe_master(int layer, int E, ColiVkTensor *const *tg, ColiVkTensor *const *tu, ColiVkTensor *const *td);
+int  coli_vk_moe_route(int layer, const float *logits, const float *nrm, const float *wsg, int E, int K, int D);
+int  coli_vk_flush_deferred(void);
+void coli_vk_defer_next_block(int on);
+int  coli_vk_deferred(void);
 int  coli_vk_dn_sync(int layer);
 void coli_vk_dn_drop(int layer);
 int  coli_vk_dn_rollback(int layer);
