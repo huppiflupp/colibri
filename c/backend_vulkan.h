@@ -75,9 +75,10 @@ typedef struct {
      * position of the token; recorded again for every token */
     int is_attn; ColiVkTensor *tq, *tk, *tv, *to; const float *qn, *kn; float *Kc, *Vc;
     int ldt, pos_base, Hq, KVh, hd, qdim, rotary; float theta, ascale;
+    int S, cap;   /* token rows (1, or 2 = MTP verify) and the DeltaNet capture row (-1 none) */
 } ColiDecLayer;
 int  coli_vk_dec_record(const ColiDecLayer *d);
-int  coli_vk_dec_run(int n, const int *layers, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E);
+int  coli_vk_dec_run(int n, const int *layers, int S, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E);
 int  coli_vk_moe_master(int layer, int E, ColiVkTensor *const *tg, ColiVkTensor *const *tu, ColiVkTensor *const *td);
 int  coli_vk_moe_route(int layer, const float *logits, const float *nrm, const float *wsg, int E, int K, int D);
 int  coli_vk_flush_deferred(void);

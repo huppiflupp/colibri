@@ -3840,7 +3840,7 @@ static int trunk_probe_gpu_wins(Model *m){
 
 /* Decode graph: record DeltaNet layer j's fixed command buffer (arena rows x, nrm,
  * tmp, logits; the next layer's in_ln for the expert tail).  0: not possible. */
-static int dec_graph_layer(Model *m, int j, float *x, float *nrm, float *tmp, float *lg, const float *next_w) {
+static int dec_graph_layer(Model *m, int j, float *x, float *nrm, float *tmp, float *lg, const float *next_w, int S, int cap) {
     Cfg *c = &m->c; Layer *l = &m->L[j];
     if (c->is_attn[j] || !l->qth_dnout || !l->qth_gate || !l->qth_shg || !l->qth_shu || !l->qth_shd ||
         (c->has_bias && l->gate_bias) || !qt_dnproj_ready(j)) return 0;
@@ -3852,11 +3852,11 @@ static int dec_graph_layer(Model *m, int j, float *x, float *nrm, float *tmp, fl
                          l->dn_b, l->dn_a, l->dn_conv, par[j], l->dn_norm, l->post_ln, next_w, l->sh_gate,
                          m->DN_conv[j], m->DN_rec[j], x, nrm, tmp, lg, c->hidden, c->dn_conv_dim, c->dn_convk,
                          vh, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->n_experts, c->topk, c->inter, c->eps,
-                         1.f / sqrtf((float)c->dn_kdim));
+                         1.f / sqrtf((float)c->dn_kdim), S, cap);
 }
 
 /* Decode graph, attention layer j at position pos (recorded for this token). */
-static int dec_graph_attn(Model *m, int j, int pos, float *x, float *nrm, float *tmp, float *lg, const float *next_w) {
+static int dec_graph_attn(Model *m, int j, int pos, float *x, float *nrm, float *tmp, float *lg, const float *next_w, int S) {
     Cfg *c = &m->c; Layer *l = &m->L[j];
     if (!c->is_attn[j] || !l->qth_q || !l->qth_k || !l->qth_v || !l->qth_o || !l->qth_gate || !l->qth_shg ||
         !l->qth_shu || !l->qth_shd || (c->has_bias && l->gate_bias) || c->k_head_dim != c->head_dim) return 0;
@@ -3864,7 +3864,7 @@ static int dec_graph_attn(Model *m, int j, int pos, float *x, float *nrm, float 
                               l->qth_shg - 1, l->qth_shu - 1, l->qth_shd - 1, l->qn, l->kn, m->K[j], m->V[j], m->max_t, pos,
                               l->post_ln, next_w, l->sh_gate, x, nrm, tmp, lg, c->hidden, c->q_heads, c->kv_heads,
                               c->head_dim, c->q_head_dim, c->rotary_dim, c->theta, 1.f / sqrtf((float)c->head_dim),
-                              c->n_experts, c->topk, c->inter, c->eps);
+                              c->n_experts, c->topk, c->inter, c->eps, S);
 }
 
 static void layers_forward_range(Model *m, float *x, int S, int pos_base,
@@ -3890,7 +3890,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
      * (QWEN_DEC_TAIL / QWEN_DEC_CHAIN take them to S <= 4) */
     static int dec_graph = -1;
     if (dec_graph < 0) dec_graph = !(getenv("QWEN_DEC_GRAPH") && getenv("QWEN_DEC_GRAPH")[0] == '0');
-    int dect = (dec_tail ? S <= 4 : dec_graph && S == 1) && qt_dn_resident(-1) && !lf;
+    int dect = (dec_tail ? S <= 4 : dec_graph && S <= 2) && qt_dn_resident(-1) && !lf;
     int arena = (S >= qt_trunk_min_s() || dect) && qt_batch_ok() && !(getenv("QWEN_HOST_ARENA") && getenv("QWEN_HOST_ARENA")[0] == '0');
     if (arena) {
         nrm = qt_host_arena(0, sizeof(float) * (size_t)S * D);
@@ -3934,16 +3934,22 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         }
         static int graph_attn = -1;   /* attention layers join the graph: the whole token, one submit (QWEN_DEC_GRAPH_ATTN=0 off) */
         if (graph_attn < 0) graph_attn = !(getenv("QWEN_DEC_GRAPH_ATTN") && getenv("QWEN_DEC_GRAPH_ATTN")[0] == '0');
-        if (dec_graph && tail && S == 1 && (!c->is_attn[i] || graph_attn)) {
-            int ls[64], n = 0;
+        static int graph_s2 = -1;   /* the MTP verify pair through the graph too (QWEN_DEC_GRAPH_S2=0 off) */
+        if (graph_s2 < 0) graph_s2 = !(getenv("QWEN_DEC_GRAPH_S2") && getenv("QWEN_DEC_GRAPH_S2")[0] == '0');
+        if (dec_graph && tail && (S == 1 || (S == 2 && graph_s2)) && (!c->is_attn[i] || graph_attn)) {
+            /* MTP verify: DeltaNet state captured after row g_dn_cap_after (roll-back) */
+            int cap = g_dn_cap_after >= 0 && g_dn_cap_after < S && g_dn_cap_rec ? g_dn_cap_after : -1;
+            int ls[64], n = 0, ndn = 0;
             for (int j = i; j < layer_end && n < 64; j++) {
                 const float *nw = j + 1 < layer_end ? m->L[j + 1].in_ln : m->L[j].in_ln;
-                if (c->is_attn[j] ? !(graph_attn && dec_graph_attn(m, j, pos_base, x, nrm, tmp, lg, nw))
-                                  : !dec_graph_layer(m, j, x, nrm, tmp, lg, nw)) break;
+                if (c->is_attn[j] ? !(graph_attn && dec_graph_attn(m, j, pos_base, x, nrm, tmp, lg, nw, S))
+                                  : !dec_graph_layer(m, j, x, nrm, tmp, lg, nw, S, cap)) break;
+                ndn += !c->is_attn[j];
                 ls[n++] = j;
             }
             double _tg = tm_now();
-            if (n > 0 && qt_dec_run(n, ls, x, nrm, tmp, lg, D, c->n_experts)) {
+            if (n > 0 && qt_dec_run(n, ls, S, x, nrm, tmp, lg, D, c->n_experts)) {
+                if (cap >= 0) g_dn_cap_n += ndn;
                 tm_add(S, 0, tm_now() - _tg);
                 i += n - 1;
                 normed = i + 1 < layer_end;

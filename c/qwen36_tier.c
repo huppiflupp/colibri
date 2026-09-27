@@ -1752,7 +1752,7 @@ int qt_moe_chain_ready(int layer){
 int qt_dec_record(int layer, int hout, int hrt, int hsg, int hsu, int hsd, const float *wb, const float *wa,
                   const float *convw, const float *par, const float *normw, const float *post_w, const float *next_w,
                   const float *wsg, float *ring, float *state, float *x, float *nrm, float *tmp, float *logits,
-                  int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim, int E, int K, int I, float eps, float qscale){
+                  int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim, int E, int K, int I, float eps, float qscale, int S, int cap){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     int h[5] = {hout, hrt, hsg, hsu, hsd};
     for(int i = 0; i < 5; i++) if(h[i] < 0 || h[i] >= G_dense_n || !G_dense[h[i]].on) return 0;
@@ -1760,18 +1760,19 @@ int qt_dec_record(int layer, int hout, int hrt, int hsg, int hsu, int hsd, const
     ColiDecLayer d = {layer, G_dnp[layer].t, G_dense[hout].t, G_dense[hrt].t, G_dense[hsg].t, G_dense[hsu].t, G_dense[hsd].t,
                       wb, wa, convw, par, normw, post_w, next_w, wsg, ring, state, x, nrm, tmp, logits,
                       H, conv_dim, convk, vh, vk, kdim, vdim, E, K, I, eps, qscale};
+    d.S = S; d.cap = cap;
     return coli_vk_dec_record(&d);
 #else
     (void)layer;(void)hout;(void)hrt;(void)hsg;(void)hsu;(void)hsd;(void)wb;(void)wa;(void)convw;(void)par;(void)normw;(void)post_w;
     (void)next_w;(void)wsg;(void)ring;(void)state;(void)x;(void)nrm;(void)tmp;(void)logits;(void)H;(void)conv_dim;(void)convk;
-    (void)vh;(void)vk;(void)kdim;(void)vdim;(void)E;(void)K;(void)I;(void)eps;(void)qscale; return 0;
+    (void)vh;(void)vk;(void)kdim;(void)vdim;(void)E;(void)K;(void)I;(void)eps;(void)qscale;(void)S;(void)cap; return 0;
 #endif
 }
 int qt_dec_record_attn(int layer, int hq, int hk, int hv, int ho, int hrt, int hsg, int hsu, int hsd,
                        const float *qn, const float *kn, float *Kc, float *Vc, int ldt, int pos,
                        const float *post_w, const float *next_w, const float *wsg,
                        float *x, float *nrm, float *tmp, float *logits, int H, int Hq, int KVh, int hd, int qdim,
-                       int rotary, float theta, float ascale, int E, int K, int I, float eps){
+                       int rotary, float theta, float ascale, int E, int K, int I, float eps, int S){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     int h[8] = {hq, hk, hv, ho, hrt, hsg, hsu, hsd};
     for(int i = 0; i < 8; i++) if(h[i] < 0 || h[i] >= G_dense_n || !G_dense[h[i]].on) return 0;
@@ -1782,19 +1783,19 @@ int qt_dec_record_attn(int layer, int hq, int hk, int hv, int ho, int hrt, int h
     d.H = H; d.E = E; d.K = K; d.I = I; d.eps = eps;
     d.is_attn = 1; d.tq = G_dense[hq].t; d.tk = G_dense[hk].t; d.tv = G_dense[hv].t; d.to = G_dense[ho].t;
     d.qn = qn; d.kn = kn; d.Kc = Kc; d.Vc = Vc; d.ldt = ldt; d.pos_base = pos; d.Hq = Hq; d.KVh = KVh; d.hd = hd;
-    d.qdim = qdim; d.rotary = rotary; d.theta = theta; d.ascale = ascale;
+    d.qdim = qdim; d.rotary = rotary; d.theta = theta; d.ascale = ascale; d.S = S; d.cap = -1;
     return coli_vk_dec_record(&d);
 #else
     (void)layer;(void)hq;(void)hk;(void)hv;(void)ho;(void)hrt;(void)hsg;(void)hsu;(void)hsd;(void)qn;(void)kn;(void)Kc;(void)Vc;
     (void)ldt;(void)pos;(void)post_w;(void)next_w;(void)wsg;(void)x;(void)nrm;(void)tmp;(void)logits;(void)H;(void)Hq;(void)KVh;
-    (void)hd;(void)qdim;(void)rotary;(void)theta;(void)ascale;(void)E;(void)K;(void)I;(void)eps; return 0;
+    (void)hd;(void)qdim;(void)rotary;(void)theta;(void)ascale;(void)E;(void)K;(void)I;(void)eps;(void)S; return 0;
 #endif
 }
-int qt_dec_run(int n, const int *layers, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E){
+int qt_dec_run(int n, const int *layers, int S, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
-    return coli_vk_available() && coli_vk_dec_run(n, layers, x, nrm, tmp, logits, H, E);
+    return coli_vk_available() && coli_vk_dec_run(n, layers, S, x, nrm, tmp, logits, H, E);
 #else
-    (void)n;(void)layers;(void)x;(void)nrm;(void)tmp;(void)logits;(void)H;(void)E; return 0;
+    (void)n;(void)layers;(void)S;(void)x;(void)nrm;(void)tmp;(void)logits;(void)H;(void)E; return 0;
 #endif
 }
 void qt_defer_next_block(int on){

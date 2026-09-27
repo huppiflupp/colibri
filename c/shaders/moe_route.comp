@@ -6,6 +6,7 @@
 // grouped-GEMV entry of each chosen expert (copied from the layer's master table,
 // row count 1, row offset = slot) for gate|up and down, and the pair weights
 // (slot K = the shared expert, its entries stay as the host wrote them).
+// One workgroup per token row t: logits, row and slots at t*E, t*D, t*(K+1).
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
 layout(local_size_x = 256) in;
@@ -22,15 +23,16 @@ shared float sv[256]; shared int si[256];
 shared float pr[1024];
 shared int pick[16]; shared float pval[16];
 void main() {
-    uint tid = gl_LocalInvocationID.x, E = uint(p.E);
+    uint tid = gl_LocalInvocationID.x, E = uint(p.E), t = gl_WorkGroupID.x;
+    uint lo = t * E, no = t * uint(p.D), so = t * uint(p.K + 1);
     // softmax (max, then sum of exp) like softmax_row
     float m = -3.0e38;
-    for (uint e = tid; e < E; e += 256u) m = max(m, logit[e]);
+    for (uint e = tid; e < E; e += 256u) m = max(m, logit[lo + e]);
     sv[tid] = m; barrier();
     for (uint s = 128u; s > 0u; s >>= 1) { if (tid < s) sv[tid] = max(sv[tid], sv[tid + s]); barrier(); }
     m = sv[0]; barrier();
     float sum = 0.0;
-    for (uint e = tid; e < E; e += 256u) { float v = exp(logit[e] - m); pr[e] = v; sum += v; }
+    for (uint e = tid; e < E; e += 256u) { float v = exp(logit[lo + e] - m); pr[e] = v; sum += v; }
     sv[tid] = sum; barrier();
     for (uint s = 128u; s > 0u; s >>= 1) { if (tid < s) sv[tid] += sv[tid + s]; barrier(); }
     float tot = sv[0]; barrier();
@@ -57,21 +59,21 @@ void main() {
     }
     // shared gate: sigmoid(nrm . wsg)
     float d = 0.0;
-    if (p.has_sg != 0) for (uint i = tid; i < uint(p.D); i += 256u) d += nrm[i] * wsg[i];
+    if (p.has_sg != 0) for (uint i = tid; i < uint(p.D); i += 256u) d += nrm[no + i] * wsg[i];
     sv[tid] = d; barrier();
     for (uint s = 128u; s > 0u; s >>= 1) { if (tid < s) sv[tid] += sv[tid + s]; barrier(); }
     if (tid == 0u) {
         float sm = 0.0;
         for (int k = 0; k < p.K; k++) sm += pval[k];
-        for (int k = 0; k < p.K; k++) wt[k] = sm > 0.0 ? pval[k] / sm : pval[k];
-        wt[p.K] = p.has_sg != 0 ? 1.0 / (1.0 + exp(-sv[0])) : 1.0;
+        for (int k = 0; k < p.K; k++) wt[so + uint(k)] = sm > 0.0 ? pval[k] / sm : pval[k];
+        wt[so + uint(p.K)] = p.has_sg != 0 ? 1.0 / (1.0 + exp(-sv[0])) : 1.0;
     }
     // entries: slot k <- master[pick[k]], rows 1, offset k
     for (uint j = tid; j < uint(p.K) * 16u; j += 256u) {
         uint k = j / 16u, f = j % 16u, e = uint(pick[k]) * 16u + f;
         uint vg = mgu[e], vd = mdn[e];
         if (f == 8u) { vg = 1u; vd = 1u; }
-        if (f == 9u) { vg = k; vd = k; }
-        egu[k * 16u + f] = vg; edn[k * 16u + f] = vd;
+        if (f == 9u) { vg = so + k; vd = so + k; }
+        egu[(so + k) * 16u + f] = vg; edn[(so + k) * 16u + f] = vd;
     }
 }
