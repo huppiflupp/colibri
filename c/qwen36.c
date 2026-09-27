@@ -3752,7 +3752,12 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
      * directly instead of copying through their staging buffers
      * (QWEN_HOST_ARENA=0 keeps plain allocations) */
     float *nrm = NULL, *tmp = NULL;
-    int arena = S >= qt_trunk_min_s() && qt_batch_ok() && !(getenv("QWEN_HOST_ARENA") && getenv("QWEN_HOST_ARENA")[0] == '0');
+    /* decode (S <= 4) with the resident DeltaNet blocks: the same arena and block
+     * tails (QWEN_DEC_TAIL=1, experiment) */
+    static int dec_tail = -1;
+    if (dec_tail < 0) dec_tail = getenv("QWEN_DEC_TAIL") && getenv("QWEN_DEC_TAIL")[0] == '1';
+    int dect = dec_tail && S <= 4 && qt_dn_resident(-1) && !lf;
+    int arena = (S >= qt_trunk_min_s() || dect) && qt_batch_ok() && !(getenv("QWEN_HOST_ARENA") && getenv("QWEN_HOST_ARENA")[0] == '0');
     if (arena) {
         nrm = qt_host_arena(0, sizeof(float) * (size_t)S * D);
         tmp = qt_host_arena(1, sizeof(float) * (size_t)S * D);
@@ -3763,7 +3768,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
      * (post_ln after the mixer, the next layer's in_ln after the MoE): one
      * parallel pass per token row instead of two, same operations per element.
      * Not with the layer dump or the pilot, which look at x in between. */
-    int fuse = S > 1 && !lf && !(allow_prefetch && g_pilot >= 1 && S <= 8);
+    int fuse = (S > 1 || dect) && !lf && !(allow_prefetch && g_pilot >= 1 && S <= 8);
     int normed = 0;                       /* nrm already holds in_ln(x) for layer i */
     /* GPU block tail: with the arena the residual stream moves into it as well
      * (slot 2, logits slot 3); each DeltaNet/attention block then adds its output
@@ -3806,7 +3811,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
             goto mixer_done;
         }
         if (fuse) {
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(static) if(S > 1)
             for (int s = 0; s < S; s++) {
                 float *xs = x + (int64_t)s*D; const float *ts = tmp + (int64_t)s*D;
                 for (int d = 0; d < D; d++) xs[d] += ts[d];
@@ -3844,7 +3849,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         if (tail && qt_expert_post_done()) { normed = i + 1 < layer_end; continue; }
         if (fuse) {
             const float *nw = i + 1 < layer_end ? m->L[i + 1].in_ln : NULL;
-            #pragma omp parallel for schedule(static)
+            #pragma omp parallel for schedule(static) if(S > 1)
             for (int s = 0; s < S; s++) {
                 float *xs = x + (int64_t)s*D; const float *ts = tmp + (int64_t)s*D;
                 for (int d = 0; d < D; d++) xs[d] += ts[d];

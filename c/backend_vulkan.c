@@ -1766,6 +1766,10 @@ int coli_vk_fast_gemv(void) { return G.ready && G.gvd_on; }   /* grouped GEMV fo
 #define DN_RES_MAX 128
 static struct { Scratch st, rg, cst, crg; int own, capv; float *host_st, *host_rg; size_t nst, nrg; } g_dnr[DN_RES_MAX];
 static int dn_res_on = -1;
+/* the layer's constant inputs of the block (b|a weights, conv weights, A_log|dt_bias,
+ * norm weight), uploaded once instead of copied into the staging buffers per call
+ * (the b|a weights alone are 512 KB a layer) */
+static struct { Scratch w, par, cw, nw; const void *sw, *spar, *scw, *snw; } g_dnc[DN_RES_MAX];
 int coli_vk_dn_resident(int on) { if (on >= 0) dn_res_on = on; return dn_res_on > 0; }
 int coli_vk_dn_sync(int layer) {
     if (layer < 0 || layer >= DN_RES_MAX || !g_dnr[layer].own) return 0;
@@ -1835,10 +1839,25 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     VkBuffer xa = arena_gpu_written(x) ? arena_buf(x, nx) : VK_NULL_HANDLE, ya = arena_buf(y, nx);
     if (!xa) memcpy(G.db_x.ptr, x, nx);
     if (ba) memcpy(G.db_ba.ptr, ba, nba);
-    else { memcpy(G.db_w.ptr, wb, (size_t)vh * H * f); memcpy((char *)G.db_w.ptr + (size_t)vh * H * f, wa, (size_t)vh * H * f); } memcpy(G.db_par.ptr, par, npar);
+    VkBuffer b_w = G.db_w.buf, b_par = G.db_par.buf, b_cw = G.db_cw.buf, b_nw = G.db_nw.buf;
+    int cres = res && (ba || (scratch_reserve(&g_dnc[layer].w, (size_t)2 * vh * H * f))) &&
+               scratch_reserve(&g_dnc[layer].par, npar) && scratch_reserve(&g_dnc[layer].cw, ncw) &&
+               scratch_reserve(&g_dnc[layer].nw, nnw);
+    if (cres) {
+        __typeof__(g_dnc[0]) *C = &g_dnc[layer];
+        /* par is the caller's per-call copy: compare contents, the rest by pointer */
+        if (!ba && C->sw != wb) { memcpy(C->w.ptr, wb, (size_t)vh * H * f); memcpy((char *)C->w.ptr + (size_t)vh * H * f, wa, (size_t)vh * H * f); C->sw = wb; }
+        if (C->spar != par || memcmp(C->par.ptr, par, npar)) { memcpy(C->par.ptr, par, npar); C->spar = par; }
+        if (C->scw != convw) { memcpy(C->cw.ptr, convw, ncw); C->scw = convw; }
+        if (C->snw != normw) { memcpy(C->nw.ptr, normw, nnw); C->snw = normw; }
+        b_w = C->w.buf; b_par = C->par.buf; b_cw = C->cw.buf; b_nw = C->nw.buf;
+    } else {
+    if (!ba) { memcpy(G.db_w.ptr, wb, (size_t)vh * H * f); memcpy((char *)G.db_w.ptr + (size_t)vh * H * f, wa, (size_t)vh * H * f); }
+    memcpy(G.db_par.ptr, par, npar);
     memcpy(G.db_cw.ptr, convw, ncw);
-    if (!res) { memcpy(G.db_ring.ptr, ring, nring); memcpy(G.dr_s.ptr, state, nst); }
     memcpy(G.db_nw.ptr, normw, nnw);
+    }
+    if (!res) { memcpy(G.db_ring.ptr, ring, nring); memcpy(G.dr_s.ptr, state, nst); }
     VkCommandBuffer cb = G.cmd;
     VKCHECK(vkResetCommandBuffer(cb, 0), "resetCmd");
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1847,7 +1866,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     /* 1. qkv|z = x Wp^T */
     rec_mm_few(cb, G.db_mm[0], 0, proj, xa ? xa : G.db_x.buf, G.db_qz.buf, S);
     if (!ba) {   /* b | a from the same input rows (read-only beside the projection) */
-        VkDescriptorBufferInfo bi[3] = {{xa ? xa : G.db_x.buf, 0, VK_WHOLE_SIZE}, {G.db_w.buf, 0, VK_WHOLE_SIZE}, {G.db_ba.buf, 0, VK_WHOLE_SIZE}};
+        VkDescriptorBufferInfo bi[3] = {{xa ? xa : G.db_x.buf, 0, VK_WHOLE_SIZE}, {b_w, 0, VK_WHOLE_SIZE}, {G.db_ba.buf, 0, VK_WHOLE_SIZE}};
         wr_desc(G.dset_dba, 3, bi);
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dba);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dba, 0, 1, &G.dset_dba, 0, NULL);
@@ -1857,7 +1876,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     }
     cc_barrier(cb); ts_stage(cb, 0);
     /* 2. conv + SiLU */
-    { VkDescriptorBufferInfo bi[4] = {{G.db_qz.buf, 0, VK_WHOLE_SIZE}, {G.db_cw.buf, 0, VK_WHOLE_SIZE},
+    { VkDescriptorBufferInfo bi[4] = {{G.db_qz.buf, 0, VK_WHOLE_SIZE}, {b_cw, 0, VK_WHOLE_SIZE},
                                       {b_rg, 0, VK_WHOLE_SIZE}, {G.db_conv.buf, 0, VK_WHOLE_SIZE}};
       wr_desc(G.dset_dc, 4, bi);
       vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dc);
@@ -1877,7 +1896,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     ts_stage(cb, 1);
     /* 3. l2norm q/k, beta, exp(g) */
     { VkDescriptorBufferInfo bi[6] = {{G.db_conv.buf, 0, VK_WHOLE_SIZE}, {G.db_ba.buf, 0, VK_WHOLE_SIZE},
-                                      {G.db_par.buf, 0, VK_WHOLE_SIZE}, {G.dr_q.buf, 0, VK_WHOLE_SIZE},
+                                      {b_par, 0, VK_WHOLE_SIZE}, {G.dr_q.buf, 0, VK_WHOLE_SIZE},
                                       {G.dr_k.buf, 0, VK_WHOLE_SIZE}, {G.db_bg.buf, 0, VK_WHOLE_SIZE}};
       wr_desc(G.dset_dp, 6, bi);
       vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dp);
@@ -1900,7 +1919,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     cc_barrier(cb); ts_stage(cb, 3);
     /* 5. gated RMSNorm */
     { VkDescriptorBufferInfo bi[4] = {{G.dr_o.buf, 0, VK_WHOLE_SIZE}, {G.db_qz.buf, 0, VK_WHOLE_SIZE},
-                                      {G.db_nw.buf, 0, VK_WHOLE_SIZE}, {G.db_or.buf, 0, VK_WHOLE_SIZE}};
+                                      {b_nw, 0, VK_WHOLE_SIZE}, {G.db_or.buf, 0, VK_WHOLE_SIZE}};
       wr_desc(G.dset_dg, 4, bi);
       vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dg);
       vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dg, 0, 1, &G.dset_dg, 0, NULL);
