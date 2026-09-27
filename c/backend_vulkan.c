@@ -89,6 +89,10 @@ static struct {
     VkDescriptorSet dset_dc, dset_dp, dset_dg, db_mm[2];
     Scratch db_x, db_qz, db_ba, db_par, db_cw, db_ring, db_conv, db_bg, db_nw, db_or, db_y;
     int sgsize;
+    /* whole attention layer of a prefill (coli_vk_attn_block) */
+    VkShaderModule shader_ab, shader_ag; VkDescriptorSetLayout dsl_ab, dsl_ag; VkPipelineLayout plyt_ab, plyt_ag;
+    VkPipeline pipe_ab, pipe_ag; VkDescriptorPool dpool_ab, dpool_ag, ab_pool; VkDescriptorSet dset_ab, dset_ag, ab_mm[4];
+    Scratch ab_x, ab_qkv, ab_nw, ab_qb, ab_gb, ab_k, ab_v, ab_cx, ab_ag, ab_y;
     VkShaderModule shader_att; VkDescriptorSetLayout dsl_att; VkPipelineLayout plyt_att;
     VkPipeline pipe_att; VkDescriptorPool dpool_att; VkDescriptorSet dset_att;
     VkCommandPool cpool;
@@ -152,6 +156,8 @@ struct PCDR { int S, vh, vk, kdim, vdim, vstride, voff; };      /* dn_recur.comp
 struct PCDC { int S, conv_dim, convk, pstride; };               /* dn_conv.comp */
 struct PCDP { int S, conv_dim, vk, vh, kdim; float scale; };    /* dn_prep.comp */
 struct PCDG { int S, vh, vdim, pstride, zoff; float eps; };     /* dn_gnorm.comp */
+struct PCAB { int S, H, KV, hd, qdim, gate_dim, rotary, pos_base, nt, has_qn, has_kn, q_off, k_off, v_off; float eps, theta; };  /* attn_prep.comp */
+struct PCAG { int n, has_gate; };                               /* attn_gate.comp */
 
 static int pick_memtype(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -681,6 +687,25 @@ int coli_vk_init(const char *spv_path) {
         if (!ok) { G.pipe_dc = G.pipe_dp = G.pipe_dg = VK_NULL_HANDLE; }
     }
     if (G.sgsize != 64) fprintf(stderr, "[VK] subgroup size %d != 64: prefill attention/DeltaNet kernels off\n", G.sgsize);
+    /* Optional whole-attention-layer kernels (COLI_VK_ATTN_BLOCK=0 turns them off). */
+    if (G.sgsize == 64 && !(getenv("COLI_VK_ATTN_BLOCK") && getenv("COLI_VK_ATTN_BLOCK")[0] == '0')) {
+        char pa[512];
+        derive_dir_file(spv_path, "attn_prep.spv", pa, sizeof(pa)); G.shader_ab = load_spv(G.dev, pa);
+        derive_dir_file(spv_path, "attn_gate.spv", pa, sizeof(pa)); G.shader_ag = load_spv(G.dev, pa);
+        int ok = G.shader_ab && G.shader_ag &&
+            build_pipeline(G.dev, 6, sizeof(struct PCAB), G.shader_ab, &G.dsl_ab, &G.plyt_ab, &G.pipe_ab, &G.dpool_ab, &G.dset_ab) &&
+            build_pipeline(G.dev, 3, sizeof(struct PCAG), G.shader_ag, &G.dsl_ag, &G.plyt_ag, &G.pipe_ag, &G.dpool_ag, &G.dset_ag);
+        if (ok) {
+            VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 16};
+            VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 4, .poolSizeCount = 1, .pPoolSizes = &ps};
+            VkDescriptorSetLayout l4[4] = {G.dsl, G.dsl, G.dsl, G.dsl};
+            VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorSetCount = 4, .pSetLayouts = l4};
+            ok = vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.ab_pool) == VK_SUCCESS;
+            ai.descriptorPool = G.ab_pool;
+            ok = ok && vkAllocateDescriptorSets(G.dev, &ai, G.ab_mm) == VK_SUCCESS;
+        }
+        if (!ok) { G.pipe_ab = G.pipe_ag = VK_NULL_HANDLE; }
+    }
     /* Optional DeltaNet prefill recurrence (COLI_VK_DN_RECUR=0 turns it off). */
     {
         const char *e = getenv("COLI_VK_DN_RECUR");
@@ -1045,10 +1070,12 @@ int coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn
 
 /* Record one matmul y = x W^T of an uploaded tensor into cb, the same shader choice
  * as coli_vk_matmul (tiles / multi-row / one-row), on descriptor set `set`. */
-static void rec_mm(VkCommandBuffer cb, VkDescriptorSet set, ColiVkTensor *t, VkBuffer xb, VkBuffer yb, int S) {
+static void rec_mm_off(VkCommandBuffer cb, VkDescriptorSet set, ColiVkTensor *t, VkBuffer xb, VkBuffer yb,
+                       VkDeviceSize yoff, int S) {
     VkDescriptorBufferInfo bi[4] = {
         {.buffer = xb, .range = VK_WHOLE_SIZE}, {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = yb, .range = VK_WHOLE_SIZE}};
+        {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = yb, .offset = yoff, .range = (VkDeviceSize)S * t->O * sizeof(float)}};
     wr_desc(set, 4, bi);
     int co = coop_use(t->fmt, S, t->I, t->O, t->gs, 0), mr = !co && mr_use(t->fmt, S, t->I, t->O);
     uint32_t gx = 0, gy = 0;
@@ -1059,6 +1086,9 @@ static void rec_mm(VkCommandBuffer cb, VkDescriptorSet set, ColiVkTensor *t, VkB
     vkCmdPushConstants(cb, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     if (co) vkCmdDispatch(cb, gx, gy, 1);
     else vkCmdDispatch(cb, (uint32_t)((t->O + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
+}
+static void rec_mm(VkCommandBuffer cb, VkDescriptorSet set, ColiVkTensor *t, VkBuffer xb, VkBuffer yb, int S) {
+    rec_mm_off(cb, set, t, xb, yb, 0, S);
 }
 static void cc_barrier(VkCommandBuffer cb) {
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
@@ -1163,6 +1193,92 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
               ring[cc * km + kk] = src >= 0 ? qz[(size_t)src * pd + cc] : old[cc * km + src + km];
           }
       free(old); }
+    G.cmd_ready = 0; G.bound_tensor = NULL;
+    return 1;
+}
+
+/* A whole gated-attention layer of a prefill block in ONE submit: q/k/v projections
+ * -> split/norm/RoPE/KV-cache rows (attn_prep) -> causal core (attn_prefill) ->
+ * sigmoid gate (attn_gate) -> o_proj. K/V rows 0..pos_base-1 come from the host
+ * caches (row t of kv head g at (g*ldt + t)*hd); the new rows are written back
+ * there. qn/kn: q_norm / k_norm weights [hd] or NULL. out = [S][D]. 0 -> caller. */
+int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, ColiVkTensor *to,
+                       const float *x, const float *qn, const float *kn, float *Kc, float *Vc, int ldt,
+                       int S, int D, int H, int KV, int hd, int qdim, int rotary, int pos_base,
+                       float eps, float theta, float scale, float *out) {
+    if (!G.ready || !G.pipe_ab || !G.pipe_ap || !tq || !tk || !tv || !to || S < 1 || KV < 1 || H % KV ||
+        hd < 1 || hd > 512 || rotary > hd) return 0;
+    int gate_dim = qdim > hd ? qdim - hd : 0, nt = pos_base + S;
+    if ((gate_dim && gate_dim != hd) || tq->I != D || tq->O != H * qdim || tk->I != D || tk->O != KV * hd ||
+        tv->I != D || tv->O != KV * hd || to->I != H * hd || to->O != D || nt > ldt) return 0;
+    size_t f = sizeof(float);
+    size_t nx = (size_t)S * D * f, nq = (size_t)S * H * qdim * f, nk = (size_t)S * KV * hd * f;
+    size_t nqb = (size_t)S * H * hd * f, nkc = (size_t)KV * nt * hd * f;
+    if (!scratch_reserve(&G.ab_x, nx) || !scratch_reserve(&G.ab_qkv, nq + 2 * nk) || !scratch_reserve(&G.ab_nw, 2 * (size_t)hd * f) ||
+        !scratch_reserve(&G.ab_qb, nqb) || !scratch_reserve(&G.ab_gb, nqb) ||
+        !scratch_reserve_mt(&G.ab_k, nkc, G.memtype_cached) || !scratch_reserve_mt(&G.ab_v, nkc, G.memtype_cached) ||
+        !scratch_reserve(&G.ab_cx, nqb) || !scratch_reserve(&G.ab_ag, nqb) || !scratch_reserve_mt(&G.ab_y, nx, G.memtype_cached)) return 0;
+    memcpy(G.ab_x.ptr, x, nx);
+    float *nw = (float *)G.ab_nw.ptr;
+    for (int d = 0; d < hd; d++) { nw[d] = qn ? qn[d] : 0.f; nw[hd + d] = kn ? kn[d] : 0.f; }
+    for (int g = 0; g < KV && pos_base > 0; g++) {   /* cached prefix keys/values */
+        memcpy((char *)G.ab_k.ptr + (size_t)g * nt * hd * f, Kc + (size_t)g * ldt * hd, (size_t)pos_base * hd * f);
+        memcpy((char *)G.ab_v.ptr + (size_t)g * nt * hd * f, Vc + (size_t)g * ldt * hd, (size_t)pos_base * hd * f);
+    }
+    VkCommandBuffer cb = G.cmd;
+    VKCHECK(vkResetCommandBuffer(cb, 0), "resetCmd");
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VKCHECK(vkBeginCommandBuffer(cb, &begin), "beginCmd");
+    /* 1. q | k | v projections into one buffer */
+    rec_mm_off(cb, G.ab_mm[0], tq, G.ab_x.buf, G.ab_qkv.buf, 0, S);
+    rec_mm_off(cb, G.ab_mm[1], tk, G.ab_x.buf, G.ab_qkv.buf, nq, S);
+    rec_mm_off(cb, G.ab_mm[2], tv, G.ab_x.buf, G.ab_qkv.buf, nq + nk, S);
+    cc_barrier(cb);
+    /* 2. split, norm, RoPE, cache rows */
+    { VkDescriptorBufferInfo bi[6] = {{G.ab_qkv.buf, 0, VK_WHOLE_SIZE}, {G.ab_nw.buf, 0, VK_WHOLE_SIZE},
+                                      {G.ab_qb.buf, 0, VK_WHOLE_SIZE}, {G.ab_gb.buf, 0, VK_WHOLE_SIZE},
+                                      {G.ab_k.buf, 0, VK_WHOLE_SIZE}, {G.ab_v.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(G.dset_ab, 6, bi);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_ab);
+      vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_ab, 0, 1, &G.dset_ab, 0, NULL);
+      struct PCAB pc = {S, H, KV, hd, qdim, gate_dim, rotary, pos_base, nt, qn != NULL, kn != NULL,
+                        0, (int)(nq / f), (int)((nq + nk) / f), eps, theta};
+      vkCmdPushConstants(cb, G.plyt_ab, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+      vkCmdDispatch(cb, (uint32_t)S, (uint32_t)(H + KV), 1); }
+    cc_barrier(cb);
+    /* 3. causal core */
+    { VkDescriptorBufferInfo bi[4] = {{G.ab_qb.buf, 0, VK_WHOLE_SIZE}, {G.ab_k.buf, 0, VK_WHOLE_SIZE},
+                                      {G.ab_v.buf, 0, VK_WHOLE_SIZE}, {G.ab_cx.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(G.dset_ap, 4, bi);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_ap);
+      vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_ap, 0, 1, &G.dset_ap, 0, NULL);
+      struct PCAP pc = {S, H, KV, hd, pos_base, nt, scale};
+      vkCmdPushConstants(cb, G.plyt_ap, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+      vkCmdDispatch(cb, (uint32_t)S, (uint32_t)H, 1); }
+    cc_barrier(cb);
+    /* 4. gate */
+    { VkDescriptorBufferInfo bi[3] = {{G.ab_cx.buf, 0, VK_WHOLE_SIZE}, {G.ab_gb.buf, 0, VK_WHOLE_SIZE}, {G.ab_ag.buf, 0, VK_WHOLE_SIZE}};
+      wr_desc(G.dset_ag, 3, bi);
+      vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_ag);
+      vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_ag, 0, 1, &G.dset_ag, 0, NULL);
+      int n = S * H * hd;
+      struct PCAG pc = {n, gate_dim > 0};
+      vkCmdPushConstants(cb, G.plyt_ag, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+      vkCmdDispatch(cb, (uint32_t)((n + 255) / 256), 1, 1); }
+    cc_barrier(cb);
+    /* 5. o_proj */
+    rec_mm(cb, G.ab_mm[3], to, G.ab_ag.buf, G.ab_y.buf, S);
+    host_read_barrier(cb);
+    VKCHECK(vkEndCommandBuffer(cb), "endCmd");
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    VKCHECK(vkResetFences(G.dev, 1, &G.fence), "resetFence");
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
+    if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    memcpy(out, G.ab_y.ptr, nx);
+    for (int g = 0; g < KV; g++) {   /* new rows back into the host caches (decode reads them) */
+        memcpy(Kc + ((size_t)g * ldt + pos_base) * hd, (char *)G.ab_k.ptr + ((size_t)g * nt + pos_base) * hd * f, (size_t)S * hd * f);
+        memcpy(Vc + ((size_t)g * ldt + pos_base) * hd, (char *)G.ab_v.ptr + ((size_t)g * nt + pos_base) * hd * f, (size_t)S * hd * f);
+    }
     G.cmd_ready = 0; G.bound_tensor = NULL;
     return 1;
 }
@@ -2104,6 +2220,17 @@ void coli_vk_shutdown(void) {
     if (G.shader_co2) vkDestroyShaderModule(G.dev, G.shader_co2, NULL);
     if (G.shader_gu_co2) vkDestroyShaderModule(G.dev, G.shader_gu_co2, NULL);
     if (G.db_pool) vkDestroyDescriptorPool(G.dev, G.db_pool, NULL);
+    if (G.ab_pool) vkDestroyDescriptorPool(G.dev, G.ab_pool, NULL);
+    { VkPipeline pl[2] = {G.pipe_ab, G.pipe_ag}; VkPipelineLayout ly[2] = {G.plyt_ab, G.plyt_ag};
+      VkDescriptorSetLayout dl[2] = {G.dsl_ab, G.dsl_ag}; VkDescriptorPool dp[2] = {G.dpool_ab, G.dpool_ag};
+      VkShaderModule sm[2] = {G.shader_ab, G.shader_ag};
+      for (int i = 0; i < 2; i++) {
+          if (pl[i]) vkDestroyPipeline(G.dev, pl[i], NULL);
+          if (ly[i]) vkDestroyPipelineLayout(G.dev, ly[i], NULL);
+          if (dl[i]) vkDestroyDescriptorSetLayout(G.dev, dl[i], NULL);
+          if (dp[i]) vkDestroyDescriptorPool(G.dev, dp[i], NULL);
+          if (sm[i]) vkDestroyShaderModule(G.dev, sm[i], NULL);
+      } }
     { VkPipeline pl[3] = {G.pipe_dc, G.pipe_dp, G.pipe_dg}; VkPipelineLayout ly[3] = {G.plyt_dc, G.plyt_dp, G.plyt_dg};
       VkDescriptorSetLayout dl[3] = {G.dsl_dc, G.dsl_dp, G.dsl_dg}; VkDescriptorPool dp[3] = {G.dpool_dc, G.dpool_dp, G.dpool_dg};
       VkShaderModule sm[3] = {G.shader_dc, G.shader_dp, G.shader_dg};
@@ -2946,6 +3073,89 @@ static int run_dn_block_case(int S, int H, int vh, int vk, int kdim, int vdim, i
     return yl2 > 5e-3 || ymax > 3e-2 || sl2 > 5e-3 || rl2 > 1e-3 || n1 || n2 || n3;
 }
 
+/* Whole attention layer against a CPU chain that mirrors qwen36.c attention():
+ * int8 q/k/v (cpu_ref), split query|gate, RMSNorm (1+w), partial RoPE, KV cache
+ * with a cached prefix, causal softmax attention (GQA), sigmoid gate, o_proj. */
+static void ab_rms(float *x, const float *w, int n, float eps) {
+    double ms = 0; for (int i = 0; i < n; i++) ms += (double)x[i] * x[i];
+    float r = 1.f / sqrtf((float)(ms / n) + eps);
+    for (int i = 0; i < n; i++) x[i] = x[i] * r * (1.0f + w[i]);
+}
+static void ab_rope(float *x, int pos, int rot, float theta) {
+    int h = rot / 2;
+    for (int j = 0; j < h; j++) {
+        float inv = powf(theta, -2.0f * j / rot), ang = pos * inv, cs = cosf(ang), sn = sinf(ang);
+        float a = x[j], b = x[j + h]; x[j] = a * cs - b * sn; x[j + h] = b * cs + a * sn;
+    }
+}
+static int run_attn_block_case(int S, int D, int H, int KV, int hd, int rotary, int pos_base) {
+    if (!G.pipe_ab) { printf("attn_block shaders not loaded\n"); return 1; }
+    int qdim = 2 * hd, ldt = pos_base + S + 5, qo = H * qdim, ko = KV * hd;
+    float eps = 1e-6f, theta = 1e7f, scale = 1.f / sqrtf((float)hd);
+    uint8_t *wq = malloc((size_t)qo * D), *wk = malloc((size_t)ko * D), *wv = malloc((size_t)ko * D), *wo = malloc((size_t)D * H * hd);
+    float *sq = malloc(qo * 4), *sk = malloc(ko * 4), *sv = malloc(ko * 4), *so = malloc(D * 4);
+    for (size_t i = 0; i < (size_t)qo * D; i++) wq[i] = rand() & 0xff;
+    for (size_t i = 0; i < (size_t)ko * D; i++) { wk[i] = rand() & 0xff; wv[i] = rand() & 0xff; }
+    for (size_t i = 0; i < (size_t)D * H * hd; i++) wo[i] = rand() & 0xff;
+    for (int i = 0; i < qo; i++) sq[i] = 0.0004f + (rand() % 100) / 300000.0f;
+    for (int i = 0; i < ko; i++) { sk[i] = 0.0004f + (rand() % 100) / 300000.0f; sv[i] = 0.0004f + (rand() % 100) / 300000.0f; }
+    for (int i = 0; i < D; i++) so[i] = 0.0004f + (rand() % 100) / 300000.0f;
+    ColiVkTensor *tq = NULL, *tk = NULL, *tv = NULL, *to = NULL;
+    if (!coli_vk_tensor_ensure(&tq, wq, sq, 1, D, qo, 0) || !coli_vk_tensor_ensure(&tk, wk, sk, 1, D, ko, 0) ||
+        !coli_vk_tensor_ensure(&tv, wv, sv, 1, D, ko, 0) || !coli_vk_tensor_ensure(&to, wo, so, 1, H * hd, D, 0)) { printf("upload failed\n"); return 1; }
+    float *x = malloc((size_t)S * D * 4), *qn = malloc(hd * 4), *kn = malloc(hd * 4);
+    float *Kg = calloc((size_t)KV * ldt * hd, 4), *Vg = calloc((size_t)KV * ldt * hd, 4);
+    for (int i = 0; i < S * D; i++) x[i] = (rand() % 200 - 100) / 100.0f;
+    for (int i = 0; i < hd; i++) { qn[i] = (rand() % 100) / 200.0f - 0.25f; kn[i] = (rand() % 100) / 200.0f - 0.25f; }
+    for (size_t i = 0; i < (size_t)KV * ldt * hd; i++) { Kg[i] = (rand() % 200 - 100) / 100.0f; Vg[i] = (rand() % 200 - 100) / 100.0f; }
+    float *Kc = malloc((size_t)KV * ldt * hd * 4), *Vc = malloc((size_t)KV * ldt * hd * 4);
+    memcpy(Kc, Kg, (size_t)KV * ldt * hd * 4); memcpy(Vc, Vg, (size_t)KV * ldt * hd * 4);
+    float *yg = malloc((size_t)S * D * 4);
+    double t0 = now();
+    if (!coli_vk_attn_block(tq, tk, tv, to, x, qn, kn, Kg, Vg, ldt, S, D, H, KV, hd, qdim, rotary, pos_base, eps, theta, scale, yg)) { printf("attn_block failed\n"); return 1; }
+    double ms = (now() - t0) * 1000;
+    float *q = malloc((size_t)S * qo * 4), *k = malloc((size_t)S * ko * 4), *v = malloc((size_t)S * ko * 4);
+    cpu_ref(q, x, wq, sq, 1, S, D, qo); cpu_ref(k, x, wk, sk, 1, S, D, ko); cpu_ref(v, x, wv, sv, 1, S, D, ko);
+    float *qb = malloc((size_t)S * H * hd * 4), *gb = malloc((size_t)S * H * hd * 4), *ag = malloc((size_t)S * H * hd * 4), *yc = malloc((size_t)S * D * 4);
+    for (int s2 = 0; s2 < S; s2++) {
+        for (int h = 0; h < H; h++) {
+            memcpy(qb + ((size_t)s2 * H + h) * hd, q + (size_t)s2 * qo + h * qdim, hd * 4);
+            memcpy(gb + ((size_t)s2 * H + h) * hd, q + (size_t)s2 * qo + h * qdim + hd, hd * 4);
+            ab_rms(qb + ((size_t)s2 * H + h) * hd, qn, hd, eps); ab_rope(qb + ((size_t)s2 * H + h) * hd, pos_base + s2, rotary, theta);
+        }
+        for (int g = 0; g < KV; g++) {
+            float *kr = k + (size_t)s2 * ko + g * hd;
+            ab_rms(kr, kn, hd, eps); ab_rope(kr, pos_base + s2, rotary, theta);
+            memcpy(Kc + ((size_t)g * ldt + pos_base + s2) * hd, kr, hd * 4);
+            memcpy(Vc + ((size_t)g * ldt + pos_base + s2) * hd, v + (size_t)s2 * ko + g * hd, hd * 4);
+        }
+    }
+    double *sc = malloc((size_t)(pos_base + S) * sizeof(double));
+    for (int s2 = 0; s2 < S; s2++) for (int h = 0; h < H; h++) {
+        int g = h / (H / KV), qp = pos_base + s2; const float *qv = qb + ((size_t)s2 * H + h) * hd;
+        double mx = -1e300;
+        for (int t = 0; t <= qp; t++) {
+            double a = 0; const float *kr = Kc + ((size_t)g * ldt + t) * hd;
+            for (int d = 0; d < hd; d++) a += (double)qv[d] * kr[d];
+            sc[t] = a * scale; if (sc[t] > mx) mx = sc[t];
+        }
+        double z = 0; for (int t = 0; t <= qp; t++) { sc[t] = exp(sc[t] - mx); z += sc[t]; }
+        for (int d = 0; d < hd; d++) { double a = 0; for (int t = 0; t <= qp; t++) a += sc[t] / z * Vc[((size_t)g * ldt + t) * hd + d];
+            size_t o = ((size_t)s2 * H + h) * hd + d; ag[o] = (float)a * (1.f / (1.f + expf(-gb[o]))); }
+    }
+    cpu_ref(yc, ag, wo, so, 1, S, H * hd, D);
+    double yl2, ymax, kl2, kmax, vl2, vmax; size_t n1, n2, n3;
+    coop_err(yg, yc, (size_t)S * D, &yl2, &ymax, &n1);
+    coop_err(Kg + (size_t)pos_base * hd, Kc + (size_t)pos_base * hd, (size_t)S * hd, &kl2, &kmax, &n2);   /* kv head 0 rows */
+    coop_err(Vg + (size_t)pos_base * hd, Vc + (size_t)pos_base * hd, (size_t)S * hd, &vl2, &vmax, &n3);
+    printf("ATTNBLOCK S=%4d D=%d H=%d KV=%d hd=%d rot=%d pos_base=%d | y relL2 %.2e max %.2e | K %.2e | V %.2e%s | %.2f ms\n",
+           S, D, H, KV, hd, rotary, pos_base, yl2, ymax, kl2, vl2, (n1 || n2 || n3) ? " NONFINITE" : "", ms);
+    coli_vk_tensor_free(tq); coli_vk_tensor_free(tk); coli_vk_tensor_free(tv); coli_vk_tensor_free(to);
+    free(wq); free(wk); free(wv); free(wo); free(sq); free(sk); free(sv); free(so); free(x); free(qn); free(kn);
+    free(Kg); free(Vg); free(Kc); free(Vc); free(yg); free(q); free(k); free(v); free(qb); free(gb); free(ag); free(yc); free(sc);
+    return yl2 > 5e-3 || ymax > 3e-2 || kl2 > 5e-3 || vl2 > 5e-3 || n1 || n2 || n3;
+}
+
 /* Prefill attention core against a CPU reference that mirrors qwen36.c's
  * attention(): scores, softmax (max-subtracted), weighted V sum, causal with a
  * prefix of pos_base cached keys, grouped-query heads. */
@@ -3267,6 +3477,11 @@ int main(int argc, char **argv) {
         bad |= run_coop_expert_group(4, 2048, 512, 16, 40, 5, 0.5f);   /* clamp */
         bad |= run_coop_expert_group(2, 6144, 2048, 8, 40, 3, 0.f);
     } else printf("coopmat shaders not loaded (no VK_KHR_cooperative_matrix f16 config, COLI_VK_COOP=0 or missing .spv): skipped\n");
+    if (G.pipe_ab && G.pipe_ap) {
+        bad |= run_attn_block_case(37, 256, 4, 2, 64, 32, 10);   /* small, cached prefix */
+        bad |= run_attn_block_case(300, 2048, 16, 2, 256, 64, 0);/* Qwen3.6 shapes */
+        bad |= run_attn_block_case(64, 2048, 16, 2, 256, 64, 40);/* Qwen3.6, prefix */
+    } else printf("attn_block shaders not loaded: skipped\n");
     if (G.pipe_dc && G.pipe_dr) {
         bad |= run_dn_block_case(37, 256, 4, 2, 64, 64, 4);      /* small, GEMV projections */
         bad |= run_dn_block_case(300, 2048, 32, 16, 128, 128, 4);/* Qwen3.6 shapes, tiled projections */

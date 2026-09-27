@@ -1,0 +1,54 @@
+#version 450
+// Qwen3.6 gated attention, per-token preparation of a prefill block on the GPU
+// (qwen36.c attention(): split q into query | gate per head, RMSNorm with (1 + w)
+// on query and key heads, partial RoPE on the first `rotary` dims, K/V rows into
+// the per-kv-head cache at position pos_base + s). One 64-lane subgroup per
+// (token, head); heads 0..H-1 are query heads, H..H+KV-1 the kv heads.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer QKV { float qkv[]; };  // q | k | v rows (offsets below)
+layout(std430, binding = 1) readonly buffer NW  { float nw[]; };   // q_norm [hd] | k_norm [hd]
+layout(std430, binding = 2) writeonly buffer QB { float qb[]; };   // [S][H][hd]
+layout(std430, binding = 3) writeonly buffer GB { float gb[]; };   // [S][H][hd] (gate)
+layout(std430, binding = 4) writeonly buffer KC { float kc[]; };   // [KV][nt][hd]
+layout(std430, binding = 5) writeonly buffer VC { float vc[]; };   // [KV][nt][hd]
+layout(push_constant) uniform P {
+    int S, H, KV, hd, qdim, gate_dim, rotary, pos_base, nt, has_qn, has_kn;
+    int q_off, k_off, v_off; float eps, theta;
+} p;
+shared float row[512];
+void main() {
+    int s = int(gl_WorkGroupID.x), head = int(gl_WorkGroupID.y);
+    int lane = int(gl_LocalInvocationID.x);
+    bool isq = head < p.H;
+    int hh = isq ? head : head - p.H;
+    int src = isq ? p.q_off + s * p.H * p.qdim + hh * p.qdim : p.k_off + (s * p.KV + hh) * p.hd;
+    for (int d = lane; d < p.hd; d += 64) row[d] = qkv[src + d];
+    if (isq && p.gate_dim > 0)
+        for (int d = lane; d < p.gate_dim; d += 64) gb[(s * p.H + hh) * p.gate_dim + d] = qkv[src + p.hd + d];
+    if (!isq) {   /* v row straight into the cache */
+        int vs = p.v_off + (s * p.KV + hh) * p.hd, vd = (hh * p.nt + p.pos_base + s) * p.hd;
+        for (int d = lane; d < p.hd; d += 64) vc[vd + d] = qkv[vs + d];
+    }
+    barrier();
+    bool nrm = isq ? p.has_qn != 0 : p.has_kn != 0;
+    if (nrm) {
+        float ss = 0.0;
+        for (int d = lane; d < p.hd; d += 64) ss += row[d] * row[d];
+        ss = subgroupAdd(ss);
+        float r = 1.0 / sqrt(ss / float(p.hd) + p.eps);
+        int wb = isq ? 0 : p.hd;
+        for (int d = lane; d < p.hd; d += 64) row[d] = row[d] * r * (1.0 + nw[wb + d]);
+        barrier();
+    }
+    int h2 = p.rotary / 2, pos = p.pos_base + s;
+    for (int j = lane; j < h2; j += 64) {
+        float inv = pow(p.theta, -2.0 * float(j) / float(p.rotary));
+        float ang = float(pos) * inv, cs = cos(ang), sn = sin(ang);
+        float a = row[j], b = row[j + h2];
+        row[j] = a * cs - b * sn; row[j + h2] = b * cs + a * sn;
+    }
+    barrier();
+    if (isq) for (int d = lane; d < p.hd; d += 64) qb[(s * p.H + hh) * p.hd + d] = row[d];
+    else     for (int d = lane; d < p.hd; d += 64) kc[(hh * p.nt + pos) * p.hd + d] = row[d];
+}

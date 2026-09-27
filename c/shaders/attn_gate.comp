@@ -1,0 +1,13 @@
+#version 450
+// attn_out *= sigmoid(gate) (Qwen3.6 attn_output_gate), elementwise; no gate -> 0.5.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer CX { float cx[]; };
+layout(std430, binding = 1) readonly buffer GB { float gb[]; };
+layout(std430, binding = 2) writeonly buffer AG { float ag[]; };
+layout(push_constant) uniform P { int n, has_gate; } p;
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= p.n) return;
+    float g = p.has_gate != 0 ? gb[i] : 0.0;
+    ag[i] = cx[i] * (1.0 / (1.0 + exp(-g)));
+}
