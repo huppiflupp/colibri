@@ -4482,7 +4482,77 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
             wn, now_s()-t0);
 }
 
+/* Spin-wait for GPU-resident runs, decided before the model loads.
+ * libgomp's workers spin ~300k rounds after a region, then sleep on a futex;
+ * during every GPU submit of a prefill they fall asleep and each following
+ * short CPU region waits for them to wake (measured on the Radeon 8060S, 1011-
+ * token prompt: TTFT 1.2-1.4 s default, 0.98 s with GOMP_SPINCOUNT=3M; decode
+ * within noise). libgomp reads the knob only in its constructor, hence one
+ * re-exec as colibri.c does for its own tuning. Only when no expert has to be
+ * streamed from disk after loading: the cache holds every expert of a layer
+ * (cache/layer >= num_experts) and the snapshot fits into available RAM with
+ * 8 GiB to spare -- on hosts that stream experts a spinning team steals cores
+ * from the I/O (omp_tune.h, #707/#159/#341). A user's GOMP_SPINCOUNT or
+ * OMP_WAIT_POLICY wins; COLI_SPIN=0 never, COLI_SPIN=1 always. */
+#ifdef __linux__
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sched.h>
+static long long snap_bytes(const char *dir, int depth) {
+    DIR *d = opendir(dir); if (!d) return -1;
+    long long sum = 0; struct dirent *e; char p[4096]; struct stat st;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        if (stat(p, &st)) continue;
+        if (S_ISREG(st.st_mode)) sum += st.st_size;
+        else if (S_ISDIR(st.st_mode) && depth > 0) { long long b = snap_bytes(p, depth - 1); if (b > 0) sum += b; }
+    }
+    closedir(d); return sum;
+}
+static long long mem_available(void) {
+    FILE *f = fopen("/proc/meminfo", "r"); if (!f) return -1;
+    char line[256]; long long kb = -1;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) break;
+    fclose(f); return kb < 0 ? -1 : kb * 1024;
+}
+static int snap_num_experts(const char *snap) {
+    char p[4096]; snprintf(p, sizeof p, "%s/config.json", snap);
+    FILE *f = fopen(p, "rb"); if (!f) return -1;
+    char buf[1 << 16]; size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[n] = 0;
+    const char *k = strstr(buf, "\"num_experts\""); if (!k) return -1;
+    k = strchr(k + 13, ':'); return k ? atoi(k + 1) : -1;
+}
+static void spin_auto(int argc, char **argv) {
+    const char *e = getenv("COLI_SPIN");
+    if ((e && *e == '0') || getenv("COLI_SPIN_DONE") || getenv("GOMP_SPINCOUNT") || getenv("OMP_WAIT_POLICY")) return;
+    const char *snap = getenv("SNAP");
+    char why[256] = "COLI_SPIN=1";
+    if (!(e && *e == '1')) {
+        int cap = argc > 1 ? atoi(argv[1]) : 16, ne = snap ? snap_num_experts(snap) : -1;
+        long long sb = snap ? snap_bytes(snap, 1) : -1, ma = mem_available();
+        if (ne < 1 || cap < ne || sb <= 0 || ma <= 0 || sb + (8LL << 30) > ma) return;
+        snprintf(why, sizeof why, "all %d experts/layer cached, snapshot %.1f GB of %.1f GB available",
+                 ne, sb / 1e9, ma / 1e9);
+    }
+    setenv("GOMP_SPINCOUNT", "3000000", 1);
+    setenv("COLI_SPIN_DONE", "1", 1);
+    fprintf(stderr, "[OMP] %s: GOMP_SPINCOUNT=3M, re-exec once (COLI_SPIN=0 to skip)\n", why);
+    /* execv keeps the affinity mask; a user OMP_PROC_BIND may already have bound
+     * this thread to one place (colibri.c #471) -> reset to all online CPUs */
+    { cpu_set_t all; CPU_ZERO(&all);
+      long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu > CPU_SETSIZE) ncpu = CPU_SETSIZE;
+      for (long i = 0; i < ncpu; i++) CPU_SET((int)i, &all);
+      if (sched_setaffinity(0, sizeof(all), &all) != 0) perror("[OMP] sched_setaffinity pre-reexec (continuing)"); }
+    execv("/proc/self/exe", argv);
+    perror("[OMP] execv self-reexec failed, running with the default spin");
+}
+#else
+static void spin_auto(int argc, char **argv) { (void)argc; (void)argv; }
+#endif
+
 int main(int argc, char **argv) {
+    spin_auto(argc, argv);
     /* Physical-core team sizing, as colibri/inkling/kimi_k3/olmoe/deepseek-v41
      * do. Without it this engine takes one thread per logical CPU, which on an
      * SMT host doubles the team for no arithmetic and pays a barrier per tiny
