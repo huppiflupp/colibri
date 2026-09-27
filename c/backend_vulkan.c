@@ -137,6 +137,8 @@ static struct {
     int grp_n[2], grp_ns[2], grp_mix[2];   /* full / small items per phase of the recorded group */
     VkShaderModule shader_gv[2]; VkPipeline pipe_gv[2];   /* grouped GEMV (few rows per expert) */
     int grp_gemv, grp_gemv_max;
+    /* dense matmuls with few rows through the grouped GEMV (one table entry) */
+    VkDescriptorPool gvd_pool; VkDescriptorSet gvd_set; Scratch gvd_it, gvd_et; int gvd_on;
     Scratch grp_it[2], grp_et[2];
     /* COLI_VK_TS=1: GPU timestamps around every command buffer of the prefill
      * paths; per label the GPU time and the host wall time submit -> fence done */
@@ -899,6 +901,13 @@ int coli_vk_init(const char *spv_path) {
                 if (!G.shader_gv[v] || !build_pipeline_mr(G.dev, G.plyt_grp[v], G.shader_gv[v], 0, &G.pipe_gv[v])) G.pipe_gv[v] = VK_NULL_HANDLE;
             }
             if (!G.pipe_gv[0] || !G.pipe_gv[1]) G.pipe_gv[0] = G.pipe_gv[1] = VK_NULL_HANDLE;
+            if (G.pipe_gv[0] && !(getenv("COLI_VK_DENSE_GEMV") && getenv("COLI_VK_DENSE_GEMV")[0] == '0')) {
+                VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
+                VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
+                VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorSetCount = 1, .pSetLayouts = &G.dsl_grp[0]};
+                G.gvd_on = vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.gvd_pool) == VK_SUCCESS &&
+                           (ai.descriptorPool = G.gvd_pool, vkAllocateDescriptorSets(G.dev, &ai, &G.gvd_set) == VK_SUCCESS);
+            }
             if (!G.pipe_grp_s[0] || !G.pipe_grp_s[1]) {
                 for (int v = 0; v < 2; v++) if (G.pipe_grp_s[v]) vkDestroyPipeline(G.dev, G.pipe_grp_s[v], NULL);
                 G.pipe_grp_s[0] = G.pipe_grp_s[1] = VK_NULL_HANDLE;
@@ -1333,6 +1342,7 @@ static void vkprof_tick(void) {
         fprintf(stderr, "[VK_PROF sub] n=%ld | submit %.0f | wait %.0f ms\n", g_vsub_n, g_vsub_ms, g_vwait_ms);
 }
 
+static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi);
 int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                    const void *weights, const float *scales,
                    int fmt, int S, int I, int O, int gs) {
@@ -1379,6 +1389,31 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
         ts_begin(G.cmd, TS_SLOT_CMD);
         int co = coop_use(fmt, S, I, O, t->gs, 0), mr = !co && mr_use(fmt, S, I, O);
+        /* a few rows (decode): the grouped GEMV with this tensor as its only entry
+         * (16-byte loads, several rows' loads in flight; COLI_VK_DENSE_GEMV=0 off) */
+        int gv = G.gvd_on && !co && S <= G.grp_gemv_max && I % 32 == 0 && I <= 8192 && t->rowWords % 4 == 0 &&
+                 (fmt == 1 || fmt == 2 || (fmt == 4 && t->gs % 32 == 0));
+        if (gv) {
+            int nit = S * ((O + 63) / 64);
+            gv = scratch_reserve(&G.gvd_it, (size_t)nit * 16) && scratch_reserve(&G.gvd_et, 64);
+            if (gv) {
+                uint32_t *e = G.gvd_et.ptr, *it = G.gvd_it.ptr; memset(e, 0, 64);
+                uint64_t wa = vk_addr(t->wbuf), sa = vk_addr(t->sbuf);
+                e[0] = (uint32_t)wa; e[1] = (uint32_t)(wa >> 32); e[2] = (uint32_t)sa; e[3] = (uint32_t)(sa >> 32);
+                e[8] = (uint32_t)S; e[9] = 0; e[10] = (uint32_t)fmt; e[11] = (uint32_t)t->rowWords; e[12] = (uint32_t)t->gs;
+                int k = 0;
+                for (int r = 0; r < S; r++) for (int o0 = 0; o0 < O; o0 += 64) { it[4*k] = 0; it[4*k+1] = (uint32_t)r; it[4*k+2] = (uint32_t)o0; it[4*k+3] = 0; k++; }
+                VkDescriptorBufferInfo bi[4] = {{xin, 0, VK_WHOLE_SIZE}, {G.gvd_it.buf, 0, VK_WHOLE_SIZE},
+                                                {G.gvd_et.buf, 0, VK_WHOLE_SIZE}, {G.y.buf, 0, VK_WHOLE_SIZE}};
+                wr_desc(G.gvd_set, 4, bi);
+                vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gv[0]);
+                vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_grp[0], 0, 1, &G.gvd_set, 0, NULL);
+                struct PCGRP gpc = {I, O, 0.f, 0, 0};
+                vkCmdPushConstants(G.cmd, G.plyt_grp[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gpc), &gpc);
+                vkCmdDispatch(G.cmd, (uint32_t)nit, 1, 1);
+                goto recorded;
+            }
+        }
         uint32_t cgx = 0, cgy = 0;
         VkPipeline cpl = co ? coop_pick(0, S, O, &cgx, &cgy) : VK_NULL_HANDLE;
         vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, co ? cpl : mr ? G.pipe_mr : G.pipe);
@@ -1390,6 +1425,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
          * The multi-row shader covers MR token rows per workgroup in y. */
         if (co) vkCmdDispatch(G.cmd, cgx, cgy, 1);
         else vkCmdDispatch(G.cmd, (uint32_t)((O + 7) / 8), (uint32_t)(mr ? (S + G.mr - 1) / G.mr : S), 1);
+    recorded:
         host_read_barrier(G.cmd);
         ts_end(G.cmd, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
@@ -1614,6 +1650,7 @@ static void post_record(VkCommandBuffer cb, VkBuffer ybuf, int S, int D) {
 /* DeltaNet b|a on the GPU: coli_vk_dn_block with ba == NULL computes them from
  * its input rows with these f32 weights (dn_b, dn_a: [vh][H] each). */
 int coli_vk_dn_ba_ready(void) { return G.ready && G.pipe_dba != VK_NULL_HANDLE; }
+int coli_vk_fast_gemv(void) { return G.ready && G.gvd_on; }   /* grouped GEMV for few-row dense matmuls */
 
 /* A whole DeltaNet layer of a prefill block in ONE submit, nothing read back in
  * between: qkv|z projection (proj, int8 [proj_dim x H]) -> causal conv + SiLU ->
@@ -2076,7 +2113,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         /* few rows per expert (decode): the grouped GEMV, one item per (expert, row,
          * 16 output rows); every expert's format must suit it */
         int maxr = 0; for (int c = 0; c < count; c++) if (rows[c] > maxr) maxr = rows[c];
-        G.grp_gemv = G.pipe_gv[0] && maxr <= G.grp_gemv_max && D % 32 == 0 && I % 32 == 0;
+        G.grp_gemv = G.pipe_gv[0] && maxr <= G.grp_gemv_max && D % 32 == 0 && I % 32 == 0 && D <= 8192 && I <= 8192;   /* xsh holds 8192 */
         for (int c = 0; G.grp_gemv && c < count; c++) {
             ColiVkTensor *t3[3] = {gates[c], ups[c], downs[c]};
             for (int k = 0; k < 3; k++)

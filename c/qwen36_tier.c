@@ -1058,9 +1058,24 @@ int qt_trunk_min_s(void){
     }
     return v;
 }
+/* Below the trunk threshold (decode: 1 row) a GPU-resident matrix still runs on the
+ * GPU when the backend has the grouped GEMV and the matrix is large enough that
+ * reading it at GPU bandwidth beats the submit round trip: lm_head (508 M
+ * weights) 4.25 -> 2.44 ms/token, the DeltaNet input projection 6.8 -> 5.6; the
+ * 8 M matrices (out_proj, o_proj) and q (16.8 M) measured slower. QT_GEMV_MIN_ELEMS (20 M). */
+static int qt_gpu_rows(int S, int I, int O){
+    if(S >= qt_trunk_min_s()) return 1;
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    static long long min_el = -1;
+    if(min_el < 0){ const char *e = getenv("QT_GEMV_MIN_ELEMS"); min_el = e ? atoll(e) : 20000000LL; }
+    return S <= 4 && coli_vk_fast_gemv() && (long long)I * O >= min_el;
+#else
+    (void)I; (void)O; return 0;
+#endif
+}
 int qt_dense_matmul_batch(int h, float *y, const float *x, int S, int I, int O){
     if(h < 0 || h >= G_dense_n || !G_dense[h].on || S <= 0) return 0;
-    if(S < qt_trunk_min_s()) return 0;
+    if(!qt_gpu_rows(S, I, O)) return 0;
     if(be_trunk_matmul(&G_dense[h].t, y, x, S, I, O, G_dense[h].dev)) return 1;
     fprintf(stderr,"[dense] handle %d GPU matmul failed; CPU from here on\n", h);
     G_dense[h].on = 0;
@@ -1076,7 +1091,7 @@ int qt_dnproj_ready(int layer){
 }
 int qt_dnproj_matmul_batch(int layer, float *y, const float *x, int S, int I, int O){
     if(!qt_dnproj_ready(layer) || S <= 0) return 0;
-    if(S < qt_trunk_min_s()) return 0;
+    if(!qt_gpu_rows(S, I, O)) return 0;
     if(be_trunk_matmul(&G_dnp[layer].t,y,x,S,I,O,G_dnp[layer].dev))
         return 1;
     fprintf(stderr,"[dnp] layer %d GPU matmul failed; CPU from here on\n", layer);
@@ -1090,7 +1105,7 @@ int qt_dnproj_matmul(int layer, float *y, const float *x, int I, int O){
 
 int qt_lmhead_matmul(float *y, const float *x, int I, int O){
     if(!G_lmh.on) return 0;
-    if(qt_trunk_min_s() > 1) return 0;   /* one row: stays on the CPU where lone GEMVs lose */
+    if(!qt_gpu_rows(1, I, O)) return 0;   /* one row: the CPU unless the fast GEMV wins (qt_gpu_rows) */
     /* cached-tensor path: upload params are ignored once *t exists */
     if(be_trunk_matmul(&G_lmh.t,y,x,1,I,O,G_lmh.dev)) return 1;
     fprintf(stderr,"[lmh] GPU matmul failed; falling back to CPU from here on\n");
