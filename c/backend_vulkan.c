@@ -140,7 +140,7 @@ static struct {
      * submitted together with the layer's expert group, which routes on the GPU first */
     VkShaderModule shader_mrt; VkDescriptorSetLayout dsl_mr; VkPipelineLayout plyt_mr;
     VkPipeline pipe_mr_route; VkDescriptorPool dpool_mr; VkDescriptorSet dset_mr;
-    int defer_next, deferred;
+    int defer_next, deferred, attn_dec_on;
     struct { int pending, E, K, D, has_sg, layer; const float *logits, *nrm, *wsg; } route;
     int sgsize;
     int has_bda;         /* bufferDeviceAddress on: buffers usable by address (grouped expert shader) */
@@ -1074,9 +1074,10 @@ int coli_vk_init(const char *spv_path) {
             ok = ok && vkAllocateDescriptorSets(G.dev, &ai, G.ab_mm) == VK_SUCCESS;
         }
         if (!ok) { G.pipe_ab = G.pipe_ag = VK_NULL_HANDLE; }
-        /* decode attention on the GPU: opt-in (COLI_VK_ATTN_DEC=1) -- measured slower than the
-         * CPU core so far (int4: 48.3 -> 45.0 tok/s short, 39.2 -> 33.1 at 10k context) */
-        if (getenv("COLI_VK_ATTN_DEC") && getenv("COLI_VK_ATTN_DEC")[0] == '1')
+        /* decode attention core: built always (the decode graph's attention layers use it);
+         * the per-call attention block takes it only with COLI_VK_ATTN_DEC=1 (measured slower
+         * than the CPU core: int4 48.3 -> 45.0 tok/s short, 39.2 -> 33.1 at 10k context) */
+        G.attn_dec_on = getenv("COLI_VK_ATTN_DEC") && getenv("COLI_VK_ATTN_DEC")[0] == '1';
         { char pd[512];
           derive_dir_file(spv_path, "attn_dec.spv", pd, sizeof(pd)); G.shader_ad = load_spv(G.dev, pd);
           derive_dir_file(spv_path, "attn_dec_merge.spv", pd, sizeof(pd)); G.shader_adm = load_spv(G.dev, pd);
@@ -2055,7 +2056,7 @@ static VkPipeline af_pipeline(int H, int KV, int hd) {
  * write at position p cuts the GPU copy back to p (coli_vk_kv_cut). */
 #define KV_RES_MAX 128
 static struct { Scratch k, v; int cap, rows; const float *hk, *hv; } g_kvr[KV_RES_MAX];
-int coli_vk_attn_dec_ready(void) { return G.ready && G.pipe_ad && G.pipe_adm && G.pipe_ab && dn_res_on > 0; }
+int coli_vk_attn_dec_ready(void) { return G.ready && G.attn_dec_on && G.pipe_ad && G.pipe_adm && G.pipe_ab && dn_res_on > 0; }
 void coli_vk_kv_cut(int layer, int from) {
     if (layer >= 0 && layer < KV_RES_MAX && g_kvr[layer].rows > from) g_kvr[layer].rows = from > 0 ? from : 0;
 }
@@ -2095,7 +2096,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
             nt = ldt;   /* cache row stride of the kernels */
         }
     }
-    int dec = res && S <= 4 && G.pipe_ad && G.pipe_adm && hd <= 256 && S * (H / KV) <= 32;
+    int dec = res && S <= 4 && G.attn_dec_on && G.pipe_ad && G.pipe_adm && hd <= 256 && S * (H / KV) <= 32;
     if (!scratch_reserve(&G.ab_x, nx) || !scratch_reserve(&G.ab_qkv, nq + 2 * nk) || !scratch_reserve(&G.ab_nw, 2 * (size_t)hd * f) ||
         !scratch_reserve(&G.ab_qb, nqb) || !scratch_reserve(&G.ab_gb, nqb) ||
         (!res && (!scratch_reserve_mt(&G.ab_k, nkc, G.memtype_cached) || !scratch_reserve_mt(&G.ab_v, nkc, G.memtype_cached))) ||
@@ -2339,12 +2340,14 @@ int coli_vk_flush_deferred(void) {
 static struct {
     VkDescriptorPool pool;
     Scratch qz, ba, conv, q, k, bg, o, orr, h, y;   /* shared by the fixed buffers (they run in order) */
+    Scratch qkv, qb, gb, cx, ag, part;               /* attention layers */
 } g_dec;
 static struct {
     VkCommandBuffer cb; int ok;
     VkBuffer dep[16]; const void *pdep[8];
-    VkDescriptorSet set[20];
-    Scratch it[3], et[3], rw[2], git[2], get[2], order, inv, wts;
+    VkDescriptorSet set[24];
+    Scratch it[7], et[7], rw[2], git[2], get[2], order, inv, wts, anw;
+    int is_attn, attn_pos, kvh, hd, nt; float *Kc, *Vc;   /* attention layer: its KV row goes back to the host */
 } g_decl[DN_RES_MAX];
 static VkDescriptorSet dec_set(VkDescriptorSetLayout l) {
     if (!g_dec.pool) {
@@ -2362,47 +2365,84 @@ static void dec_bind(VkCommandBuffer cb, VkPipeline pl, VkPipelineLayout ly, VkD
     vkCmdPushConstants(cb, ly, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)npc, pc);
 }
 int coli_vk_dec_record(const ColiDecLayer *d) {
-    int L = d->layer, S = 1, H = d->H, vh = d->vh, vk = d->vk, kdim = d->kdim, vdim = d->vdim, E = d->E, K = d->K, I = d->I, K2 = K + 1;
-    if (dn_res_on <= 0 || L < 0 || L >= DN_RES_MAX || L >= MOE_RES_MAX || !G.ready || !G.pipe_dc || !G.pipe_dp || !G.pipe_dr ||
-        !G.pipe_dg || !G.pipe_rg || !G.pipe_dba || !G.pipe_mr_route || !G.pipe_gv[0] || !G.pipe_gv[1] || !G.ep_pipe[1] ||
-        !G.pipe_rn || g_moem[L].E != E || K2 > 16 || H % 4 || H > 8192 || I > 8192 || d->convk > 17) return 0;
-    if (!d->proj || !d->outp || !d->router || !d->shg || !d->shu || !d->shd) return 0;
-    int value_dim = vh * vdim, pd = d->proj->O, ktot = vk * kdim, conv_dim = d->conv_dim, convk = d->convk;
-    if (d->proj->I != H || pd != conv_dim + value_dim || d->outp->I != value_dim || d->outp->O != H ||
-        d->router->I != H || d->router->O != E) return 0;
+    int L = d->layer, S = 1, H = d->H, E = d->E, K = d->K, I = d->I, K2 = K + 1;
+    if (dn_res_on <= 0 || L < 0 || L >= DN_RES_MAX || L >= MOE_RES_MAX || L >= KV_RES_MAX || !G.ready ||
+        !G.pipe_mr_route || !G.pipe_gv[0] || !G.pipe_gv[1] || !G.ep_pipe[1] || !G.pipe_rn || g_moem[L].E != E ||
+        K2 > 16 || H % 4 || H > 8192 || I > 8192) return 0;
+    if (!d->router || !d->shg || !d->shu || !d->shd || d->router->I != H || d->router->O != E) return 0;
     size_t f = sizeof(float), nH = (size_t)H * f;
-    size_t nst = (size_t)vh * kdim * vdim * f, nring = (size_t)conv_dim * (convk - 1) * f;
-    __typeof__(g_dnr[0]) *R = &g_dnr[L];
-    __typeof__(g_dnc[0]) *C = &g_dnc[L];
     __typeof__(g_decl[0]) *T = &g_decl[L];
-    /* state, ring and constants as the block keeps them */
-    if (R->own && (R->host_st != d->state || R->host_rg != d->ring)) coli_vk_dn_sync(L);
-    if (!scratch_reserve(&R->st, nst) || !scratch_reserve(&R->rg, nring) || !scratch_reserve(&R->cst, nst) || !scratch_reserve(&R->crg, nring)) return 0;
-    if (!R->own) { memcpy(R->st.ptr, d->state, nst); memcpy(R->rg.ptr, d->ring, nring); R->own = 1; R->capv = 0; }
-    R->host_st = d->state; R->host_rg = d->ring; R->nst = nst; R->nrg = nring;
-    size_t npar = (size_t)2 * vh * f, ncw = (size_t)conv_dim * convk * f, nnw = (size_t)vdim * f;
-    if (!scratch_reserve(&C->w, (size_t)2 * vh * H * f) || !scratch_reserve(&C->par, npar) || !scratch_reserve(&C->cw, ncw) || !scratch_reserve(&C->nw, nnw)) return 0;
-    if (C->sw != d->wb) { memcpy(C->w.ptr, d->wb, (size_t)vh * H * f); memcpy((char *)C->w.ptr + (size_t)vh * H * f, d->wa, (size_t)vh * H * f); C->sw = d->wb; }
-    if (C->spar != d->par || memcmp(C->par.ptr, d->par, npar)) { memcpy(C->par.ptr, d->par, npar); C->spar = d->par; }
-    if (C->scw != d->convw) { memcpy(C->cw.ptr, d->convw, ncw); C->scw = d->convw; }
-    if (C->snw != d->normw) { memcpy(C->nw.ptr, d->normw, nnw); C->snw = d->normw; }
     if (d->wsg && g_moem[L].ssg != d->wsg) {
         if (!scratch_reserve(&g_moem[L].sg, nH)) return 0;
         memcpy(g_moem[L].sg.ptr, d->wsg, nH); g_moem[L].ssg = d->wsg;
     }
-    /* shared scratch (S = 1 sizes, all layers alike: reserved once) */
-    if (!scratch_reserve(&g_dec.qz, (size_t)pd * f) || !scratch_reserve(&g_dec.ba, (size_t)2 * vh * f) ||
-        !scratch_reserve(&g_dec.conv, (size_t)conv_dim * f) || !scratch_reserve(&g_dec.q, (size_t)ktot * f) ||
-        !scratch_reserve(&g_dec.k, (size_t)ktot * f) || !scratch_reserve(&g_dec.bg, (size_t)2 * vh * f) ||
-        !scratch_reserve(&g_dec.o, (size_t)value_dim * f) || !scratch_reserve(&g_dec.orr, (size_t)value_dim * f) ||
-        !scratch_reserve(&g_dec.h, (size_t)K2 * I * f) || !scratch_reserve(&g_dec.y, (size_t)K2 * H * f)) return 0;
+    if (!scratch_reserve(&g_dec.h, (size_t)K2 * I * f) || !scratch_reserve(&g_dec.y, (size_t)K2 * H * f)) return 0;
     VkBuffer bx = arena_buf(d->x, nH), bn = arena_buf(d->nrm, nH), bt = arena_buf(d->tmp, nH), bl = arena_buf(d->logits, (size_t)E * f);
     if (!bx || !bn || !bt || !bl) return 0;
-    VkBuffer dep[16] = {bx, bn, bt, bl, R->st.buf, R->rg.buf, R->crg.buf, C->w.buf, C->par.buf, C->cw.buf, C->nw.buf,
-                        g_moem[L].gu.buf, g_moem[L].dn.buf, d->wsg ? g_moem[L].sg.buf : VK_NULL_HANDLE,
-                        g_dec.qz.buf, g_dec.h.buf};
-    const void *pdep[8] = {d->proj, d->outp, d->router, d->shg, d->shu, d->shd, d->post_w, d->next_w};
-    if (T->ok && !memcmp(T->dep, dep, sizeof dep) && !memcmp(T->pdep, pdep, sizeof pdep)) return 1;
+    /* ---- mixer resources ---- */
+    int vh = d->vh, vk = d->vk, kdim = d->kdim, vdim = d->vdim, value_dim = vh * vdim, ktot = vk * kdim;
+    int conv_dim = d->conv_dim, convk = d->convk, pd = 0;
+    int Hq = d->Hq, KVh = d->KVh, hd = d->hd, qdim = d->qdim, gate_dim = qdim > hd ? qdim - hd : 0, pos = d->pos_base, nt = d->ldt;
+    size_t nq = 0, nk = 0, nqb = 0;
+    int ad_chunk = 0, ad_nch = 0, ad_R = 0;
+    __typeof__(g_dnr[0]) *R = &g_dnr[L];
+    __typeof__(g_dnc[0]) *C = &g_dnc[L];
+    VkBuffer dep[16] = {0};
+    if (!d->is_attn) {
+        if (!G.pipe_dc || !G.pipe_dp || !G.pipe_dr || !G.pipe_dg || !G.pipe_rg || !G.pipe_dba || !d->proj || !d->outp || convk > 17) return 0;
+        pd = d->proj->O;
+        if (d->proj->I != H || pd != conv_dim + value_dim || d->outp->I != value_dim || d->outp->O != H) return 0;
+        size_t nst = (size_t)vh * kdim * vdim * f, nring = (size_t)conv_dim * (convk - 1) * f;
+        if (R->own && (R->host_st != d->state || R->host_rg != d->ring)) coli_vk_dn_sync(L);
+        if (!scratch_reserve(&R->st, nst) || !scratch_reserve(&R->rg, nring) || !scratch_reserve(&R->cst, nst) || !scratch_reserve(&R->crg, nring)) return 0;
+        if (!R->own) { memcpy(R->st.ptr, d->state, nst); memcpy(R->rg.ptr, d->ring, nring); R->own = 1; R->capv = 0; }
+        R->host_st = d->state; R->host_rg = d->ring; R->nst = nst; R->nrg = nring;
+        size_t npar = (size_t)2 * vh * f, ncw = (size_t)conv_dim * convk * f, nnw = (size_t)vdim * f;
+        if (!scratch_reserve(&C->w, (size_t)2 * vh * H * f) || !scratch_reserve(&C->par, npar) || !scratch_reserve(&C->cw, ncw) || !scratch_reserve(&C->nw, nnw)) return 0;
+        if (C->sw != d->wb) { memcpy(C->w.ptr, d->wb, (size_t)vh * H * f); memcpy((char *)C->w.ptr + (size_t)vh * H * f, d->wa, (size_t)vh * H * f); C->sw = d->wb; }
+        if (C->spar != d->par || memcmp(C->par.ptr, d->par, npar)) { memcpy(C->par.ptr, d->par, npar); C->spar = d->par; }
+        if (C->scw != d->convw) { memcpy(C->cw.ptr, d->convw, ncw); C->scw = d->convw; }
+        if (C->snw != d->normw) { memcpy(C->nw.ptr, d->normw, nnw); C->snw = d->normw; }
+        if (!scratch_reserve(&g_dec.qz, (size_t)pd * f) || !scratch_reserve(&g_dec.ba, (size_t)2 * vh * f) ||
+            !scratch_reserve(&g_dec.conv, (size_t)conv_dim * f) || !scratch_reserve(&g_dec.q, (size_t)ktot * f) ||
+            !scratch_reserve(&g_dec.k, (size_t)ktot * f) || !scratch_reserve(&g_dec.bg, (size_t)2 * vh * f) ||
+            !scratch_reserve(&g_dec.o, (size_t)value_dim * f) || !scratch_reserve(&g_dec.orr, (size_t)value_dim * f)) return 0;
+        VkBuffer dd[16] = {bx, bn, bt, bl, R->st.buf, R->rg.buf, R->crg.buf, C->w.buf, C->par.buf, C->cw.buf, C->nw.buf,
+                           g_moem[L].gu.buf, g_moem[L].dn.buf, d->wsg ? g_moem[L].sg.buf : VK_NULL_HANDLE, g_dec.qz.buf, g_dec.h.buf};
+        memcpy(dep, dd, sizeof dep);
+    } else {
+        if (!G.pipe_ab || !G.pipe_ag || !G.pipe_ad || !G.pipe_adm || !d->tq || !d->tk || !d->tv || !d->to || hd > 256 || hd % 4 ||
+            KVh < 1 || Hq % KVh || (gate_dim && gate_dim != hd) || pos + 1 > nt) return 0;
+        ad_R = Hq / KVh;
+        if (ad_R > 32 || d->tq->I != H || d->tq->O != Hq * qdim || d->tk->O != KVh * hd || d->tv->O != KVh * hd ||
+            d->to->I != Hq * hd || d->to->O != H) return 0;
+        nq = (size_t)Hq * qdim * f; nk = (size_t)KVh * hd * f; nqb = (size_t)Hq * hd * f;
+        /* the resident KV cache of the attention block, rows the host has loaded first */
+        __typeof__(g_kvr[0]) *KR = &g_kvr[L];
+        size_t nres = (size_t)KVh * nt * hd * f;
+        if (KR->cap != nt || KR->hk != d->Kc || KR->hv != d->Vc) KR->rows = 0;
+        if (!scratch_reserve(&KR->k, nres) || !scratch_reserve(&KR->v, nres)) return 0;
+        KR->cap = nt; KR->hk = d->Kc; KR->hv = d->Vc;
+        if (KR->rows > pos) KR->rows = pos;
+        for (int g = 0; g < KVh && KR->rows < pos; g++) {
+            size_t o = ((size_t)g * nt + KR->rows) * hd, n = (size_t)(pos - KR->rows) * hd * f;
+            memcpy((float *)KR->k.ptr + o, d->Kc + o, n); memcpy((float *)KR->v.ptr + o, d->Vc + o, n);
+        }
+        KR->rows = pos;
+        if (!scratch_reserve(&T->anw, (size_t)2 * hd * f)) return 0;
+        { float *nw = T->anw.ptr; for (int i = 0; i < hd; i++) { nw[i] = d->qn ? d->qn[i] : 0.f; nw[hd + i] = d->kn ? d->kn[i] : 0.f; } }
+        int want = 80 / KVh; if (want < 1) want = 1;
+        ad_chunk = (pos + 1 + want - 1) / want; if (ad_chunk < 32) ad_chunk = 32; ad_chunk = (ad_chunk + 31) & ~31;   /* measured 32 > 64 > 128 at short context */
+        { const char *e = getenv("COLI_VK_AD_CHUNK"); if (e && atoi(e) > 0) ad_chunk = atoi(e); }
+        ad_nch = (pos + 1 + ad_chunk - 1) / ad_chunk;
+        if (!scratch_reserve(&g_dec.qkv, nq + 2 * nk) || !scratch_reserve(&g_dec.qb, nqb) || !scratch_reserve(&g_dec.gb, nqb) ||
+            !scratch_reserve(&g_dec.cx, nqb) || !scratch_reserve(&g_dec.ag, nqb) ||
+            !scratch_reserve(&g_dec.part, (size_t)KVh * ad_nch * ad_R * (2 + hd) * f)) return 0;
+        T->ok = 0;   /* position-dependent: recorded for every token */
+    }
+    const void *pdep[8] = {d->is_attn ? (const void *)d->tq : d->proj, d->is_attn ? (const void *)d->to : d->outp, d->router,
+                           d->shg, d->shu, d->shd, d->post_w, d->next_w};
+    if (!d->is_attn && T->ok && !memcmp(T->dep, dep, sizeof dep) && !memcmp(T->pdep, pdep, sizeof pdep)) return 1;
     T->ok = 0;
     /* per-layer tables */
     int rpw_gu = 64, rpw_dn = 64;
@@ -2421,9 +2461,10 @@ int coli_vk_dec_record(const ColiDecLayer *d) {
     for (int c = 0; c < K2; c++) { ((int *)T->order.ptr)[c] = c; ((int *)T->inv.ptr)[c] = c; ((float *)T->wts.ptr)[c] = 0.f; }
     /* descriptor sets: allocated once per layer */
     if (!T->set[0]) {
-        VkDescriptorSetLayout ls[16] = {G.dsl_grp[0], G.dsl_dba, G.dsl_dc, G.dsl_rg, G.dsl_dp, G.dsl_dr, G.dsl_dg, G.dsl_grp[0],
-                                        G.dsl_rn, G.dsl_grp[0], G.dsl_mr, G.dsl_grp[1], G.dsl_grp[0], G.ep_dsl[1], G.dsl_rn, G.dsl_rn};
-        for (int i = 0; i < 16; i++) if (!(T->set[i] = dec_set(ls[i]))) return 0;
+        VkDescriptorSetLayout ls[24] = {G.dsl_grp[0], G.dsl_dba, G.dsl_dc, G.dsl_rg, G.dsl_dp, G.dsl_dr, G.dsl_dg, G.dsl_grp[0],
+                                        G.dsl_rn, G.dsl_grp[0], G.dsl_mr, G.dsl_grp[1], G.dsl_grp[0], G.ep_dsl[1], G.dsl_rn, G.dsl_rn,
+                                        G.dsl_grp[0], G.dsl_grp[0], G.dsl_grp[0], G.dsl_ab, G.dsl_ad, G.dsl_adm, G.dsl_ag, G.dsl_grp[0]};
+        for (int i = 0; i < 24; i++) if (!(T->set[i] = dec_set(ls[i]))) return 0;
     }
     if (!T->cb) {
         VkCommandBufferAllocateInfo cbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = G.cpool,
@@ -2436,6 +2477,40 @@ int coli_vk_dec_record(const ColiDecLayer *d) {
     VKCHECK(vkBeginCommandBuffer(cb, &begin), "dec beginCmd");
     cc_barrier(cb);   /* after the previous layer's buffer in the same submit */
     VkDescriptorSet *ss = T->set;
+    if (d->is_attn) {   /* gated attention: q|k|v, prep (norm, RoPE, KV row), split-key core, gate, o_proj -> tmp */
+        __typeof__(g_kvr[0]) *KR = &g_kvr[L];
+        if (!rec_gv(cb, ss[16], &T->it[3], &T->et[3], d->tq, bn, g_dec.qkv.buf, 0, S) ||
+            !rec_gv(cb, ss[17], &T->it[4], &T->et[4], d->tk, bn, g_dec.qkv.buf, nq, S) ||
+            !rec_gv(cb, ss[18], &T->it[5], &T->et[5], d->tv, bn, g_dec.qkv.buf, nq + nk, S)) { vkEndCommandBuffer(cb); return 0; }
+        cc_barrier(cb);
+        { VkDescriptorBufferInfo bi[6] = {{g_dec.qkv.buf, 0, VK_WHOLE_SIZE}, {T->anw.buf, 0, VK_WHOLE_SIZE},
+                                          {g_dec.qb.buf, 0, VK_WHOLE_SIZE}, {g_dec.gb.buf, 0, VK_WHOLE_SIZE},
+                                          {KR->k.buf, 0, VK_WHOLE_SIZE}, {KR->v.buf, 0, VK_WHOLE_SIZE}};
+          wr_desc(ss[19], 6, bi);
+          struct PCAB pc = {S, Hq, KVh, hd, qdim, gate_dim, d->rotary, pos, nt, d->qn != NULL, d->kn != NULL,
+                            0, (int)(nq / f), (int)((nq + nk) / f), d->eps, d->theta};
+          dec_bind(cb, G.pipe_ab, G.plyt_ab, ss[19], &pc, sizeof pc);
+          vkCmdDispatch(cb, (uint32_t)S, (uint32_t)(Hq + KVh), 1); }
+        cc_barrier(cb);
+        { struct PCAD pc = {S, Hq, KVh, hd, pos, nt, ad_nch, ad_chunk, d->ascale};
+          VkDescriptorBufferInfo bi[4] = {{g_dec.qb.buf, 0, VK_WHOLE_SIZE}, {KR->k.buf, 0, VK_WHOLE_SIZE},
+                                          {KR->v.buf, 0, VK_WHOLE_SIZE}, {g_dec.part.buf, 0, VK_WHOLE_SIZE}};
+          wr_desc(ss[20], 4, bi);
+          dec_bind(cb, G.pipe_ad, G.plyt_ad, ss[20], &pc, sizeof pc);
+          vkCmdDispatch(cb, (uint32_t)ad_nch, (uint32_t)KVh, 1);
+          cc_barrier(cb);
+          VkDescriptorBufferInfo bm[2] = {{g_dec.part.buf, 0, VK_WHOLE_SIZE}, {g_dec.cx.buf, 0, VK_WHOLE_SIZE}};
+          wr_desc(ss[21], 2, bm);
+          dec_bind(cb, G.pipe_adm, G.plyt_adm, ss[21], &pc, sizeof pc);
+          vkCmdDispatch(cb, (uint32_t)(KVh * ad_R * S), 1, 1); }
+        cc_barrier(cb);
+        { VkDescriptorBufferInfo bi[3] = {{g_dec.cx.buf, 0, VK_WHOLE_SIZE}, {g_dec.gb.buf, 0, VK_WHOLE_SIZE}, {g_dec.ag.buf, 0, VK_WHOLE_SIZE}};
+          wr_desc(ss[22], 3, bi); int n = S * Hq * hd; struct PCAG pc = {n, gate_dim > 0};
+          dec_bind(cb, G.pipe_ag, G.plyt_ag, ss[22], &pc, sizeof pc);
+          vkCmdDispatch(cb, (uint32_t)((n + 255) / 256), 1, 1); }
+        cc_barrier(cb);
+        if (!rec_gv(cb, ss[23], &T->it[6], &T->et[6], d->to, g_dec.ag.buf, bt, 0, S)) { vkEndCommandBuffer(cb); return 0; }
+    } else {
     /* DeltaNet block: input = the normed row, output -> tmp */
     if (!rec_gv(cb, ss[0], &T->it[0], &T->et[0], d->proj, bn, g_dec.qz.buf, 0, S)) { vkEndCommandBuffer(cb); return 0; }
     { VkDescriptorBufferInfo bi[3] = {{bn, 0, VK_WHOLE_SIZE}, {C->w.buf, 0, VK_WHOLE_SIZE}, {g_dec.ba.buf, 0, VK_WHOLE_SIZE}};
@@ -2472,6 +2547,7 @@ int coli_vk_dec_record(const ColiDecLayer *d) {
       vkCmdDispatch(cb, (uint32_t)((S + 7) / 8), (uint32_t)vh, 1); }
     cc_barrier(cb);
     if (!rec_gv(cb, ss[7], &T->it[1], &T->et[1], d->outp, g_dec.orr.buf, bt, 0, S)) { vkEndCommandBuffer(cb); return 0; }
+    }
     /* block tail: x += tmp, nrm = post_ln(x); logits = router(nrm) */
     if (!rn_record_x(cb, ss[8], &T->rw[0], bx, bt, bn, d->post_w, d->eps, S, H)) { vkEndCommandBuffer(cb); return 0; }
     cc_barrier(cb);
@@ -2509,6 +2585,8 @@ int coli_vk_dec_record(const ColiDecLayer *d) {
     host_read_barrier(cb);
     VKCHECK(vkEndCommandBuffer(cb), "dec endCmd");
     memcpy(T->dep, dep, sizeof dep); memcpy(T->pdep, pdep, sizeof pdep);
+    T->is_attn = d->is_attn;
+    if (d->is_attn) { T->attn_pos = pos; T->kvh = KVh; T->hd = hd; T->nt = nt; T->Kc = d->Kc; T->Vc = d->Vc; }
     T->ok = 1;
     return 1;
 }
@@ -2519,15 +2597,28 @@ int coli_vk_dec_run(int n, const int *layers, const float *x, const float *nrm, 
     for (int i = 0; i < n; i++) {
         int L = layers[i];
         if (L < 0 || L >= DN_RES_MAX || !g_decl[L].ok) return 0;
-        __typeof__(g_dnr[0]) *R = &g_dnr[L];
-        if (!R->own) { memcpy(R->st.ptr, R->host_st, R->nst); memcpy(R->rg.ptr, R->host_rg, R->nrg); R->own = 1; }
-        R->capv = 0;
+        if (!g_decl[L].is_attn) {
+            __typeof__(g_dnr[0]) *R = &g_dnr[L];
+            if (!R->own) { memcpy(R->st.ptr, R->host_st, R->nst); memcpy(R->rg.ptr, R->host_rg, R->nrg); R->own = 1; }
+            R->capv = 0;
+        }
         cbs[i] = g_decl[L].cb;
     }
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = (uint32_t)n, .pCommandBuffers = cbs};
     VKCHECK(vkResetFences(G.dev, 1, &G.fence), "dec resetFence");
     VKCHECK(vk_submit(G.queue, &si, G.fence), "dec queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
+    for (int i = 0; i < n; i++) {   /* attention layers: their new KV row back into the host caches */
+        __typeof__(g_decl[0]) *T = &g_decl[layers[i]];
+        if (!T->is_attn) continue;
+        __typeof__(g_kvr[0]) *KR = &g_kvr[layers[i]];
+        for (int g = 0; g < T->kvh; g++) {
+            size_t o = ((size_t)g * T->nt + T->attn_pos) * T->hd, nb = (size_t)T->hd * sizeof(float);
+            memcpy(T->Kc + o, (const float *)KR->k.ptr + o, nb); memcpy(T->Vc + o, (const float *)KR->v.ptr + o, nb);
+        }
+        KR->rows = T->attn_pos + 1;
+        T->ok = 0;   /* position-bound: recorded again next token */
+    }
     size_t nH = (size_t)H * sizeof(float);
     arena_mark_gpu(arena_buf(x, nH)); arena_mark_gpu(arena_buf(nrm, nH)); arena_mark_gpu(arena_buf(tmp, nH));
     arena_mark_gpu(arena_buf(logits, (size_t)E * sizeof(float)));

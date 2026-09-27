@@ -1767,6 +1767,29 @@ int qt_dec_record(int layer, int hout, int hrt, int hsg, int hsu, int hsd, const
     (void)vh;(void)vk;(void)kdim;(void)vdim;(void)E;(void)K;(void)I;(void)eps;(void)qscale; return 0;
 #endif
 }
+int qt_dec_record_attn(int layer, int hq, int hk, int hv, int ho, int hrt, int hsg, int hsu, int hsd,
+                       const float *qn, const float *kn, float *Kc, float *Vc, int ldt, int pos,
+                       const float *post_w, const float *next_w, const float *wsg,
+                       float *x, float *nrm, float *tmp, float *logits, int H, int Hq, int KVh, int hd, int qdim,
+                       int rotary, float theta, float ascale, int E, int K, int I, float eps){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    int h[8] = {hq, hk, hv, ho, hrt, hsg, hsu, hsd};
+    for(int i = 0; i < 8; i++) if(h[i] < 0 || h[i] >= G_dense_n || !G_dense[h[i]].on) return 0;
+    if(!qt_moe_chain_ready(layer)) return 0;
+    ColiDecLayer d; memset(&d, 0, sizeof d);
+    d.layer = layer; d.router = G_dense[hrt].t; d.shg = G_dense[hsg].t; d.shu = G_dense[hsu].t; d.shd = G_dense[hsd].t;
+    d.post_w = post_w; d.next_w = next_w; d.wsg = wsg; d.x = x; d.nrm = nrm; d.tmp = tmp; d.logits = logits;
+    d.H = H; d.E = E; d.K = K; d.I = I; d.eps = eps;
+    d.is_attn = 1; d.tq = G_dense[hq].t; d.tk = G_dense[hk].t; d.tv = G_dense[hv].t; d.to = G_dense[ho].t;
+    d.qn = qn; d.kn = kn; d.Kc = Kc; d.Vc = Vc; d.ldt = ldt; d.pos_base = pos; d.Hq = Hq; d.KVh = KVh; d.hd = hd;
+    d.qdim = qdim; d.rotary = rotary; d.theta = theta; d.ascale = ascale;
+    return coli_vk_dec_record(&d);
+#else
+    (void)layer;(void)hq;(void)hk;(void)hv;(void)ho;(void)hrt;(void)hsg;(void)hsu;(void)hsd;(void)qn;(void)kn;(void)Kc;(void)Vc;
+    (void)ldt;(void)pos;(void)post_w;(void)next_w;(void)wsg;(void)x;(void)nrm;(void)tmp;(void)logits;(void)H;(void)Hq;(void)KVh;
+    (void)hd;(void)qdim;(void)rotary;(void)theta;(void)ascale;(void)E;(void)K;(void)I;(void)eps; return 0;
+#endif
+}
 int qt_dec_run(int n, const int *layers, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     return coli_vk_available() && coli_vk_dec_run(n, layers, x, nrm, tmp, logits, H, E);

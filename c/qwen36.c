@@ -3855,6 +3855,18 @@ static int dec_graph_layer(Model *m, int j, float *x, float *nrm, float *tmp, fl
                          1.f / sqrtf((float)c->dn_kdim));
 }
 
+/* Decode graph, attention layer j at position pos (recorded for this token). */
+static int dec_graph_attn(Model *m, int j, int pos, float *x, float *nrm, float *tmp, float *lg, const float *next_w) {
+    Cfg *c = &m->c; Layer *l = &m->L[j];
+    if (!c->is_attn[j] || !l->qth_q || !l->qth_k || !l->qth_v || !l->qth_o || !l->qth_gate || !l->qth_shg ||
+        !l->qth_shu || !l->qth_shd || (c->has_bias && l->gate_bias) || c->k_head_dim != c->head_dim) return 0;
+    return qt_dec_record_attn(j, l->qth_q - 1, l->qth_k - 1, l->qth_v - 1, l->qth_o - 1, l->qth_gate - 1,
+                              l->qth_shg - 1, l->qth_shu - 1, l->qth_shd - 1, l->qn, l->kn, m->K[j], m->V[j], m->max_t, pos,
+                              l->post_ln, next_w, l->sh_gate, x, nrm, tmp, lg, c->hidden, c->q_heads, c->kv_heads,
+                              c->head_dim, c->q_head_dim, c->rotary_dim, c->theta, 1.f / sqrtf((float)c->head_dim),
+                              c->n_experts, c->topk, c->inter, c->eps);
+}
+
 static void layers_forward_range(Model *m, float *x, int S, int pos_base,
                                  int layer_begin, int layer_end,
                                  int allow_prefetch, FILE *lf) {
@@ -3920,11 +3932,14 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         } else {
             for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
         }
-        if (dec_graph && tail && S == 1 && !c->is_attn[i]) {
+        static int graph_attn = -1;   /* QWEN_DEC_GRAPH_ATTN=1: attention layers join the graph (the whole token, one submit) */
+        if (graph_attn < 0) graph_attn = getenv("QWEN_DEC_GRAPH_ATTN") && getenv("QWEN_DEC_GRAPH_ATTN")[0] == '1';
+        if (dec_graph && tail && S == 1 && (!c->is_attn[i] || graph_attn)) {
             int ls[64], n = 0;
-            for (int j = i; j < layer_end && !c->is_attn[j] && n < 64; j++) {
+            for (int j = i; j < layer_end && n < 64; j++) {
                 const float *nw = j + 1 < layer_end ? m->L[j + 1].in_ln : m->L[j].in_ln;
-                if (!dec_graph_layer(m, j, x, nrm, tmp, lg, nw)) break;
+                if (c->is_attn[j] ? !(graph_attn && dec_graph_attn(m, j, pos_base, x, nrm, tmp, lg, nw))
+                                  : !dec_graph_layer(m, j, x, nrm, tmp, lg, nw)) break;
                 ls[n++] = j;
             }
             double _tg = tm_now();

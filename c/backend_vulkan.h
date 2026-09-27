@@ -71,6 +71,10 @@ typedef struct {
     float *ring, *state, *x, *nrm, *tmp, *logits;
     int H, conv_dim, convk, vh, vk, kdim, vdim, E, K, I;
     float eps, qscale;
+    /* attention layers (is_attn): q|k|v|o, q/k norm weights, host KV caches (row stride ldt),
+     * position of the token; recorded again for every token */
+    int is_attn; ColiVkTensor *tq, *tk, *tv, *to; const float *qn, *kn; float *Kc, *Vc;
+    int ldt, pos_base, Hq, KVh, hd, qdim, rotary; float theta, ascale;
 } ColiDecLayer;
 int  coli_vk_dec_record(const ColiDecLayer *d);
 int  coli_vk_dec_run(int n, const int *layers, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E);
