@@ -15,7 +15,10 @@
  *   model runs [a, d] as one S = 2 step. argmax at a == d -> both tokens stand;
  *   otherwise d is dropped: KV length back, DeltaNet state and conv ring back to
  *   the copies captured right after token a (deltanet_phased, g_dn_cap_*).
- *   Greedy output is the plain greedy output (verified token by token).
+ *   Greedy output is the plain greedy output (verified token by token).  With
+ *   sampling (QWEN_TEMP > 0) every emitted token is drawn from the main model's
+ *   logits (cli_pick) and the draft stands only if it equals that draw, so the
+ *   output follows the model's distribution exactly; the draft itself stays argmax.
  *
  * The MTP block runs on the CPU (dense int8 / int4 like the trunk, experts
  * grouped per expert so the prompt catch-up is a few batched GEMMs). */
@@ -295,7 +298,7 @@ static int generate_mtp(Model *m, const int *prompt, int np, int n_new, int *out
     g_step_hid = NULL;
     if (np > 1) mtp_forward(m, prompt + 1, H, np - 1, 1, NULL);        /* MTP catch-up over the prompt */
     float *hprev = falloc(D); memcpy(hprev, H + (int64_t)(np - 1) * D, sizeof(float) * D); free(H);
-    int a = argmax_v(logit, V); free(logit);
+    int a = cli_pick(logit, V); free(logit);
     if (g_ttft < 0) g_ttft = now_s() - g_gen_t0;
     int len = np, made = 0, pend = -1;
     double t_draft = 0, t_verify = 0;           /* pend: accepted draft whose MTP row is still owed */
@@ -328,8 +331,8 @@ static int generate_mtp(Model *m, const int *prompt, int np, int n_new, int *out
         t_verify += now_s() - tq1;
         g_step_hid = NULL; g_step_logits = NULL; g_dn_cap_after = -1;
         free(lg);
-        int c1 = argmax_v(L2, V);
-        if (c1 == d) {
+        int c1 = cli_pick(L2, V);
+        if (c1 == d && !force_rej) {   /* forced test: never accept, even if d+1 hits */
             g_mtp.accepted++;
             int d_eos = 0; for (int e = 0; e < n_eos; e++) d_eos |= d == eos_ids[e];
             if (d_eos) { len++; break; }
@@ -338,7 +341,7 @@ static int generate_mtp(Model *m, const int *prompt, int np, int n_new, int *out
             if (made >= n_new) { len += 2; break; }
             pend = d; memcpy(hpend, H2, sizeof(float) * D);
             memcpy(hprev, H2 + D, sizeof(float) * D);
-            a = argmax_v(L2 + V, V);
+            a = cli_pick(L2 + V, V);
             len += 2;
         } else {
             /* drop d: state back to right after a */

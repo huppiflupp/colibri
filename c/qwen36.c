@@ -4317,6 +4317,41 @@ static void ensure_kv(Model *m){
 
 static int serve_eos_ids(int *ids, int cap);
 static void ensure_kv(Model *m);
+
+/* Token choice of the CLI: greedy by default; QWEN_TEMP > 0 samples like llama.cpp's
+ * chain top_k -> top_p -> temperature -> dist (top_p on the untempered softmax),
+ * with QWEN_TOP_K (20), QWEN_TOP_P (0.95) and a seeded generator (QWEN_SEED, 1),
+ * so runs repeat.  O(V) per token: the top k are kept in a small sorted array. */
+static float g_s_temp = -1.f, g_s_top_p; static int g_s_top_k; static uint64_t g_s_rng;
+static int cli_pick(const float *lo, int V) {
+    if (g_s_temp < 0.f) {
+        const char *e = getenv("QWEN_TEMP"); g_s_temp = e ? atof(e) : 0.f;
+        e = getenv("QWEN_TOP_P"); g_s_top_p = e ? atof(e) : 0.95f;
+        e = getenv("QWEN_TOP_K"); g_s_top_k = e ? atoi(e) : 20;
+        e = getenv("QWEN_SEED"); g_s_rng = (e ? strtoull(e, NULL, 10) : 1) * 0x9E3779B97F4A7C15ull + 1;
+        if (g_s_top_k < 1 || g_s_top_k > 256) g_s_top_k = 256;
+        if (g_s_temp > 0.f) fprintf(stderr, "[sample] temp %.2f top_k %d top_p %.2f seed %s\n",
+                                    g_s_temp, g_s_top_k, g_s_top_p, getenv("QWEN_SEED") ? getenv("QWEN_SEED") : "1");
+    }
+    if (g_s_temp <= 0.f) { int b = 0; for (int i = 1; i < V; i++) if (lo[i] > lo[b]) b = i; return b; }
+    int K = g_s_top_k, n = 0, id[256]; float v[256];
+    for (int i = 0; i < V; i++) {                        /* top K, descending */
+        if (n == K && lo[i] <= v[n - 1]) continue;
+        int j = n < K ? n++ : n - 1;
+        while (j > 0 && v[j - 1] < lo[i]) { v[j] = v[j - 1]; id[j] = id[j - 1]; j--; }
+        v[j] = lo[i]; id[j] = i;
+    }
+    double p[256], sum = 0, kept = 0;
+    for (int j = 0; j < n; j++) { p[j] = exp((double)v[j] - v[0]); sum += p[j]; }
+    int nk = 0;                                          /* top_p: smallest prefix with mass >= top_p */
+    while (nk < n) { kept += p[nk++] / sum; if (kept >= g_s_top_p) break; }
+    double w[256], tot = 0;
+    for (int j = 0; j < nk; j++) { w[j] = exp(((double)v[j] - v[0]) / g_s_temp); tot += w[j]; }
+    g_s_rng ^= g_s_rng >> 12; g_s_rng ^= g_s_rng << 25; g_s_rng ^= g_s_rng >> 27;   /* xorshift64* */
+    double r = (double)((g_s_rng * 0x2545F4914F6CDD1Dull) >> 11) / 9007199254740992.0 * tot, acc = 0;
+    for (int j = 0; j < nk; j++) { acc += w[j]; if (r < acc) return id[j]; }
+    return id[nk - 1];
+}
 #include "qwen36_mtp.h"
 /* Returns the number of tokens generated: n_new, or fewer with STOP_EOS=1 when the
  * model emits <|im_end|> / <|endoftext|> (the CLI is a benchmark and by default
@@ -4341,8 +4376,7 @@ static int generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     float *logit = step(m, prompt, np, 0);
     int len = np;
     for (int s = 0; s < n_new; s++) {
-        int best = 0; float bv = logit[0];
-        for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        int best = cli_pick(logit, c->vocab);
         if (s == 0 && g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* record TTFT */
         { int is_eos = 0; for (int e = 0; e < n_eos; e++) is_eos |= best == eos_ids[e];
           if (is_eos) { free(logit); return len - np; } }
