@@ -51,13 +51,21 @@ const char *coli_vk_default_spv(char *buf, size_t n);
 int  coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, ColiVkTensor *to,
                         const float *x, const float *qn, const float *kn, float *Kc, float *Vc, int ldt,
                         int S, int D, int H, int KV, int hd, int qdim, int rotary, int pos_base,
-                        float eps, float theta, float scale, float *out);
+                        float eps, float theta, float scale, float *out, int layer);
+int  coli_vk_attn_dec_ready(void);            /* decode core (attn_dec) built */
+void coli_vk_kv_cut(int layer, int from);     /* host wrote K/V row `from`: resident copy ends there */
 /* A whole DeltaNet layer of a prefill block in one submit (see backend_vulkan.c). */
 int  coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, const float *ba,
                       const float *wb, const float *wa,
                       const float *convw, const float *par, const float *normw, float *ring, float *state,
                       int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
-                      float eps, float qscale, float *y);
+                      float eps, float qscale, float *y, int layer, int cap);
+/* Resident DeltaNet state of the block (decode): on/off (-1 queries), host copy back
+ * (1 if the GPU held it), forget the GPU copy, swap in the state after token cap. */
+int  coli_vk_dn_resident(int on);
+int  coli_vk_dn_sync(int layer);
+void coli_vk_dn_drop(int layer);
+int  coli_vk_dn_rollback(int layer);
 /* DeltaNet gated delta rule over a prefill block (see backend_vulkan.c); 0 -> CPU path. */
 float *coli_vk_dn_stage(int which, size_t bytes);
 /* persistent host-visible, host-cached buffer (slot 0..3) the prefill keeps its rows in;

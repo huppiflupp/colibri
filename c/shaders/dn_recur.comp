@@ -25,8 +25,10 @@ layout(std430, binding = 3) readonly buffer BT { float beta[]; };   // [S][vh]
 layout(std430, binding = 4) readonly buffer GE { float gexp[]; };   // [S][vh]  exp(g)
 layout(std430, binding = 5) buffer ST { float st[]; };              // [vh][kdim][vdim], in and out
 layout(std430, binding = 6) writeonly buffer OV { float outv[]; };  // [S][vh][vdim]
+layout(std430, binding = 7) writeonly buffer CS { float cst[]; };   // state after token cap (MTP roll-back)
 
-layout(push_constant) uniform P { int S, vh, vk, kdim, vdim, vstride, voff; } p;
+// cap >= 0: the state as it stands after token cap is also written to cst
+layout(push_constant) uniform P { int S, vh, vk, kdim, vdim, vstride, voff, cap; } p;
 
 void main() {
     uint h = gl_WorkGroupID.x;
@@ -74,6 +76,8 @@ void main() {
         }
         float o = subgroupClusteredAdd(op, LPC);
         if (li == 0u && live) outv[(t * uint(p.vh) + h) * vd + col] = o;
+        if (int(t) == p.cap && live)
+            [[unroll]] for (uint r = 0u; r < MAXR; r++) if (r < R) cst[sb + (r * LPC + li) * vd + col] = s[r];
         [[unroll]] for (uint r = 0u; r < MAXR; r++) { kc[r] = kx[r]; qc[r] = qx[r]; }
         ge = gex; bt = btx; vv = vvx;
     }
@@ -96,6 +100,8 @@ void main() {
         }
         float o = subgroupClusteredAdd(op, LPC);
         if (li == 0u && live) outv[(t * uint(p.vh) + h) * vd + col] = o;
+        if (int(t) == p.cap && live)
+            [[unroll]] for (uint r = 0u; r < MAXR; r++) if (r < R) cst[sb + (r * LPC + li) * vd + col] = s[r];
     }
 #endif
     [[unroll]] for (uint r = 0u; r < MAXR; r++)

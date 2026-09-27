@@ -1052,31 +1052,74 @@ int qt_dn_recur(float *outv, float *state, const float *qn, const float *kn, con
 int qt_dn_block(int layer, int hout, const float *x, const float *ba, const float *wb, const float *wa, const float *convw,
                 const float *par, const float *normw, float *ring, float *state,
                 int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
-                float eps, float qscale, float *y){
+                float eps, float qscale, float *y, int cap){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     if(!qt_dnproj_ready(layer) || hout < 0 || hout >= G_dense_n || !G_dense[hout].on) return 0;
     return coli_vk_dn_block(G_dnp[layer].t, G_dense[hout].t, x, ba, wb, wa, convw, par, normw, ring, state,
-                            S, H, conv_dim, convk, vh, vk, kdim, vdim, eps, qscale, y);
+                            S, H, conv_dim, convk, vh, vk, kdim, vdim, eps, qscale, y, layer, cap);
 #else
     (void)layer;(void)hout;(void)x;(void)ba;(void)wb;(void)wa;(void)convw;(void)par;(void)normw;(void)ring;(void)state;
-    (void)S;(void)H;(void)conv_dim;(void)convk;(void)vh;(void)vk;(void)kdim;(void)vdim;(void)eps;(void)qscale;(void)y;
+    (void)S;(void)H;(void)conv_dim;(void)convk;(void)vh;(void)vk;(void)kdim;(void)vdim;(void)eps;(void)qscale;(void)y;(void)cap;
     return 0;
+#endif
+}
+/* Resident DeltaNet state (Vulkan): see coli_vk_dn_*. Without Vulkan all no-ops. */
+int qt_dn_resident(int on){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_dn_resident(on);
+#else
+    (void)on; return 0;
+#endif
+}
+int qt_dn_sync(int layer){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_dn_sync(layer);
+#else
+    (void)layer; return 0;
+#endif
+}
+void qt_dn_drop(int layer){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    coli_vk_dn_drop(layer);
+#else
+    (void)layer;
+#endif
+}
+int qt_dn_rollback(int layer){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_dn_rollback(layer);
+#else
+    (void)layer; return 0;
 #endif
 }
 /* A whole gated-attention layer of a prefill block on the GPU (Vulkan only): the
  * dense handles of q, k, v, o must all be GPU-placed. 0 -> the engine's path. */
 int qt_attn_block(int hq, int hk, int hv, int ho, const float *x, const float *qn, const float *kn,
                   float *Kc, float *Vc, int ldt, int S, int D, int H, int KV, int hd, int qdim,
-                  int rotary, int pos_base, float eps, float theta, float scale, float *out){
+                  int rotary, int pos_base, float eps, float theta, float scale, float *out, int layer){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     int h[4] = {hq, hk, hv, ho};
     for(int i = 0; i < 4; i++) if(h[i] < 0 || h[i] >= G_dense_n || !G_dense[h[i]].on) return 0;
     return coli_vk_attn_block(G_dense[hq].t, G_dense[hk].t, G_dense[hv].t, G_dense[ho].t, x, qn, kn, Kc, Vc, ldt,
-                              S, D, H, KV, hd, qdim, rotary, pos_base, eps, theta, scale, out);
+                              S, D, H, KV, hd, qdim, rotary, pos_base, eps, theta, scale, out, layer);
 #else
     (void)hq;(void)hk;(void)hv;(void)ho;(void)x;(void)qn;(void)kn;(void)Kc;(void)Vc;(void)ldt;(void)S;(void)D;
-    (void)H;(void)KV;(void)hd;(void)qdim;(void)rotary;(void)pos_base;(void)eps;(void)theta;(void)scale;(void)out;
+    (void)H;(void)KV;(void)hd;(void)qdim;(void)rotary;(void)pos_base;(void)eps;(void)theta;(void)scale;(void)out;(void)layer;
     return 0;
+#endif
+}
+int qt_attn_dec_ready(void){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_available() && coli_vk_attn_dec_ready();
+#else
+    return 0;
+#endif
+}
+void qt_kv_cut(int layer, int from){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    if(coli_vk_available()) coli_vk_kv_cut(layer, from);
+#else
+    (void)layer;(void)from;
 #endif
 }
 int qt_trunk_min_s(void){

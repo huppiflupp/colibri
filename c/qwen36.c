@@ -2397,14 +2397,18 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
     /* The whole layer on the GPU in one submit when q/k/v/o are placed there;
      * the new K/V rows land in the host caches (decode reads them). QWEN_ATTN_BLOCK=0
      * keeps the steps below. */
-    if (l->qth_q && l->qth_k && l->qth_v && l->qth_o && kvd == hd && S > 1 && S >= qt_trunk_min_s() &&
+    /* decode (S <= 4) takes the block too once the KV cache stays on the GPU and
+     * the split-key decode core is there (qt_attn_dec_ready) */
+    if (l->qth_q && l->qth_k && l->qth_v && l->qth_o && kvd == hd &&
+        ((S > 1 && S >= qt_trunk_min_s()) || (S <= 4 && qt_attn_dec_ready())) &&
         !(getenv("QWEN_ATTN_BLOCK") && getenv("QWEN_ATTN_BLOCK")[0] == '0') &&
         qt_attn_block(l->qth_q - 1, l->qth_k - 1, l->qth_v - 1, l->qth_o - 1, x, l->qn, l->kn,
                       m->K[layer], m->V[layer], m->max_t, S, D, H, KV, hd, qdim, rotary, pos_base,
-                      c->eps, c->theta, 1.f / sqrtf((float)hd), out)) {
-        if (tm_on()) g_at_pf[1] += tm_now() - _a0;
+                      c->eps, c->theta, 1.f / sqrtf((float)hd), out, layer)) {
+        if (tm_on()) { if (S > 1) g_at_pf[1] += tm_now() - _a0; }
         return;
     }
+    qt_kv_cut(layer, pos_base);   /* this path writes rows pos_base.. into the host caches */
     float *q = falloc((int64_t)S*q_out);
     float *k = falloc((int64_t)S*kv_out);
     float *vv= falloc((int64_t)S*kv_out);
@@ -3202,7 +3206,9 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
      * there: nothing but the layer output, the state and the ring comes back.
      * QWEN_DN_BLOCK=0 keeps the phases below. (f16 tiles in the projections, as
      * the placed trunk uses anyway; the rest f32.) */
-    if (l->qth_dnout && qt_dnproj_ready(layer) && S >= qt_trunk_min_s() &&
+    /* decode (S <= 4: a token, an MTP verify pair) takes the block too once the
+     * state stays on the GPU between tokens (qt_dn_resident) */
+    if (l->qth_dnout && qt_dnproj_ready(layer) && (S >= qt_trunk_min_s() || (S <= 4 && qt_dn_resident(-1))) &&
         !(getenv("QWEN_DN_BLOCK") && getenv("QWEN_DN_BLOCK")[0] == '0')) {
         float *ba = falloc((int64_t)S * 2 * vh), *par = falloc(2 * vh);
         double _tb = tm_now();
@@ -3226,12 +3232,19 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
         if (tm_on()) g_dn_pf[1] += tm_now() - _tb;   /* dn block: small b/a projections on the CPU */
         memcpy(par, l->dn_alog, (size_t)vh * sizeof(float));
         memcpy(par + vh, l->dn_dtbias, (size_t)vh * sizeof(float));
+        /* MTP verify: the state after token g_dn_cap_after is kept on the GPU */
+        int cap = g_dn_cap_after >= 0 && g_dn_cap_after < S && g_dn_cap_rec && g_dn_cap_rec[layer] ? g_dn_cap_after : -1;
         int ok = qt_dn_block(layer, l->qth_dnout - 1, x, ba_gpu ? NULL : ba, l->dn_b, l->dn_a, l->dn_conv, par, l->dn_norm,
                              m->DN_conv[layer], m->DN_rec[layer], S, H, conv_dim, convk,
-                             vh, vk, kdim, vdim, c->eps, scale, out);
+                             vh, vk, kdim, vdim, c->eps, scale, out, cap);
         free(ba); free(par);
-        if (ok) { if (tm_on()) g_dn_pf[0] += tm_now() - _d0; return; }
+        if (ok) {
+            if (cap >= 0) g_dn_cap_n++;
+            if (tm_on()) { if (S <= 4) g_dn_sub[0] += tm_now() - _d0; else g_dn_pf[0] += tm_now() - _d0;   /* decode: whole block counted as "proj" */ }
+            return;
+        }
     }
+    qt_dn_sync(layer);   /* the CPU phases below need the host copy of state and ring */
     /* 1. projections of every token */
     float *qkv = falloc((int64_t)S * conv_dim), *z = falloc((int64_t)S * value_dim);
     float *b = falloc((int64_t)S * vh), *a = falloc((int64_t)S * vh);
@@ -3420,10 +3433,12 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
 static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     (void)pos_base;
     Cfg *c = &m->c;
-    if (S > 1 && c->dn_convk <= 17 && !getenv("DN_DBG") && !(getenv("QWEN_DN_TOKENWISE") && getenv("QWEN_DN_TOKENWISE")[0] == '1')) {
+    int tokw = getenv("DN_DBG") || (getenv("QWEN_DN_TOKENWISE") && getenv("QWEN_DN_TOKENWISE")[0] == '1');
+    if ((S > 1 || (qt_dn_resident(-1) && l->qth_dnout && qt_dnproj_ready(layer))) && c->dn_convk <= 17 && !tokw) {
         deltanet_phased(m, l, layer, x, S, out);
         return;
     }
+    qt_dn_sync(layer);   /* host copy of state and ring for the token loop */
     int vh = c->dn_vheads, vk = c->dn_kheads, kdim = c->dn_kdim, vdim = c->dn_vdim;
     int convk = c->dn_convk, conv_dim = c->dn_conv_dim;
     int rep = vh / vk;
@@ -4178,6 +4193,7 @@ static Q36PinState *q36_pin_state_save(Model *m, Q36PinState *reuse){
     }
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]) continue;
+        qt_dn_sync(i);
         if (m->DN_rec[i]  && st->rec[i])  memcpy(st->rec[i],  m->DN_rec[i],  nr * sizeof(float));
         if (m->DN_conv[i] && st->conv[i]) memcpy(st->conv[i], m->DN_conv[i], nc * sizeof(float));
     }
@@ -4217,6 +4233,7 @@ static int pin_restore(Model *m, const int *ids, int n){
                 if (c->is_attn[i]) continue;
                 if (m->DN_rec[i]  && st->rec[i])  memcpy(m->DN_rec[i],  st->rec[i],  nr * sizeof(float));
                 if (m->DN_conv[i] && st->conv[i]) memcpy(m->DN_conv[i], st->conv[i], nc * sizeof(float));
+                qt_dn_drop(i);
             }
             m->kv_len = k->len;
             kv_prefix_clear(&m->kvp);
@@ -4241,6 +4258,7 @@ static void reset_recurrent(Model *m){
         if (c->is_attn[i]) continue;
         if (m->DN_rec[i])  memset(m->DN_rec[i],  0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
         if (m->DN_conv[i]) memset(m->DN_conv[i], 0, (size_t)c->dn_conv_dim * (c->dn_convk - 1) * sizeof(float));
+        qt_dn_drop(i);   /* the zeroed host arrays are the state now */
     }
 }
 
@@ -5014,6 +5032,9 @@ int main(int argc, char **argv) {
      * is ever reached — which is exactly how `coli` launches it (SERVE=1, no
      * prompt argument). */
     int serve_mode = getenv("SERVE") && getenv("SERVE")[0]=='1';
+    /* resident DeltaNet state for the CLI (decode blocks keep it on the GPU);
+     * serve sessions swap the state arrays, so they keep the host copy */
+    qt_dn_resident(!serve_mode && !(getenv("QWEN_DN_RESIDENT") && getenv("QWEN_DN_RESIDENT")[0] == '0'));
 
     /* load tokenizer early so text-prompt mode can encode before model_init */
     {

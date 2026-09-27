@@ -347,9 +347,10 @@ static int generate_mtp(Model *m, const int *prompt, int np, int n_new, int *out
             /* drop d: state back to right after a */
             int ndn = 0; for (int i = 0; i < c->n_layers; i++) ndn += !c->is_attn[i];
             if (g_dn_cap_n != ndn) { fprintf(stderr, "[mtp] DeltaNet state capture missed (%d of %d layers)\n", g_dn_cap_n, ndn); exit(1); }
-            for (int i = 0; i < c->n_layers; i++) if (!c->is_attn[i]) {
+            for (int i = 0; i < c->n_layers; i++) if (!c->is_attn[i] && !qt_dn_rollback(i)) {   /* GPU: swap in its capture */
                 memcpy(m->DN_rec[i], cr[i], sizeof(float) * (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim);
                 memcpy(m->DN_conv[i], cg[i], sizeof(float) * (size_t)c->dn_conv_dim * (c->dn_convk - 1));
+                qt_dn_drop(i);
             }
             m->kv_len = len + 1;
             if (m->kvp.len > len + 1) m->kvp.len = len + 1;

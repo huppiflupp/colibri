@@ -1,0 +1,30 @@
+#version 450
+// DeltaNet conv ring carried on the GPU (after dn_conv of the same block has read
+// the old ring): slot kk of a channel holds the input convk-1-kk tokens back, so
+// the new ring is the last convk-1 unconvolved inputs of the block, older slots
+// from the old ring -- the rule of qwen36.c deltanet_phased.  cap >= 0 also writes
+// the ring as it stands after token cap (MTP roll-back).  One invocation per channel;
+// it reads its old slots before writing them, so the update is in place.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer QZ { float qkvz[]; };   // row s at s*pstride, channel cc
+layout(std430, binding = 1) buffer RG { float ring[]; };            // [conv_dim][convk-1], in and out
+layout(std430, binding = 2) writeonly buffer CR { float cring[]; }; // [conv_dim][convk-1]
+layout(push_constant) uniform P { int S, conv_dim, convk, pstride, cap; } p;
+void main() {
+    int cc = int(gl_GlobalInvocationID.x);
+    if (cc >= p.conv_dim) return;
+    int km = p.convk - 1;
+    float old[16];
+    for (int kk = 0; kk < km; kk++) old[kk] = ring[cc * km + kk];
+    if (p.cap >= 0) {
+        int S1 = p.cap + 1;
+        for (int kk = 0; kk < km; kk++) {
+            int src = S1 - km + kk;
+            cring[cc * km + kk] = src >= 0 ? qkvz[src * p.pstride + cc] : old[src + km];
+        }
+    }
+    for (int kk = 0; kk < km; kk++) {
+        int src = p.S - km + kk;
+        ring[cc * km + kk] = src >= 0 ? qkvz[src * p.pstride + cc] : old[src + km];
+    }
+}

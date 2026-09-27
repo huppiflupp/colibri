@@ -1,0 +1,67 @@
+#version 450
+// Merge split-K attention; grid (KV*R, 1, 1), 256 invocations, dimension = tid.
+// Same parameters as attn_dec.comp, R = S*(H/KV), N = KV*nch*R.
+// part: m at 0, l at N, o at 2*N, all offsets in floats; o is unnormalised.
+// The caller must insert a compute-write -> compute-read buffer barrier between
+// passes. Buffers must not alias; all element offsets must fit signed 32-bit int.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer I  { float part[]; }; // m | l | o
+layout(std430, binding = 1) writeonly buffer O { float ctx[]; };  // [S][H][hd]
+
+layout(push_constant) uniform P { int S, H, KV, hd, pos_base, ldt, nch, chunk; float scale; } p;
+
+shared float red[256], sw[256];                   // reduction scratch and chunk weights: 2048 bytes
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x), row = int(gl_WorkGroupID.x);
+    int qpk = p.H / p.KV, R = p.S * qpk;
+    int g = row / R, r = row % R, N = p.KV * p.nch * R;
+    float m = -1.0 / 0.0;
+    for (int c = tid; c < p.nch; c += 256) {
+        int ix = (g * p.nch + c) * R + r;
+        if (part[N + ix] > 0.0) m = max(m, part[ix]);
+    }
+    red[tid] = m;
+    barrier();
+    for (int step = 128; step > 0; step >>= 1) {
+        if (tid < step) red[tid] = max(red[tid], red[tid + step]);
+        barrier();
+    }
+    float M = red[0];
+    barrier();                                    // all invocations captured M before scratch reuse
+
+    float num = 0.0, den = 0.0;
+    for (int c0 = 0; c0 < p.nch; c0 += 256) {
+        int nc = min(256, p.nch - c0), c = c0 + tid;
+        float w = 0.0;
+        if (tid < nc) {
+            int ix = (g * p.nch + c) * R + r;
+            float l = part[N + ix];
+            // Empty chunks never evaluate exp(-inf - -inf), even if all are empty.
+            if (l > 0.0) { w = exp(part[ix] - M); den += l * w; }
+        }
+        sw[tid] = w;
+        barrier();
+        if (tid < p.hd) {
+            for (int j = 0; j < nc; j++) {
+                float weight = sw[j];
+                if (weight > 0.0) {
+                    int ix = (g * p.nch + c0 + j) * R + r;
+                    num += part[2 * N + ix * p.hd + tid] * weight;
+                }
+            }
+        }
+        barrier();                                // all dimensions consumed this weight tile
+    }
+    red[tid] = den;
+    barrier();
+    for (int step = 128; step > 0; step >>= 1) {
+        if (tid < step) red[tid] += red[tid + step];
+        barrier();
+    }
+    if (tid < p.hd) {
+        int s = r / qpk, h = g * qpk + r % qpk;
+        ctx[(s * p.H + h) * p.hd + tid] = red[0] > 0.0 ? num / red[0] : 0.0;
+    }
+}

@@ -150,14 +150,20 @@ void qt_note_n(int layer, int eid, const uint8_t *g4, const uint8_t *u4, const u
 int qt_trunk_min_s(void);
 int qt_attn_block(int hq, int hk, int hv, int ho, const float *x, const float *qn, const float *kn,
                   float *Kc, float *Vc, int ldt, int S, int D, int H, int KV, int hd, int qdim,
-                  int rotary, int pos_base, float eps, float theta, float scale, float *out);
+                  int rotary, int pos_base, float eps, float theta, float scale, float *out, int layer);
+int qt_attn_dec_ready(void);
+void qt_kv_cut(int layer, int from);
 int qt_issue_batch_reduce_sh(int layer,const int *eids,int S,int K,const float *x,
                              const float *weights,int hg,int hu,int hd,const float *sgate,
                              float *res,uint8_t *done);
 int qt_dn_block(int layer, int hout, const float *x, const float *ba, const float *wb, const float *wa, const float *convw,
                 const float *par, const float *normw, float *ring, float *state,
                 int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
-                float eps, float qscale, float *y);
+                float eps, float qscale, float *y, int cap);
+int qt_dn_resident(int on);
+int qt_dn_sync(int layer);
+void qt_dn_drop(int layer);
+int qt_dn_rollback(int layer);
 float *qt_dn_stage(int which, size_t bytes);
 float *qt_host_arena(int slot, size_t bytes);
 int qt_block_post(float *x, float *n, const float *w, float eps, int hr, float *logits, int E);
@@ -222,9 +228,15 @@ static inline int qt_batch_gpu_reduce(void){return 0;}
 static inline int qt_issue_batch_reduce(int a,const int*b,int c,int d,const float*e,const float*f,float*g,uint8_t*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
 static inline void qt_note_n(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h,uint32_t n){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)n;}
 static inline int qt_trunk_min_s(void){return 1;}
-static inline int qt_attn_block(int a,int b,int c,int d,const float*e,const float*f,const float*g,float*h,float*i,int j,int k,int l,int m,int n,int o,int q,int r,int t,float u,float v,float w,float*y){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)q;(void)r;(void)t;(void)u;(void)v;(void)w;(void)y;return 0;}
+static inline int qt_attn_block(int a,int b,int c,int d,const float*e,const float*f,const float*g,float*h,float*i,int j,int k,int l,int m,int n,int o,int q,int r,int t,float u,float v,float w,float*y,int ly){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)q;(void)r;(void)t;(void)u;(void)v;(void)w;(void)y;(void)ly;return 0;}
+static inline int qt_attn_dec_ready(void){return 0;}
+static inline void qt_kv_cut(int l,int f){(void)l;(void)f;}
 static inline int qt_issue_batch_reduce_sh(int a,const int*b,int c,int d,const float*e,const float*f,int g,int h,int i,const float*j,float*k,uint8_t*l){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;return 0;}
-static inline int qt_dn_block(int a,int b,const float*c,const float*d,const float*wb_,const float*wa_,const float*e,const float*f,const float*g,float*h,float*i,int j,int k,int l,int m,int n,int o,int q,int r,float t,float u,float*v){(void)a;(void)b;(void)c;(void)d;(void)wb_;(void)wa_;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)q;(void)r;(void)t;(void)u;(void)v;return 0;}
+static inline int qt_dn_block(int a,int b,const float*c,const float*d,const float*wb_,const float*wa_,const float*e,const float*f,const float*g,float*h,float*i,int j,int k,int l,int m,int n,int o,int q,int r,float t,float u,float*v,int cap_){(void)a;(void)b;(void)c;(void)d;(void)wb_;(void)wa_;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)q;(void)r;(void)t;(void)u;(void)v;(void)cap_;return 0;}
+static inline int qt_dn_resident(int on){(void)on;return 0;}
+static inline int qt_dn_sync(int l){(void)l;return 0;}
+static inline void qt_dn_drop(int l){(void)l;}
+static inline int qt_dn_rollback(int l){(void)l;return 0;}
 static inline float *qt_dn_stage(int a,size_t b){(void)a;(void)b;return 0;}
 static inline float *qt_host_arena(int a,size_t b){(void)a;(void)b;return 0;}
 static inline int qt_block_post(float *a,float *b,const float *c,float d,int e,float *f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}

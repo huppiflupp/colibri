@@ -27,7 +27,8 @@ layout(std430, binding = 3) writeonly buffer Y { float y[]; };
 #ifdef GATE_UP
 layout(std430, binding = 4) readonly buffer OR { int order[]; };    // kgat > 0: token row = order[j] / kgat
 #endif
-layout(push_constant) uniform P { int I, O; float limit; int kgat; int ibase; } p;
+// rpw > 0: output rows per work item chosen by the host (small O: more, shorter items)
+layout(push_constant) uniform P { int I, O; float limit; int kgat; int ibase; int rpw; } p;
 
 #ifndef RPW
 #ifdef GATE_UP
@@ -36,7 +37,10 @@ layout(push_constant) uniform P { int I, O; float limit; int kgat; int ibase; } 
 #define RPW 64u                                // down: short rows (I = 512), more of them per workgroup
 #endif
 #endif
-shared vec4 xsh[2048];                         // I <= 8192
+#ifndef XSHN
+#define XSHN 2048
+#endif
+shared vec4 xsh[XSHN];                         // I <= 4 * XSHN (default 8192)
 
 float i8(uint w, uint k) { return float(int(w << (24u - 8u * k)) >> 24); }
 // dot of one int4 word (8 nibbles, value = n - 8) with 8 inputs
@@ -109,10 +113,15 @@ void main() {
     barrier();
     uint lane = gl_SubgroupInvocationID, nl = gl_SubgroupSize, sg = gl_SubgroupID, nsg = gl_NumSubgroups;
     uint W4 = fmt == 1 ? I / 16u : I / 32u;            // uvec4 per row
+#ifdef LPRMAX
+    uint lpr = min(min(nl, W4), LPRMAX), rg = nl / lpr;   // fewer lanes per row: several words each
+#else
     uint lpr = min(nl, W4), rg = nl / lpr;             // lanes per row, rows side by side
+#endif
     uint rr = lane / lpr, jj = lane % lpr;
     uint ng = (I + uint(gs) - 1u) / uint(max(gs, 1));
-    uint rows_sg = (RPW + nsg - 1u) / nsg;             // rows this subgroup owns
+    uint RW = p.rpw > 0 ? uint(p.rpw) : RPW;
+    uint rows_sg = (RW + nsg - 1u) / nsg;              // rows this subgroup owns
     for (uint base = 0u; base < rows_sg; base += RPS * rg) {
         float ag[RPS], au[RPS];
         [[unroll]] for (uint t = 0u; t < RPS; t++) { ag[t] = 0.0; au[t] = 0.0; }
@@ -123,7 +132,7 @@ void main() {
 #endif
             [[unroll]] for (uint t = 0u; t < RPS; t++) {      // all loads first: RPS in flight
                 uint q = sg * rows_sg + base + t * rg + rr, o = o0 + q;
-                bool ok = base + t * rg + rr < rows_sg && q < RPW && o < uint(p.O);
+                bool ok = base + t * rg + rr < rows_sg && q < RW && o < uint(p.O);
                 vg[t] = ok ? wg.v[o * rowWords / 4u + j] : uvec4(0u);
 #ifdef GATE_UP
                 vu[t] = ok ? wu.v[o * rowWords / 4u + j] : uvec4(0u);
@@ -157,7 +166,7 @@ void main() {
         }
         [[unroll]] for (uint t = 0u; t < RPS; t++) {
             uint q = sg * rows_sg + base + t * rg + rr, o = o0 + q;
-            bool ok = base + t * rg + rr < rows_sg && q < RPW && o < uint(p.O);
+            bool ok = base + t * rg + rr < rows_sg && q < RW && o < uint(p.O);
             float g = red(ag[t], lpr);
             if (ok && fmt != 4) g *= gsc.v[o];
 #ifdef GATE_UP
@@ -200,10 +209,15 @@ void main() {
     uint lane = gl_SubgroupInvocationID, nl = gl_SubgroupSize, sg = gl_SubgroupID, nsg = gl_NumSubgroups;
     uint W4 = fmt == 1 ? I / 16u : I / 32u;            // uvec4 per row
     uint XW = fmt == 1 ? 4u : 8u;                      // xsh vec4 per uvec4 of weights
+#ifdef LPRMAX
+    uint lpr = min(min(nl, W4), LPRMAX), rg = nl / lpr;   // fewer lanes per row: several words each
+#else
     uint lpr = min(nl, W4), rg = nl / lpr;             // lanes per row, rows side by side
+#endif
     uint rr = lane / lpr, jj = lane % lpr;
     uint ng = (I + uint(gs) - 1u) / uint(max(gs, 1));
-    uint rows_sg = (RPW + nsg - 1u) / nsg;             // rows this subgroup owns
+    uint RW = p.rpw > 0 ? uint(p.rpw) : RPW;
+    uint rows_sg = (RW + nsg - 1u) / nsg;              // rows this subgroup owns
     for (uint base = 0u; base < rows_sg; base += RPS * rg) {
         float ag[RPS * MAXNR], au[RPS * MAXNR];
         [[unroll]] for (uint t = 0u; t < RPS * MAXNR; t++) { ag[t] = 0.0; au[t] = 0.0; }
@@ -214,7 +228,7 @@ void main() {
 #endif
             [[unroll]] for (uint t = 0u; t < RPS; t++) {      // all loads first: RPS in flight
                 uint q = sg * rows_sg + base + t * rg + rr, o = o0 + q;
-                bool ok = base + t * rg + rr < rows_sg && q < RPW && o < uint(p.O);
+                bool ok = base + t * rg + rr < rows_sg && q < RW && o < uint(p.O);
                 vg[t] = ok ? wg.v[o * rowWords / 4u + j] : uvec4(0u);
 #ifdef GATE_UP
                 vu[t] = ok ? wu.v[o * rowWords / 4u + j] : uvec4(0u);
@@ -251,7 +265,7 @@ void main() {
         }
         [[unroll]] for (uint t = 0u; t < RPS; t++) {
             uint q = sg * rows_sg + base + t * rg + rr, o = o0 + q;
-            bool ok = base + t * rg + rr < rows_sg && q < RPW && o < uint(p.O);
+            bool ok = base + t * rg + rr < rows_sg && q < RW && o < uint(p.O);
             [[unroll]] for (uint k = 0u; k < MAXNR; k++) if (k < nr) {
                 float g = red(ag[t * MAXNR + k], lpr);
                 if (ok && fmt != 4) g *= gsc.v[o];

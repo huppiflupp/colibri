@@ -1,0 +1,121 @@
+#version 450
+// Split-K causal GQA attention, f32; grid (nch, KV, 1), 256 invocations.
+// Row r = (token r/qpk, head g*qpk + r%qpk), qpk = H/KV, R = S*qpk.
+// Q is unscaled. K/V rows are at (g*ldt + t)*hd; T = pos_base + S.
+// part holds m[N], l[N], o[N][hd], N = KV*nch*R (offsets in floats).
+// Assumes 1 <= S <= 4, 1 <= hd <= 256, R <= 32, H divisible by KV,
+// pos_base >= 0, ldt >= T, chunk > 0, nch = ceil(T/chunk), finite scores.
+#extension GL_EXT_control_flow_attributes : enable
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Q  { float q[]; };     // [S][H][hd]
+layout(std430, binding = 1) readonly buffer KB { float kc[]; };    // [KV][ldt][hd]
+layout(std430, binding = 2) readonly buffer VB { float vc[]; };    // [KV][ldt][hd]
+layout(std430, binding = 3) writeonly buffer O { float part[]; };  // m | l | o
+
+layout(push_constant) uniform P { int S, H, KV, hd, pos_base, ldt, nch, chunk; float scale; } p;
+
+#define MAXR 32
+#define MAXD 256
+#define BC 64
+#define BD 64
+#define NS (MAXR * BC / 256)
+
+// K is staged in dimension tiles: a full 64x256 f32 block would exceed LDS.
+// Transpose K for consecutive keys across lanes; padding avoids store conflicts.
+// Shared memory: (8192 + 4160 + 2048 + 96) floats = 57984 bytes.
+shared float sq[MAXR * MAXD];
+shared float sk[BD * (BC + 1)];
+shared float sp[MAXR * BC];                       // scores, then exp(score - m)
+shared float sm[MAXR], sl[MAXR], sa[MAXR];         // running max, sum, correction
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int c = int(gl_WorkGroupID.x), g = int(gl_WorkGroupID.y);
+    int qpk = p.H / p.KV, R = p.S * qpk;
+    int N = p.KV * p.nch * R;
+    int first = c * p.chunk, end = min(first + p.chunk, p.pos_base + p.S);
+
+    for (int e = tid; e < R * p.hd; e += 256) {
+        int r = e / p.hd, d = e % p.hd;
+        int s = r / qpk, h = g * qpk + r % qpk;
+        sq[r * MAXD + d] = q[(s * p.H + h) * p.hd + d];
+    }
+    if (tid < R) { sm[tid] = -1.0 / 0.0; sl[tid] = 0.0; }
+    float acc[MAXR];
+    [[unroll]] for (int r = 0; r < MAXR; r++) acc[r] = 0.0;
+    barrier();
+
+    for (int k0 = first; k0 < end; k0 += BC) {
+        int nk = min(BC, end - k0);
+        float sc[NS];
+        [[unroll]] for (int i = 0; i < NS; i++) sc[i] = 0.0;
+
+        for (int d0 = 0; d0 < p.hd; d0 += BD) {
+            int nd = min(BD, p.hd - d0);
+            for (int e = tid; e < nk * BD; e += 256) {
+                int j = e / BD, d = e % BD;
+                sk[d * (BC + 1) + j] = d < nd ? kc[(g * p.ldt + k0 + j) * p.hd + d0 + d] : 0.0;
+            }
+            barrier();
+            // Each invocation owns up to eight (row, key) scalar products.
+            [[unroll]] for (int i = 0; i < NS; i++) {
+                int e = tid + i * 256, r = e / BC, j = e % BC;
+                if (r < R && j < nk && k0 + j <= p.pos_base + r / qpk) {
+                    for (int d = 0; d < nd; d++)
+                        sc[i] += sq[r * MAXD + d0 + d] * sk[d * (BC + 1) + j];
+                }
+            }
+            barrier();                            // all readers finished with this K tile
+        }
+        [[unroll]] for (int i = 0; i < NS; i++) {
+            int e = tid + i * 256, r = e / BC, j = e % BC;
+            if (r < R)
+                sp[e] = j < nk && k0 + j <= p.pos_base + r / qpk ? sc[i] * p.scale : -1.0 / 0.0;
+        }
+        barrier();
+
+        // One invocation per row updates the online softmax and its 64 weights.
+        if (tid < R) {
+            int r = tid, nv = clamp(p.pos_base + r / qpk - k0 + 1, 0, nk);
+            float corr = 1.0;
+            if (nv > 0) {
+                float bm = -1.0 / 0.0;
+                for (int j = 0; j < nv; j++) bm = max(bm, sp[r * BC + j]);
+                float mn = max(sm[r], bm);
+                corr = sl[r] > 0.0 ? exp(sm[r] - mn) : 0.0;
+                float sum = 0.0;
+                for (int j = 0; j < BC; j++) {
+                    float w = 0.0;
+                    if (j < nv) w = exp(sp[r * BC + j] - mn);
+                    sp[r * BC + j] = w;
+                    sum += w;
+                }
+                sm[r] = mn;
+                sl[r] = sl[r] * corr + sum;
+            } else {
+                for (int j = 0; j < BC; j++) sp[r * BC + j] = 0.0;
+            }
+            sa[r] = corr;
+        }
+        barrier();
+
+        // Dimension tid owns all row accumulators; reuse each global V load.
+        if (tid < p.hd) {
+            [[unroll]] for (int r = 0; r < MAXR; r++)
+                if (r < R) acc[r] *= sa[r];
+            for (int j = 0; j < nk; j++) {
+                float v = vc[(g * p.ldt + k0 + j) * p.hd + tid];
+                [[unroll]] for (int r = 0; r < MAXR; r++)
+                    if (r < R) acc[r] += sp[r * BC + j] * v;
+            }
+        }
+        barrier();                                // weights consumed before the next block
+    }
+
+    int base = (g * p.nch + c) * R;
+    if (tid < R) { part[base + tid] = sm[tid]; part[N + base + tid] = sl[tid]; }
+    if (tid < p.hd)
+        [[unroll]] for (int r = 0; r < MAXR; r++)
+            if (r < R) part[2 * N + (base + r) * p.hd + tid] = acc[r];
+}
