@@ -938,6 +938,15 @@ int qt_attn_prefill(float *ctx, const float *q, const float *K, const float *V, 
     return 0;
 #endif
 }
+/* Host arena of the Vulkan backend (slot 0..3): prefill rows kept there are bound
+ * by the blocks and the expert group directly, without their staging copies. */
+float *qt_host_arena(int slot, size_t bytes){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_available() ? coli_vk_host_arena(slot, bytes) : NULL;
+#else
+    (void)slot; (void)bytes; return NULL;
+#endif
+}
 /* DeltaNet prefill recurrence on the GPU (Vulkan only): staging buffers the engine
  * fills in place (which 0..4 = qn, kn, v, beta, exp(g)), then one call. */
 float *qt_dn_stage(int which, size_t bytes){

@@ -59,6 +59,9 @@ int  coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, co
                       float eps, float qscale, float *y);
 /* DeltaNet gated delta rule over a prefill block (see backend_vulkan.c); 0 -> CPU path. */
 float *coli_vk_dn_stage(int which, size_t bytes);
+/* persistent host-visible, host-cached buffer (slot 0..3) the prefill keeps its rows in;
+ * blocks/groups called with exactly this pointer bind it instead of copying */
+float *coli_vk_host_arena(int slot, size_t bytes);
 int  coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn,
                       const float *vsrc, int vstride, int voff, const float *beta, const float *gexp,
                       int S, int vh, int vk, int kdim, int vdim);

@@ -3440,7 +3440,18 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
                                  int allow_prefetch, FILE *lf) {
     Cfg *c = &m->c;
     int D = c->hidden;
-    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    /* a prefill block on the GPU keeps its normed rows and sublayer outputs in the
+     * Vulkan host arena: the blocks, the router and the expert group bind them
+     * directly instead of copying through their staging buffers
+     * (QWEN_HOST_ARENA=0 keeps plain allocations) */
+    float *nrm = NULL, *tmp = NULL;
+    int arena = S >= qt_trunk_min_s() && qt_batch_ok() && !(getenv("QWEN_HOST_ARENA") && getenv("QWEN_HOST_ARENA")[0] == '0');
+    if (arena) {
+        nrm = qt_host_arena(0, sizeof(float) * (size_t)S * D);
+        tmp = qt_host_arena(1, sizeof(float) * (size_t)S * D);
+        if (!nrm || !tmp) arena = 0;
+    }
+    if (!arena) { nrm = falloc((int64_t)S*D); tmp = falloc((int64_t)S*D); }
     /* prefill blocks fuse each residual add with the RMSNorm that follows it
      * (post_ln after the mixer, the next layer's in_ln after the MoE): one
      * parallel pass per token row instead of two, same operations per element.
@@ -3526,7 +3537,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         if (allow_prefetch && g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
             pilot_prefetch(m, i + 3, x, S);
     }
-    free(nrm); free(tmp);
+    if (!arena) { free(nrm); free(tmp); }
 }
 
 /* Fotografia dello stato dopo un prefill "pinnato" (SUBMIT pin=1).

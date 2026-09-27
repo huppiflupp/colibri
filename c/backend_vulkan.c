@@ -164,6 +164,7 @@ static struct {
     VkPipelineLayout ep_layout[2]; VkPipeline ep_pipe[2];
     VkDescriptorPool ep_pool[2]; VkDescriptorSet ep_set[2];
     int eg_reduced;
+    VkBuffer ep_xa, ep_ya;      /* host-arena input/output of the current prefill group (or 0) */
     /* q-prep chain (pair -> rmsnorm -> q_b in ONE submit): norm pipeline (3 bindings),
      * a 3rd matmul set + norm set, GPU-only latent intermediates, per-layer resident
      * norm-weight buffers (tiny, uploaded once like the KV mirror). */
@@ -204,7 +205,7 @@ static struct PCGU pcgu(int fmt, int S, int I, int O, int rowWords, int gs) {
     return (struct PCGU){fmt, S, I, O, rowWords, gs, g_swiglu_limit, 0};
 }
 struct PCEP { int S, D, K, rows; };
-typedef struct { int S, K; const int *order; const float *weights; } ExpertPrefill;
+typedef struct { int S, K; const int *order; const float *weights; float *y; } ExpertPrefill;
 struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
@@ -477,6 +478,23 @@ static void ts_report(void) {
  * on: the fence orders execution, the barrier makes the writes available to a
  * HOST read (Khronos synchronization example "CPU read-back of data written by a
  * compute shader"). HOST_COHERENT spares the invalidate, not this dependency. */
+/* Host arena: persistent host-visible, HOST_CACHED buffers the engine can keep its
+ * prefill rows in (normed input, sublayer output). A block or group called with
+ * exactly such a pointer binds the buffer itself instead of copying through its
+ * own staging (UMA: the copies were ~1.5 ms per layer at 1011 tokens). Cached,
+ * because the CPU reads these rows (residual add, norms) -- reads from the
+ * write-combined staging type cost ~250 ns each. */
+#define ARENA_N 4
+static Scratch g_arena[ARENA_N];
+float *coli_vk_host_arena(int slot, size_t bytes) {
+    if (!G.ready || slot < 0 || slot >= ARENA_N || !scratch_reserve_mt(&g_arena[slot], bytes, G.memtype_cached)) return NULL;
+    return (float *)g_arena[slot].ptr;
+}
+static VkBuffer arena_buf(const void *p, size_t n) {
+    for (int i = 0; i < ARENA_N; i++)
+        if (g_arena[i].buf && p == g_arena[i].ptr && n <= g_arena[i].cap) return g_arena[i].buf;
+    return VK_NULL_HANDLE;
+}
 static void host_read_barrier(VkCommandBuffer cb) {
     VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
@@ -1290,16 +1308,17 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     VkBuffer old_x = G.x.buf, old_y = G.y.buf;
     if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb, G.memtype_cached)) return 0;  /* y read back */
-    memcpy(G.x.ptr, x, xb);
+    VkBuffer xin = arena_buf(x, xb);                 /* host arena: bound as is, no copy */
+    if (!xin) { memcpy(G.x.ptr, x, xb); xin = G.x.buf; }
     if (G.eg_prof) { tA = vk_now(); p_x += tA - t0; t0 = tA; }
 
     /* Rebind descriptors only when the tensor or a scratch buffer changed (a realloc
      * makes the old VkBuffer handle stale); otherwise the previous binding is still valid. */
     int rebind = G.bound_tensor != t || G.x.buf != old_x || G.y.buf != old_y
-              || G.bound_xbuf != G.x.buf || G.bound_ybuf != G.y.buf;
+              || G.bound_xbuf != xin || G.bound_ybuf != G.y.buf;
     if (rebind) {
         VkDescriptorBufferInfo bi[4] = {
-            {.buffer = G.x.buf, .range = VK_WHOLE_SIZE},
+            {.buffer = xin, .range = VK_WHOLE_SIZE},
             {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
             {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
             {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
@@ -1309,7 +1328,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
             .dstBinding = i, .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
         vkUpdateDescriptorSets(G.dev, 4, w, 0, NULL);
-        G.bound_tensor = t; G.bound_xbuf = G.x.buf; G.bound_ybuf = G.y.buf;
+        G.bound_tensor = t; G.bound_xbuf = xin; G.bound_ybuf = G.y.buf;
     }
     if (G.eg_prof) { tA = vk_now(); p_desc += tA - t0; t0 = tA; }
 
@@ -1534,7 +1553,11 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
         !scratch_reserve(&G.db_bg, nbg) || !scratch_reserve_mt(&G.dr_s, nst, G.memtype_cached) ||
         !scratch_reserve(&G.dr_o, nov) || !scratch_reserve(&G.db_nw, nnw) || !scratch_reserve(&G.db_or, nov) ||
         !scratch_reserve_mt(&G.db_y, nx, G.memtype_cached)) return 0;
-    memcpy(G.db_x.ptr, x, nx); memcpy(G.db_ba.ptr, ba, nba); memcpy(G.db_par.ptr, par, npar);
+    /* the input stays a copy: bound from the (host-cached) arena, the projection
+     * re-reading x once per output block ran 121 -> 209 ms (30 layers, 1011 tokens) */
+    VkBuffer xa = getenv("COLI_VK_DN_ARENA_X") ? arena_buf(x, nx) : VK_NULL_HANDLE, ya = arena_buf(y, nx);
+    if (!xa) memcpy(G.db_x.ptr, x, nx);
+    memcpy(G.db_ba.ptr, ba, nba); memcpy(G.db_par.ptr, par, npar);
     memcpy(G.db_cw.ptr, convw, ncw); memcpy(G.db_ring.ptr, ring, nring); memcpy(G.dr_s.ptr, state, nst);
     memcpy(G.db_nw.ptr, normw, nnw);
     VkCommandBuffer cb = G.cmd;
@@ -1543,7 +1566,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     VKCHECK(vkBeginCommandBuffer(cb, &begin), "beginCmd");
     ts_begin(cb, TS_SLOT_CMD); ts_stage0(cb);
     /* 1. qkv|z = x Wp^T */
-    rec_mm(cb, G.db_mm[0], proj, G.db_x.buf, G.db_qz.buf, S);
+    rec_mm(cb, G.db_mm[0], proj, xa ? xa : G.db_x.buf, G.db_qz.buf, S);
     cc_barrier(cb); ts_stage(cb, 0);
     /* 2. conv + SiLU */
     { VkDescriptorBufferInfo bi[4] = {{G.db_qz.buf, 0, VK_WHOLE_SIZE}, {G.db_cw.buf, 0, VK_WHOLE_SIZE},
@@ -1589,7 +1612,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
       vkCmdDispatch(cb, (uint32_t)((S + 7) / 8), (uint32_t)vh, 1); }
     cc_barrier(cb); ts_stage(cb, 4);
     /* 6. out_proj */
-    rec_mm(cb, G.db_mm[1], outp, G.db_or.buf, G.db_y.buf, S); ts_stage(cb, 5);
+    rec_mm(cb, G.db_mm[1], outp, G.db_or.buf, ya ? ya : G.db_y.buf, S); ts_stage(cb, 5);
     host_read_barrier(cb);
     ts_end(cb, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(cb), "endCmd");
@@ -1599,7 +1622,7 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence), "queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     ts_read(TS_SLOT_CMD, TS_DNBLOCK, vk_now() - th0); ts_stage_read(TSB_DN, 6);
-    memcpy(y, G.db_y.ptr, nx);
+    if (!ya) memcpy(y, G.db_y.ptr, nx);
     memcpy(state, G.dr_s.ptr, nst);
     /* new ring: the last convk-1 unconvolved qkv inputs (older ones from the old ring) */
     /* (the last km rows of db_qz are copied out in one piece first: scattered
@@ -1666,7 +1689,8 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
         !scratch_reserve(&G.ab_qb, nqb) || !scratch_reserve(&G.ab_gb, nqb) ||
         !scratch_reserve_mt(&G.ab_k, nkc, G.memtype_cached) || !scratch_reserve_mt(&G.ab_v, nkc, G.memtype_cached) ||
         !scratch_reserve(&G.ab_cx, nqb) || !scratch_reserve(&G.ab_ag, nqb) || !scratch_reserve_mt(&G.ab_y, nx, G.memtype_cached)) return 0;
-    memcpy(G.ab_x.ptr, x, nx);
+    VkBuffer xa = arena_buf(x, nx), ya = arena_buf(out, nx);
+    if (!xa) memcpy(G.ab_x.ptr, x, nx);
     float *nw = (float *)G.ab_nw.ptr;
     for (int d = 0; d < hd; d++) { nw[d] = qn ? qn[d] : 0.f; nw[hd + d] = kn ? kn[d] : 0.f; }
     for (int g = 0; g < KV && pos_base > 0; g++) {   /* cached prefix keys/values */
@@ -1681,11 +1705,11 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
     /* 1. q | k | v projections into one buffer */
     /* one after the other: run concurrently (no barrier) the three measured
      * 74 ms over 10 layers, serialised 56 ms (the small k/v tiles compete with q's) */
-    rec_mm_off(cb, G.ab_mm[0], tq, G.ab_x.buf, G.ab_qkv.buf, 0, S);
+    rec_mm_off(cb, G.ab_mm[0], tq, xa ? xa : G.ab_x.buf, G.ab_qkv.buf, 0, S);
     cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 0);
-    rec_mm_off(cb, G.ab_mm[1], tk, G.ab_x.buf, G.ab_qkv.buf, nq, S);
+    rec_mm_off(cb, G.ab_mm[1], tk, xa ? xa : G.ab_x.buf, G.ab_qkv.buf, nq, S);
     cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 1);
-    rec_mm_off(cb, G.ab_mm[2], tv, G.ab_x.buf, G.ab_qkv.buf, nq + nk, S);
+    rec_mm_off(cb, G.ab_mm[2], tv, xa ? xa : G.ab_x.buf, G.ab_qkv.buf, nq + nk, S);
     cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 2);
     /* 2. split, norm, RoPE, cache rows */
     { VkDescriptorBufferInfo bi[6] = {{G.ab_qkv.buf, 0, VK_WHOLE_SIZE}, {G.ab_nw.buf, 0, VK_WHOLE_SIZE},
@@ -1722,7 +1746,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
       vkCmdDispatch(cb, (uint32_t)((n + 255) / 256), 1, 1); }
     cc_barrier(cb); ts_stageb(cb, TSB_ATTN, 5);
     /* 5. o_proj */
-    rec_mm(cb, G.ab_mm[3], to, G.ab_ag.buf, G.ab_y.buf, S); ts_stageb(cb, TSB_ATTN, 6);
+    rec_mm(cb, G.ab_mm[3], to, G.ab_ag.buf, ya ? ya : G.ab_y.buf, S); ts_stageb(cb, TSB_ATTN, 6);
     host_read_barrier(cb);
     ts_end(cb, TS_SLOT_CMD);
     VKCHECK(vkEndCommandBuffer(cb), "endCmd");
@@ -1732,7 +1756,7 @@ int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Col
     VKCHECK(vk_submit(G.queue, &si, G.fence), "queueSubmit");
     if (vk_fence_wait(G.dev, G.fence) != VK_SUCCESS) { G.ready = 0; return 0; }
     ts_read(TS_SLOT_CMD, TS_ATTN, vk_now() - th0); ts_stage_read(TSB_ATTN, 7);
-    memcpy(out, G.ab_y.ptr, nx);
+    if (!ya) memcpy(out, G.ab_y.ptr, nx);
     for (int g = 0; g < KV; g++) {   /* new rows back into the host caches (decode reads them) */
         memcpy(Kc + ((size_t)g * ldt + pos_base) * hd, (char *)G.ab_k.ptr + ((size_t)g * nt + pos_base) * hd * f, (size_t)S * hd * f);
         memcpy(Vc + ((size_t)g * ldt + pos_base) * hd, (char *)G.ab_v.ptr + ((size_t)g * nt + pos_base) * hd * f, (size_t)S * hd * f);
@@ -1868,10 +1892,11 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
     G.eg_prof = getenv("VK_PROF") != NULL;
     if (G.eg_prof) { G.eg_t0 = vk_now(); G.eg_tin = t_in; }
     if (ep) {
-        memcpy(G.ep_x.ptr, x, (size_t)ep->S*D*4);
+        G.ep_xa = arena_buf(x, (size_t)ep->S*D*4); G.ep_ya = arena_buf(ep->y, (size_t)ep->S*D*4);
+        if (!G.ep_xa) memcpy(G.ep_x.ptr, x, (size_t)ep->S*D*4);
         memcpy(G.ep_order.ptr, ep->order, (size_t)total*4);
         memcpy(G.ep_weights.ptr, ep->weights, (size_t)ep->S*ep->K*4);
-    } else memcpy(G.eg_x.ptr, x, xb);
+    } else { G.ep_xa = G.ep_ya = VK_NULL_HANDLE; memcpy(G.eg_x.ptr, x, xb); }
     if (G.eg_prof) G.eg_t1 = vk_now();
 
     if (G.eg_nsets < count) {
@@ -1890,11 +1915,11 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         G.eg_nsets = n;
     }
     if (ep) {
-        VkDescriptorBufferInfo gi[3] = {{G.ep_x.buf, 0, (size_t)ep->S*D*4},
+        VkDescriptorBufferInfo gi[3] = {{G.ep_xa ? G.ep_xa : G.ep_x.buf, 0, (size_t)ep->S*D*4},
             {G.ep_order.buf, 0, (size_t)total*4}, {G.eg_x.buf, 0, xb}};
         VkDescriptorBufferInfo ri[4] = {{G.eg_y.buf, 0, yb},
             {G.ep_inverse.buf, 0, (size_t)ep->S*ep->K*4},
-            {G.ep_weights.buf, 0, (size_t)ep->S*ep->K*4}, {G.ep_y.buf, 0, (size_t)ep->S*D*4}};
+            {G.ep_weights.buf, 0, (size_t)ep->S*ep->K*4}, {G.ep_ya ? G.ep_ya : G.ep_y.buf, 0, (size_t)ep->S*D*4}};
         wr_desc(G.ep_set[0], 3, gi); wr_desc(G.ep_set[1], 4, ri);
     }
     for (int c = 0; c < count; c++) {
@@ -1978,7 +2003,7 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         G.grp_n[0] = nbig[0]; G.grp_n[1] = nbig[1]; G.grp_ns[0] = nsm[0]; G.grp_ns[1] = nsm[1];
     }
     if (grp) {
-        VkBuffer xin[2] = {G.eg_h.buf, ggat ? G.ep_x.buf : G.eg_x.buf}, yout[2] = {G.eg_y.buf, G.eg_h.buf};
+        VkBuffer xin[2] = {G.eg_h.buf, ggat ? (G.ep_xa ? G.ep_xa : G.ep_x.buf) : G.eg_x.buf}, yout[2] = {G.eg_y.buf, G.eg_h.buf};
         for (int step = 0; step < 2; step++) {
             int v = step == 0 ? 1 : 0;       /* gate_up first, then down */
             VkDescriptorBufferInfo bi[5] = {{xin[v], 0, VK_WHOLE_SIZE}, {G.grp_it[v].buf, 0, VK_WHOLE_SIZE},
@@ -2064,7 +2089,7 @@ int coli_vk_expert_prefill(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
                            const int *order, const float *weights, int S, int K,
                            const float *x, float *y) {
     if (G.eg_inflight || !x || !y) return 0;
-    ExpertPrefill ep = {S, K, order, weights};
+    ExpertPrefill ep = {S, K, order, weights, y};
     if (!eg_prepare_submit(gates, ups, downs, rows, count, x, &ep)) return 0;
     return coli_vk_expert_group_take(y);
 }
@@ -2089,7 +2114,7 @@ int coli_vk_expert_group_take(float *y) {
     ts_read(TS_SLOT_EG, TS_EG, vk_now() - G.eg_th0);
     if (G.eg_reduced) ts_stage_read(TSB_EG, 4);
     double t4 = G.eg_prof ? vk_now() : 0;
-    memcpy(y, G.eg_reduced ? G.ep_y.ptr : G.eg_y.ptr, G.eg_pending_yb);
+    if (!(G.eg_reduced && G.ep_ya)) memcpy(y, G.eg_reduced ? G.ep_y.ptr : G.eg_y.ptr, G.eg_pending_yb);
     if (G.eg_prof) {
         double t5 = vk_now();
         fprintf(stderr, "[VK_PROF] pre %.3f | memcpy_x %.3f | desc %.3f | record %.3f | issue->take %.3f | memcpy_y %.3f ms\n",
@@ -2832,6 +2857,8 @@ void coli_vk_shutdown(void) {
     if (G.y.buf) { vkDestroyBuffer(G.dev, G.y.buf, NULL); vkFreeMemory(G.dev, G.y.mem, NULL); }
     if (G.h.buf) { vkDestroyBuffer(G.dev, G.h.buf, NULL); vkFreeMemory(G.dev, G.h.mem, NULL); }
     if (G.eg_x.buf) { vkDestroyBuffer(G.dev, G.eg_x.buf, NULL); vkFreeMemory(G.dev, G.eg_x.mem, NULL); }
+    for (int i = 0; i < ARENA_N; i++)
+        if (g_arena[i].buf) { vkDestroyBuffer(G.dev, g_arena[i].buf, NULL); vkFreeMemory(G.dev, g_arena[i].mem, NULL); g_arena[i] = (Scratch){0}; }
     if (G.eg_h.buf) { vkDestroyBuffer(G.dev, G.eg_h.buf, NULL); vkFreeMemory(G.dev, G.eg_h.mem, NULL); }
     if (G.eg_y.buf) { vkDestroyBuffer(G.dev, G.eg_y.buf, NULL); vkFreeMemory(G.dev, G.eg_y.mem, NULL); }
     if (G.att_sc.buf) { vkDestroyBuffer(G.dev, G.att_sc.buf, NULL); vkFreeMemory(G.dev, G.att_sc.mem, NULL); }
