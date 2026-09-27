@@ -45,7 +45,7 @@ shared uvec4 sg[BO * 8u];              // weights, B tiles COLUMN-major (= W[n][
 #ifdef GATE_UP
 shared uvec4 su[BO * 8u];
 #endif
-shared float spatch[8u * 256u];        // per-subgroup 16x16 patch for partial token tiles
+shared float spatch[4u * 256u];        // per-subgroup 16x16 patch for partial token tiles (4 x wave64)
 
 // Shared memory holds every 16x16 operand tile CONTIGUOUSLY (256 values, loaded
 // with stride 16): strided cooperative-matrix loads out of a wide row-major
