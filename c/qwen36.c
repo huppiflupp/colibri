@@ -2767,7 +2767,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
          * no separate shared-expert round trips. QWEN_SHEXP_FOLD=0 keeps it apart. */
         int fold = reduce && l->qth_shg && l->qth_shu && l->qth_shd && S >= qt_trunk_min_s() &&
                    !(getenv("QWEN_SHEXP_FOLD") && getenv("QWEN_SHEXP_FOLD")[0] == '0');
-        int batch_ok = 0, folded = 0;
+        int batch_ok = 0, folded = 0, direct = 0;
         if (fold && res) {
             float *sg_all = falloc(S);
             #pragma omp parallel for schedule(static)
@@ -2780,9 +2780,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 }
                 sg_all[s] = sgate;
             }
+            /* the folded GPU sum per token IS the layer output when no pair missed:
+             * written straight into out (zeroed above: 0 + v == v), no accumulate */
             batch_ok = folded = qt_issue_batch_reduce_sh(layer, bidx, S, K, x, bval, l->qth_shg - 1,
-                                                         l->qth_shu - 1, l->qth_shd - 1, sg_all, res, done);
+                                                         l->qth_shu - 1, l->qth_shd - 1, sg_all, out, done);
             free(sg_all);
+            if (folded) {
+                int miss = 0;
+                for (int i = 0; i < S * K && !miss; i++) miss = !done[i];
+                if (miss) {   /* CPU pairs first, as before: the GPU sum goes back to res */
+                    memcpy(res, out, sizeof(float) * (size_t)S * D);
+                    memset(out, 0, sizeof(float) * (size_t)S * D);
+                } else direct = 1;
+            } else memset(out, 0, sizeof(float) * (size_t)S * D);
         }
         if (!folded)
             batch_ok = res && (reduce ? qt_issue_batch_reduce(layer, bidx, S, K, x, bval, res, done)
@@ -2828,7 +2838,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
          * region alone should not serialise inner teams (max-active-levels counts
          * active levels only); lost worker reuse under the extra level is the
          * likelier cause. */
-        if (!any_miss && (shb || folded)) {
+        if (direct) { /* out already holds every token's sum */ }
+        else if (!any_miss && (shb || folded)) {
             #pragma omp parallel for schedule(static)
             for (int s = 0; s < S; s++) {
                 const float *xs = x + (int64_t)s*D; float *os = out + (int64_t)s*D;
