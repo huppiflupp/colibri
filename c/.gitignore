@@ -76,3 +76,4 @@ shaders/qmatmul_grp.spv
 shaders/qmatmul_gate_up_grp.spv
 shaders/attn_flash.spv
 shaders/resid_norm.spv
+shaders/dn_ba.spv

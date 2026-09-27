@@ -121,6 +121,9 @@ static struct {
     /* whole DeltaNet block of a prefill (coli_vk_dn_block): conv, prep, gated norm
      * pipelines, two matmul descriptor sets (projection, out_proj) and scratch */
     VkShaderModule shader_dc, shader_dp, shader_dg;
+    /* optional: DeltaNet b|a projections of the block on the GPU (dn_ba.comp) */
+    VkShaderModule shader_dba; VkDescriptorSetLayout dsl_dba; VkPipelineLayout plyt_dba;
+    VkPipeline pipe_dba; VkDescriptorPool dpool_dba; VkDescriptorSet dset_dba; Scratch db_w;
     VkDescriptorSetLayout dsl_dc, dsl_dp, dsl_dg; VkPipelineLayout plyt_dc, plyt_dp, plyt_dg;
     VkPipeline pipe_dc, pipe_dp, pipe_dg; VkDescriptorPool dpool_dc, dpool_dp, dpool_dg, db_pool;
     VkDescriptorSet dset_dc, dset_dp, dset_dg, db_mm[2];
@@ -939,6 +942,10 @@ int coli_vk_init(const char *spv_path) {
             ok = ok && vkAllocateDescriptorSets(G.dev, &ai, G.db_mm) == VK_SUCCESS;
         }
         if (!ok) { G.pipe_dc = G.pipe_dp = G.pipe_dg = VK_NULL_HANDLE; }
+        derive_dir_file(spv_path, "dn_ba.spv", pa, sizeof(pa));
+        if (ok && (G.shader_dba = load_spv(G.dev, pa)) &&
+            !build_pipeline(G.dev, 3, 3 * sizeof(int), G.shader_dba, &G.dsl_dba, &G.plyt_dba, &G.pipe_dba, &G.dpool_dba, &G.dset_dba))
+            G.pipe_dba = VK_NULL_HANDLE;
     }
     if (G.sgsize != 64) fprintf(stderr, "[VK] subgroup size %d != 64: prefill attention/DeltaNet kernels off\n", G.sgsize);
     /* Optional whole-attention-layer kernels (COLI_VK_ATTN_BLOCK=0 turns them off). */
@@ -1572,6 +1579,10 @@ static void post_record(VkCommandBuffer cb, VkBuffer ybuf, int S, int D) {
     G.post.done = 1;
 }
 
+/* DeltaNet b|a on the GPU: coli_vk_dn_block with ba == NULL computes them from
+ * its input rows with these f32 weights (dn_b, dn_a: [vh][H] each). */
+int coli_vk_dn_ba_ready(void) { return G.ready && G.pipe_dba != VK_NULL_HANDLE; }
+
 /* A whole DeltaNet layer of a prefill block in ONE submit, nothing read back in
  * between: qkv|z projection (proj, int8 [proj_dim x H]) -> causal conv + SiLU ->
  * l2norm/beta/exp(g) -> gated delta rule -> gated RMSNorm -> out_proj (outp,
@@ -1579,9 +1590,11 @@ static void post_record(VkCommandBuffer cb, VkBuffer ybuf, int S, int D) {
  * par = A_log | dt_bias. ring (conv_dim x (convk-1)) and state (vh x kdim x vdim)
  * are read and written back; y = [S][H]. 0 -> caller's path. */
 int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, const float *ba,
+                     const float *wb, const float *wa,
                      const float *convw, const float *par, const float *normw, float *ring, float *state,
                      int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
                      float eps, float qscale, float *y) {
+    if (!ba && (!G.pipe_dba || !wb || !wa || H % 4)) return 0;
     if (!G.ready || !G.pipe_dc || !G.pipe_dr || !proj || !outp || S < 1 || convk < 2 || convk > 17 ||
         vh % vk || kdim % 16 || kdim > 256) return 0;
     int value_dim = vh * vdim, pd = proj->O, ktot = vk * kdim;
@@ -1596,12 +1609,14 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
         !scratch_reserve(&G.db_conv, nconv) || !scratch_reserve(&G.dr_q, nqk) || !scratch_reserve(&G.dr_k, nqk) ||
         !scratch_reserve(&G.db_bg, nbg) || !scratch_reserve_mt(&G.dr_s, nst, G.memtype_cached) ||
         !scratch_reserve(&G.dr_o, nov) || !scratch_reserve(&G.db_nw, nnw) || !scratch_reserve(&G.db_or, nov) ||
-        !scratch_reserve_mt(&G.db_y, nx, G.memtype_cached)) return 0;
+        !scratch_reserve_mt(&G.db_y, nx, G.memtype_cached) ||
+        (!ba && !scratch_reserve(&G.db_w, (size_t)2 * vh * H * f))) return 0;
     /* the input stays a copy: bound from the (host-cached) arena, the projection
      * re-reading x once per output block ran 121 -> 209 ms (30 layers, 1011 tokens) */
     VkBuffer xa = getenv("COLI_VK_DN_ARENA_X") ? arena_buf(x, nx) : VK_NULL_HANDLE, ya = arena_buf(y, nx);
     if (!xa) memcpy(G.db_x.ptr, x, nx);
-    memcpy(G.db_ba.ptr, ba, nba); memcpy(G.db_par.ptr, par, npar);
+    if (ba) memcpy(G.db_ba.ptr, ba, nba);
+    else { memcpy(G.db_w.ptr, wb, (size_t)vh * H * f); memcpy((char *)G.db_w.ptr + (size_t)vh * H * f, wa, (size_t)vh * H * f); } memcpy(G.db_par.ptr, par, npar);
     memcpy(G.db_cw.ptr, convw, ncw); memcpy(G.db_ring.ptr, ring, nring); memcpy(G.dr_s.ptr, state, nst);
     memcpy(G.db_nw.ptr, normw, nnw);
     VkCommandBuffer cb = G.cmd;
@@ -1611,6 +1626,15 @@ int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, con
     ts_begin(cb, TS_SLOT_CMD); ts_stage0(cb);
     /* 1. qkv|z = x Wp^T */
     rec_mm(cb, G.db_mm[0], proj, xa ? xa : G.db_x.buf, G.db_qz.buf, S);
+    if (!ba) {   /* b | a from the same input rows (read-only beside the projection) */
+        VkDescriptorBufferInfo bi[3] = {{xa ? xa : G.db_x.buf, 0, VK_WHOLE_SIZE}, {G.db_w.buf, 0, VK_WHOLE_SIZE}, {G.db_ba.buf, 0, VK_WHOLE_SIZE}};
+        wr_desc(G.dset_dba, 3, bi);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_dba);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_dba, 0, 1, &G.dset_dba, 0, NULL);
+        int pc[3] = {S, H, 2 * vh};
+        vkCmdPushConstants(cb, G.plyt_dba, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(cb, (uint32_t)S, 1, 1);
+    }
     cc_barrier(cb); ts_stage(cb, 0);
     /* 2. conv + SiLU */
     { VkDescriptorBufferInfo bi[4] = {{G.db_qz.buf, 0, VK_WHOLE_SIZE}, {G.db_cw.buf, 0, VK_WHOLE_SIZE},
@@ -3900,7 +3924,7 @@ static int run_dn_block_case(int S, int H, int vh, int vk, int kdim, int vdim, i
     float *ringg = malloc((size_t)conv_dim * km * 4), *stg = malloc((size_t)vh * kdim * vdim * 4), *yg = malloc((size_t)S * H * 4);
     memcpy(ringg, ring0, (size_t)conv_dim * km * 4); memcpy(stg, st0, (size_t)vh * kdim * vdim * 4);
     double t0 = now();
-    if (!coli_vk_dn_block(tp, to, x, ba, cw, par, nw, ringg, stg, S, H, conv_dim, convk, vh, vk, kdim, vdim, eps, scale, yg)) { printf("dn_block failed\n"); return 1; }
+    if (!coli_vk_dn_block(tp, to, x, ba, NULL, NULL, cw, par, nw, ringg, stg, S, H, conv_dim, convk, vh, vk, kdim, vdim, eps, scale, yg)) { printf("dn_block failed\n"); return 1; }
     double ms = (now() - t0) * 1000;
     /* CPU chain */
     float *qz = malloc((size_t)S * pd * 4), *conv = malloc((size_t)S * conv_dim * 4), *ov = malloc((size_t)S * value_dim * 4);

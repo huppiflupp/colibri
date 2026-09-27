@@ -2942,6 +2942,10 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
         !(getenv("QWEN_DN_BLOCK") && getenv("QWEN_DN_BLOCK")[0] == '0')) {
         float *ba = falloc((int64_t)S * 2 * vh), *par = falloc(2 * vh);
         double _tb = tm_now();
+        /* b | a: on the GPU inside the block when it can (dn_ba.comp, f32 like
+         * here; QWEN_DN_BA_GPU=0 keeps them on the CPU) */
+        int ba_gpu = qt_dn_ba_ready() && !(getenv("QWEN_DN_BA_GPU") && getenv("QWEN_DN_BA_GPU")[0] == '0');
+        if (!ba_gpu) {
         /* b | a in one parallel pass, straight into the [S][2*vh] layout the
          * block takes (each value the same dot product as matmul_vec's) */
         #pragma omp parallel for collapse(2) schedule(static)
@@ -2954,10 +2958,11 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
                 for (int i = 0; i < H; i++) acc += xs[i] * w[i];
                 ba[(int64_t)s * 2 * vh + o] = acc;
             }
+        }
         if (tm_on()) g_dn_pf[1] += tm_now() - _tb;   /* dn block: small b/a projections on the CPU */
         memcpy(par, l->dn_alog, (size_t)vh * sizeof(float));
         memcpy(par + vh, l->dn_dtbias, (size_t)vh * sizeof(float));
-        int ok = qt_dn_block(layer, l->qth_dnout - 1, x, ba, l->dn_conv, par, l->dn_norm,
+        int ok = qt_dn_block(layer, l->qth_dnout - 1, x, ba_gpu ? NULL : ba, l->dn_b, l->dn_a, l->dn_conv, par, l->dn_norm,
                              m->DN_conv[layer], m->DN_rec[layer], S, H, conv_dim, convk,
                              vh, vk, kdim, vdim, c->eps, scale, out);
         free(ba); free(par);

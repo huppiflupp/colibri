@@ -150,7 +150,7 @@ int qt_attn_block(int hq, int hk, int hv, int ho, const float *x, const float *q
 int qt_issue_batch_reduce_sh(int layer,const int *eids,int S,int K,const float *x,
                              const float *weights,int hg,int hu,int hd,const float *sgate,
                              float *res,uint8_t *done);
-int qt_dn_block(int layer, int hout, const float *x, const float *ba, const float *convw,
+int qt_dn_block(int layer, int hout, const float *x, const float *ba, const float *wb, const float *wa, const float *convw,
                 const float *par, const float *normw, float *ring, float *state,
                 int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
                 float eps, float qscale, float *y);
@@ -158,6 +158,7 @@ float *qt_dn_stage(int which, size_t bytes);
 float *qt_host_arena(int slot, size_t bytes);
 int qt_block_post(float *x, float *n, const float *w, float eps, int hr, float *logits, int E);
 int qt_block_post_done(void);
+int qt_dn_ba_ready(void);
 int qt_dn_recur(float *outv, float *state, const float *qn, const float *kn, const float *v,
                 const float *beta, const float *gexp, int S, int vh, int vk, int kdim, int vdim);
 int qt_attn_prefill(float *ctx, const float *q, const float *K, const float *V, int ldt,
@@ -212,11 +213,12 @@ static inline void qt_note_n(int a,int b,const uint8_t*c,const uint8_t*d,const u
 static inline int qt_trunk_min_s(void){return 1;}
 static inline int qt_attn_block(int a,int b,int c,int d,const float*e,const float*f,const float*g,float*h,float*i,int j,int k,int l,int m,int n,int o,int q,int r,int t,float u,float v,float w,float*y){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)q;(void)r;(void)t;(void)u;(void)v;(void)w;(void)y;return 0;}
 static inline int qt_issue_batch_reduce_sh(int a,const int*b,int c,int d,const float*e,const float*f,int g,int h,int i,const float*j,float*k,uint8_t*l){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;return 0;}
-static inline int qt_dn_block(int a,int b,const float*c,const float*d,const float*e,const float*f,const float*g,float*h,float*i,int j,int k,int l,int m,int n,int o,int q,int r,float t,float u,float*v){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)q;(void)r;(void)t;(void)u;(void)v;return 0;}
+static inline int qt_dn_block(int a,int b,const float*c,const float*d,const float*wb_,const float*wa_,const float*e,const float*f,const float*g,float*h,float*i,int j,int k,int l,int m,int n,int o,int q,int r,float t,float u,float*v){(void)a;(void)b;(void)c;(void)d;(void)wb_;(void)wa_;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;(void)m;(void)n;(void)o;(void)q;(void)r;(void)t;(void)u;(void)v;return 0;}
 static inline float *qt_dn_stage(int a,size_t b){(void)a;(void)b;return 0;}
 static inline float *qt_host_arena(int a,size_t b){(void)a;(void)b;return 0;}
 static inline int qt_block_post(float *a,float *b,const float *c,float d,int e,float *f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int qt_block_post_done(void){return 0;}
+static inline int qt_dn_ba_ready(void){return 0;}
 static inline int qt_dn_recur(float*a,float*b,const float*c,const float*d,const float*e,const float*f,const float*g,int h,int i,int j,int k,int l){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;(void)l;return 0;}
 static inline int qt_attn_prefill(float*a,const float*b,const float*c,const float*d,int e,int f,int g,int h,int i,int j,float k){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;return 0;}
 static inline int qt_issue_batch(int a,const int*b,int c,int d,const float*e,float*f,uint8_t*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}

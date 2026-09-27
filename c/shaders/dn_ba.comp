@@ -1,0 +1,23 @@
+#version 450
+// DeltaNet b | a projections of a prefill block on the GPU (f32, as the CPU's
+// matmul_vec): ba[s][o] = x[s] . W[o], W = dn_b rows (o < vh) then dn_a rows.
+// One workgroup per token row, 4 lanes per output (64 outputs per 256 lanes).
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer XB { vec4 x4[]; };      // [S][H]
+layout(std430, binding = 1) readonly buffer WB { vec4 w4[]; };      // [2*vh][H]
+layout(std430, binding = 2) writeonly buffer BA { float ba[]; };    // [S][2*vh]
+layout(push_constant) uniform P { int S, H, nout; } p;
+void main() {
+    uint s = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    uint h4 = uint(p.H) / 4u;
+    for (uint o0 = 0u; o0 < uint(p.nout); o0 += 64u) {
+        uint o = o0 + tid / 4u, q = tid % 4u;
+        float acc = 0.0;
+        if (o < uint(p.nout))
+            for (uint i = q; i < h4; i += 4u) acc += dot(x4[s * h4 + i], w4[o * h4 + i]);
+        acc = subgroupClusteredAdd(acc, 4u);
+        if (q == 0u && o < uint(p.nout)) ba[s * uint(p.nout) + o] = acc;
+    }
+}

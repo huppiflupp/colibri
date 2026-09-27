@@ -54,6 +54,7 @@ int  coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, Co
                         float eps, float theta, float scale, float *out);
 /* A whole DeltaNet layer of a prefill block in one submit (see backend_vulkan.c). */
 int  coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, const float *ba,
+                      const float *wb, const float *wa,
                       const float *convw, const float *par, const float *normw, float *ring, float *state,
                       int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
                       float eps, float qscale, float *y);
@@ -66,6 +67,7 @@ float *coli_vk_host_arena(int slot, size_t bytes);
  * (all host-arena rows); _done() says whether it ran and clears the request */
 void coli_vk_block_post(float *x, float *n, const float *w, float eps, ColiVkTensor *router, float *logits, int E);
 int coli_vk_block_post_done(void);
+int coli_vk_dn_ba_ready(void);   /* coli_vk_dn_block takes ba == NULL + wb/wa */
 int  coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn,
                       const float *vsrc, int vstride, int voff, const float *beta, const float *gexp,
                       int S, int vh, int vk, int kdim, int vdim);

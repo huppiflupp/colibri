@@ -683,7 +683,7 @@ ifeq ($(VK),1)
 CFLAGS   += -DCOLI_VULKAN
 LDFLAGS  += -lvulkan
 VK_OBJ    = backend_vulkan.o
-VK_SPV    = shaders/expert_gather.spv shaders/expert_reduce.spv shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/qmatmul_coop2.spv shaders/qmatmul_gate_up_coop2.spv shaders/qmatmul_grp.spv shaders/qmatmul_gate_up_grp.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/attn_prefill.spv shaders/attn_flash.spv shaders/dn_recur.spv shaders/dn_conv.spv shaders/dn_prep.spv shaders/dn_gnorm.spv shaders/attn_prep.spv shaders/attn_gate.spv shaders/resid_norm.spv
+VK_SPV    = shaders/expert_gather.spv shaders/expert_reduce.spv shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_mr.spv shaders/qmatmul_gate_up_mr.spv shaders/qmatmul_coop.spv shaders/qmatmul_gate_up_coop.spv shaders/qmatmul_coop2.spv shaders/qmatmul_gate_up_coop2.spv shaders/qmatmul_grp.spv shaders/qmatmul_gate_up_grp.spv shaders/attention_absorb.spv shaders/rmsnorm.spv shaders/attn_prefill.spv shaders/attn_flash.spv shaders/dn_recur.spv shaders/dn_conv.spv shaders/dn_prep.spv shaders/dn_gnorm.spv shaders/attn_prep.spv shaders/attn_gate.spv shaders/resid_norm.spv shaders/dn_ba.spv
 endif
 
 # Optional AMD XDNA2 (Ryzen AI NPU) lane, Windows. Same opt-in shape as VK=1:

@@ -949,6 +949,13 @@ int qt_block_post(float *x, float *n, const float *w, float eps, int hr, float *
     (void)x;(void)n;(void)w;(void)eps;(void)hr;(void)logits;(void)E; return 0;
 #endif
 }
+int qt_dn_ba_ready(void){
+#if defined(COLI_VULKAN) && !defined(COLI_CUDA)
+    return coli_vk_available() && coli_vk_dn_ba_ready();
+#else
+    return 0;
+#endif
+}
 int qt_block_post_done(void){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     return coli_vk_available() ? coli_vk_block_post_done() : 0;
@@ -987,16 +994,16 @@ int qt_dn_recur(float *outv, float *state, const float *qn, const float *kn, con
 /* A whole DeltaNet layer of a prefill block on the GPU (Vulkan only): the fused
  * qkv|z projection of `layer` and the dense out_proj handle `hout` must both be
  * GPU-placed. 0 -> the engine's own path. */
-int qt_dn_block(int layer, int hout, const float *x, const float *ba, const float *convw,
+int qt_dn_block(int layer, int hout, const float *x, const float *ba, const float *wb, const float *wa, const float *convw,
                 const float *par, const float *normw, float *ring, float *state,
                 int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim,
                 float eps, float qscale, float *y){
 #if defined(COLI_VULKAN) && !defined(COLI_CUDA)
     if(!qt_dnproj_ready(layer) || hout < 0 || hout >= G_dense_n || !G_dense[hout].on) return 0;
-    return coli_vk_dn_block(G_dnp[layer].t, G_dense[hout].t, x, ba, convw, par, normw, ring, state,
+    return coli_vk_dn_block(G_dnp[layer].t, G_dense[hout].t, x, ba, wb, wa, convw, par, normw, ring, state,
                             S, H, conv_dim, convk, vh, vk, kdim, vdim, eps, qscale, y);
 #else
-    (void)layer;(void)hout;(void)x;(void)ba;(void)convw;(void)par;(void)normw;(void)ring;(void)state;
+    (void)layer;(void)hout;(void)x;(void)ba;(void)wb;(void)wa;(void)convw;(void)par;(void)normw;(void)ring;(void)state;
     (void)S;(void)H;(void)conv_dim;(void)convk;(void)vh;(void)vk;(void)kdim;(void)vdim;(void)eps;(void)qscale;(void)y;
     return 0;
 #endif
