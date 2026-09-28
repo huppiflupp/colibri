@@ -1,0 +1,32 @@
+pr1338	pshort.txt	0	20	0.28	33.03	
+pr1338	pshort.txt	1	20	0.28	33.03	
+pr1338	pshort.txt	2	20	0.30	33.12	
+pr1338	pshort.txt	3	20	0.29	33.07	
+int8	pshort.txt	0	20	0.16	49.61	
+int8	pshort.txt	1	20	0.15	50.50	
+int8	pshort.txt	2	20	0.16	49.61	
+int8	pshort.txt	3	20	0.15	49.51	
+int4	pshort.txt	0	20	0.18	66.75	
+int4	pshort.txt	1	20	0.18	66.75	
+int4	pshort.txt	2	20	0.19	66.93	
+int4	pshort.txt	3	20	0.20	67.11	
+int4-mtp	pshort.txt	0	20	0.19	77.04	80.9
+int4-mtp	pshort.txt	1	20	0.19	77.04	80.9
+int4-mtp	pshort.txt	2	20	0.21	77.51	80.9
+int4-mtp	pshort.txt	3	20	0.20	77.27	80.9
+pr1338	p6k.txt	0	7006	113.34	22.85	
+pr1338	p6k.txt	1	7006	113.60	18.09	
+pr1338	p6k.txt	2	7006	113.81	17.01	
+pr1338	p6k.txt	3	7006	113.44	17.63	
+int8	p6k.txt	0	7006	8.13	42.71	
+int8	p6k.txt	1	7006	8.28	43.07	
+int8	p6k.txt	2	7006	8.41	43.29	
+int8	p6k.txt	3	7006	8.34	43.52	
+int4	p6k.txt	0	7006	8.25	54.84	
+int4	p6k.txt	1	7006	8.35	53.68	
+int4	p6k.txt	2	7006	8.15	53.68	
+int4	p6k.txt	3	7006	8.17	53.91	
+int4-mtp	p6k.txt	0	7006	10.15	68.00	88.9
+int4-mtp	p6k.txt	1	7006	9.76	68.18	88.9
+int4-mtp	p6k.txt	2	7006	9.94	69.67	88.9
+int4-mtp	p6k.txt	3	7006	9.91	69.11	88.9
