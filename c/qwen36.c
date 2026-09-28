@@ -3341,8 +3341,9 @@ static void deltanet_phased(Model *m, Layer *l, int layer, float *x, int S, floa
     float *b = decode_falloc(&scratch[4], S, (int64_t)S * vh);
     float *a = decode_falloc(&scratch[5], S, (int64_t)S * vh);
     if (qt_dnproj_ready(layer)) {
-        /* whole-prompt blocks (up to 2048 rows): the GPU only wins on large ones */
-        int B = S < 2048 ? S : 2048;
+        /* memory-bounded blocks (dnproj_batch_rows); prompts of qt_trunk_min_s() rows and
+         * more take the whole DeltaNet block on the GPU above, so this path sees short ones */
+        int B = dnproj_batch_rows(S, H, proj_dim);
         float *qkvz = decode_falloc(&scratch[6], S, (int64_t)B * proj_dim);
         for (int s0 = 0; s0 < S; s0 += B) {
             int rows = S - s0 < B ? S - s0 : B;
@@ -4507,7 +4508,20 @@ static void ensure_kv(Model *m){
     }
 }
 
-static int serve_eos_ids(int *ids, int cap);
+/* Chat turns end on <|im_end|>, base completions on <|endoftext|>. Resolve
+ * both ids from the tokenizer's added_tokens: Qwen3.6's 248320-token vocab
+ * puts them at 248044+, so the old hardcoded 151645 (the 151k-vocab Qwen id)
+ * silently never matched and every serve turn ran into max_tok. Q36_EOS
+ * still overrides for experiments. */
+static int serve_eos_ids(int *ids, int cap){
+    int n=0;
+    if(getenv("Q36_EOS")){ ids[n++]=atoi(getenv("Q36_EOS")); return n; }
+    for(int k=0;k<g_nspecial && n<cap;k++)
+        if(!strcmp(g_sp_str[k],"<|im_end|>")||!strcmp(g_sp_str[k],"<|endoftext|>"))
+            ids[n++]=g_sp_id[k];
+    if(!n) ids[n++]=151645;   /* tokenizer without added_tokens: old default */
+    return n;
+}
 static void ensure_kv(Model *m);
 
 /* Token choice of the CLI: greedy by default; QWEN_TEMP > 0 samples like llama.cpp's
@@ -4770,20 +4784,6 @@ static int serve_sample(const float *lo, int V, float temp, float top_p){
     free(rank); return pick;
 }
 
-/* Chat turns end on <|im_end|>, base completions on <|endoftext|>. Resolve
- * both ids from the tokenizer's added_tokens: Qwen3.6's 248320-token vocab
- * puts them at 248044+, so the old hardcoded 151645 (the 151k-vocab Qwen id)
- * silently never matched and every serve turn ran into max_tok. Q36_EOS
- * still overrides for experiments. */
-static int serve_eos_ids(int *ids, int cap){
-    int n=0;
-    if(getenv("Q36_EOS")){ ids[n++]=atoi(getenv("Q36_EOS")); return n; }
-    for(int k=0;k<g_nspecial && n<cap;k++)
-        if(!strcmp(g_sp_str[k],"<|im_end|>")||!strcmp(g_sp_str[k],"<|endoftext|>"))
-            ids[n++]=g_sp_id[k];
-    if(!n) ids[n++]=151645;   /* tokenizer without added_tokens: old default */
-    return n;
-}
 
 /* Un CANCEL per la richiesta in corso, visto SENZA bloccare (#1332).
  *
@@ -5139,10 +5139,12 @@ static void spin_auto(int argc, char **argv) {
     fprintf(stderr, "[OMP] %s: GOMP_SPINCOUNT=3M, re-exec once (COLI_SPIN=0 to skip)\n", why);
     /* execv keeps the affinity mask; a user OMP_PROC_BIND may already have bound
      * this thread to one place (colibri.c #471) -> reset to all online CPUs */
+#ifdef CPU_SET   /* (glibc exposes it with _GNU_SOURCE; tests that include this file may not) */
     { cpu_set_t all; CPU_ZERO(&all);
       long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu > CPU_SETSIZE) ncpu = CPU_SETSIZE;
       for (long i = 0; i < ncpu; i++) CPU_SET((int)i, &all);
       if (sched_setaffinity(0, sizeof(all), &all) != 0) perror("[OMP] sched_setaffinity pre-reexec (continuing)"); }
+#endif
     execv("/proc/self/exe", argv);
     perror("[OMP] execv self-reexec failed, running with the default spin");
 }

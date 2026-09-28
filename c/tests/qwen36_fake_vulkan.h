@@ -139,4 +139,34 @@ int coli_vk_expert_prefill(ColiVkTensor *const *gates, ColiVkTensor *const *ups,
     return 1;
 }
 
+
+/* Stubs for the backend entry points the tier gained with the block / decode-graph work:
+ * all report "unavailable", so the fake exercises the tier's CPU fallbacks. */
+void coli_vk_arena_cpu_wrote(const void *p) { (void)p; }
+int coli_vk_attn_block(ColiVkTensor *tq, ColiVkTensor *tk, ColiVkTensor *tv, ColiVkTensor *to, const float *x, const float *qn, const float *kn, float *Kc, float *Vc, int ldt, int S, int D, int H, int KV, int hd, int qdim, int rotary, int pos_base, float eps, float theta, float scale, float *out, int layer) { (void)tq; (void)tk; (void)tv; (void)to; (void)x; (void)qn; (void)kn; (void)Kc; (void)Vc; (void)ldt; (void)S; (void)D; (void)H; (void)KV; (void)hd; (void)qdim; (void)rotary; (void)pos_base; (void)eps; (void)theta; (void)scale; (void)out; (void)layer; return 0; }
+int coli_vk_attn_dec_ready(void) { return 0; }
+int coli_vk_attn_prefill(float *ctx, const float *q, const float *K, const float *V, int ldt, int S, int H, int KV, int hd, int pos_base, float scale) { (void)ctx; (void)q; (void)K; (void)V; (void)ldt; (void)S; (void)H; (void)KV; (void)hd; (void)pos_base; (void)scale; return 0; }
+void coli_vk_block_post(float *x, float *n, const float *w, float eps, ColiVkTensor *router, float *logits, int E) { (void)x; (void)n; (void)w; (void)eps; (void)router; (void)logits; (void)E; }
+int coli_vk_block_post_done(void) { return 0; }
+int coli_vk_dec_record(const ColiDecLayer *d) { (void)d; return 0; }
+int coli_vk_dec_run(int n, const int *layers, int S, const float *x, const float *nrm, const float *tmp, const float *logits, int H, int E) { (void)n; (void)layers; (void)S; (void)x; (void)nrm; (void)tmp; (void)logits; (void)H; (void)E; return 0; }
+void coli_vk_defer_next_block(int on) { (void)on; }
+int coli_vk_deferred(void) { return 0; }
+int coli_vk_dn_ba_ready(void) { return 0; }
+int coli_vk_dn_block(ColiVkTensor *proj, ColiVkTensor *outp, const float *x, const float *ba, const float *wb, const float *wa, const float *convw, const float *par, const float *normw, float *ring, float *state, int S, int H, int conv_dim, int convk, int vh, int vk, int kdim, int vdim, float eps, float qscale, float *y, int layer, int cap) { (void)proj; (void)outp; (void)x; (void)ba; (void)wb; (void)wa; (void)convw; (void)par; (void)normw; (void)ring; (void)state; (void)S; (void)H; (void)conv_dim; (void)convk; (void)vh; (void)vk; (void)kdim; (void)vdim; (void)eps; (void)qscale; (void)y; (void)layer; (void)cap; return 0; }
+void coli_vk_dn_drop(int layer) { (void)layer; }
+int coli_vk_dn_recur(float *outv, float *state, const float *qn, const float *kn, const float *vsrc, int vstride, int voff, const float *beta, const float *gexp, int S, int vh, int vk, int kdim, int vdim) { (void)outv; (void)state; (void)qn; (void)kn; (void)vsrc; (void)vstride; (void)voff; (void)beta; (void)gexp; (void)S; (void)vh; (void)vk; (void)kdim; (void)vdim; return 0; }
+int coli_vk_dn_resident(int on) { (void)on; return 0; }
+int coli_vk_dn_rollback(int layer) { (void)layer; return 0; }
+float * coli_vk_dn_stage(int which, size_t bytes) { (void)which; (void)bytes; return NULL; }
+int coli_vk_dn_sync(int layer) { (void)layer; return 0; }
+void coli_vk_expert_post(float *x, float *n, const float *w, float eps) { (void)x; (void)n; (void)w; (void)eps; }
+int coli_vk_expert_post_done(void) { return 0; }
+int coli_vk_fast_gemv(void) { return 0; }
+int coli_vk_flush_deferred(void) { return 1; }
+float * coli_vk_host_arena(int slot, size_t bytes) { (void)slot; (void)bytes; return NULL; }
+void coli_vk_kv_cut(int layer, int from) { (void)layer; (void)from; }
+int coli_vk_moe_master(int layer, int E, ColiVkTensor *const *tg, ColiVkTensor *const *tu, ColiVkTensor *const *td) { (void)layer; (void)E; (void)tg; (void)tu; (void)td; return 0; }
+int coli_vk_moe_route(int layer, const float *logits, const float *nrm, const float *wsg, int E, int K, int D) { (void)layer; (void)logits; (void)nrm; (void)wsg; (void)E; (void)K; (void)D; return 0; }
+
 #endif /* QWEN36_FAKE_VULKAN_H */

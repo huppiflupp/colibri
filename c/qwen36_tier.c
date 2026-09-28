@@ -1757,9 +1757,12 @@ int qt_dec_record(int layer, int hout, int hrt, int hsg, int hsu, int hsd, const
     int h[5] = {hout, hrt, hsg, hsu, hsd};
     for(int i = 0; i < 5; i++) if(h[i] < 0 || h[i] >= G_dense_n || !G_dense[h[i]].on) return 0;
     if(!qt_dnproj_ready(layer) || !qt_moe_chain_ready(layer)) return 0;
-    ColiDecLayer d = {layer, G_dnp[layer].t, G_dense[hout].t, G_dense[hrt].t, G_dense[hsg].t, G_dense[hsu].t, G_dense[hsd].t,
-                      wb, wa, convw, par, normw, post_w, next_w, wsg, ring, state, x, nrm, tmp, logits,
-                      H, conv_dim, convk, vh, vk, kdim, vdim, E, K, I, eps, qscale};
+    ColiDecLayer d = {.layer = layer, .proj = G_dnp[layer].t, .outp = G_dense[hout].t, .router = G_dense[hrt].t,
+                      .shg = G_dense[hsg].t, .shu = G_dense[hsu].t, .shd = G_dense[hsd].t,
+                      .wb = wb, .wa = wa, .convw = convw, .par = par, .normw = normw, .post_w = post_w, .next_w = next_w,
+                      .wsg = wsg, .ring = ring, .state = state, .x = x, .nrm = nrm, .tmp = tmp, .logits = logits,
+                      .H = H, .conv_dim = conv_dim, .convk = convk, .vh = vh, .vk = vk, .kdim = kdim, .vdim = vdim,
+                      .E = E, .K = K, .I = I, .eps = eps, .qscale = qscale};
     d.S = S; d.cap = cap;
     return coli_vk_dec_record(&d);
 #else

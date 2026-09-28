@@ -165,7 +165,12 @@ int main(void) {
         correct = 1;
         for (int j = 0; j < 3*D; j++) if (by[j] != 0.f) correct = 0;
         check(correct && calls == fake_vk_prefill_calls, "all-miss batch needs no GPU submit");
-        check(!qt_issue_batch_reduce(0,ids,1,2,bx,weights,by,done), "decode stays on its old path");
+        /* decode (one row) takes the batch path too since the grouped decode GEMV
+         * (all routed experts + the shared one in one submit); all-miss -> zeros */
+        check(qt_issue_batch_reduce(0,ids,1,2,bx,weights,by,done), "decode (one row) takes the batch path too");
+        correct = 1;
+        for (int d = 0; d < D; d++) if (by[d] != 0.f) correct = 0;
+        check(correct && !done[0] && !done[1], "one-row all-miss batch: zeros, nothing claimed");
     }
 
     /* ---- 6. injected resident trunk upload failures fall back to CPU ---- */

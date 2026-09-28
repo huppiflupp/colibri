@@ -252,6 +252,7 @@ static void mtp_moe(const float *x, int R, float *out) {
 static void mtp_forward(Model *m, const int *tok, const float *hprev, int R, int pos0, float *logits) {
     Cfg *c = &m->c; Mtp *p = &g_mtp; int D = c->hidden;
     float *cat = falloc((int64_t)R * 2 * D), *x = falloc((int64_t)R * D), *nrm = falloc((int64_t)R * D), *tmp = falloc((int64_t)R * D);
+    memset(cat, 0, sizeof(float) * (size_t)R * 2 * D);   /* (every row is written below; silences -Wmaybe-uninitialized) */
     for (int r = 0; r < R; r++) {
         rmsnorm_row(cat + (int64_t)r * 2 * D, m->embed + (int64_t)tok[r] * D, p->enorm, D, c->eps);
         rmsnorm_row(cat + (int64_t)r * 2 * D + D, hprev + (int64_t)r * D, p->hnorm, D, c->eps);

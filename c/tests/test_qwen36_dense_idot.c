@@ -40,6 +40,10 @@ static double rel_gap(const float *a, const float *b, int n) {
 }
 
 int main(void) {
+    /* the packing contract below is the plain rule (one absmax/7 scale per block); the
+     * default weighted scale search (make_qx_quants style) picks other scales on purpose
+     * and is validated by perplexity, so this test pins the plain rule */
+    setenv("COLI_DENSE_Q4_SEARCH", "0", 1);
     enum { I = 256, O = 96, S = 5 };
     printf("activation quantizer\n");
     {
