@@ -5056,7 +5056,7 @@ int main(int argc, char **argv) {
     }
     if (getenv("VK_EG_BENCH")) {
         if (!G.ts_on) printf("VK_EG_BENCH needs COLI_VK_TS=1\n");
-        bad = run_expert_prefill_bench(getenv("VK_EG_BENCH_S") ? atoi(getenv("VK_EG_BENCH_S")) : 1011, getenv("VK_EG_BENCH_K") ? atoi(getenv("VK_EG_BENCH_K")) : 8, 256, 2048, 512, getenv("VK_EG_BENCH_N") ? atoi(getenv("VK_EG_BENCH_N")) : 20);
+        bad = run_expert_prefill_bench(getenv("VK_EG_BENCH_S") ? atoi(getenv("VK_EG_BENCH_S")) : 1011, getenv("VK_EG_BENCH_K") ? atoi(getenv("VK_EG_BENCH_K")) : 8, getenv("VK_EG_BENCH_E") ? atoi(getenv("VK_EG_BENCH_E")) : 256, getenv("VK_EG_BENCH_D") ? atoi(getenv("VK_EG_BENCH_D")) : 2048, getenv("VK_EG_BENCH_I") ? atoi(getenv("VK_EG_BENCH_I")) : 512, getenv("VK_EG_BENCH_N") ? atoi(getenv("VK_EG_BENCH_N")) : 20);
         coli_vk_shutdown(); return bad;
     }
     if (getenv("VK_ATTN_TEST")) {   /* attention cores only (attn_flash / attn_prefill + whole layer) */
