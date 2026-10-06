@@ -491,7 +491,7 @@ static void extra(void) {
     on = vkt_init(&vc, NULL);
     CHECK(on && vkt_layers() == 1, "extra: no device form, the tier has %d layers (want the main one)", vkt_layers());
     if (on) {
-        float x[H] = {0}; int id[K] = {0, 1, 2}; uint8_t taken[K];
+        float x[HF_MAX] = {0}; int id[K] = {0, 1, 2}; uint8_t taken[K];
         CHECK(vkt_issue(1, x, 1, K, id, taken) == 0, "extra: a layer past the tier's took rows");
         vkt_shutdown();
     }
@@ -849,6 +849,7 @@ static void grouped(void) {
         {{VKT_SRC_I4U_PLANAR64, 64}, {VKT_SRC_I4U_PLANAR64, 64}, 0, "planar int4-g64"},
     };
     int h0 = H; H = 256;
+    unsigned rng0 = rng;   /* the cases after this one see the random stream they had before it */
     int any_grouped = 0, any_summed = 0;
     for (size_t c = 0; c < sizeof cs / sizeof *cs; c++) {
         for (int mode = 0; mode < 3; mode++) {   /* single, whole, mixed */
@@ -898,7 +899,7 @@ static void grouped(void) {
     printf("  grouped route %s, device sums %s\n", any_grouped ? "taken" : "not on this device",
            any_summed ? "taken" : "not on this device");
     CHECK(!any_grouped || any_summed, "grouped: the device took the grouped route but never summed a whole step");
-    H = h0;
+    H = h0; rng = rng0;
 }
 
 int main(int argc, char **argv) {
